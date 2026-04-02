@@ -88,6 +88,7 @@ fn handle_site_state(key: ContractKey, state_bytes: &[u8]) {
                 role: SiteRole::Visitor,
                 state: site_state,
                 owner_pubkey: [0u8; 32],
+                contract_key: Some(key),
             },
         );
     }

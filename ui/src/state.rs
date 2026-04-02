@@ -1,6 +1,7 @@
-use delta_core::{Page, PageId, SignedConfig, SiteConfig, SiteState};
+use delta_core::{Page, PageId, SiteConfig, SiteParameters, SiteState};
 use dioxus::prelude::*;
-use ed25519_dalek::Signature;
+use ed25519_dalek::{Signature, SigningKey};
+use freenet_stdlib::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -16,6 +17,9 @@ pub struct KnownSite {
     pub state: SiteState,
     /// Full owner pubkey bytes (for resolving prefix back to params).
     pub owner_pubkey: [u8; 32],
+    /// Contract key (if known — set after PUT or GET).
+    #[serde(skip)]
+    pub contract_key: Option<ContractKey>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -23,6 +27,12 @@ pub enum SiteRole {
     Owner,
     Visitor,
 }
+
+/// Owner signing keys, keyed by site prefix.
+/// Held in browser memory — lost on page refresh.
+/// (Delegate persistence comes later.)
+pub static SIGNING_KEYS: GlobalSignal<BTreeMap<String, SigningKey>> =
+    GlobalSignal::new(BTreeMap::new);
 
 // ---------------------------------------------------------------------------
 // Global signals
@@ -46,6 +56,9 @@ pub static SHOW_ADD_SITE: GlobalSignal<bool> = GlobalSignal::new(|| false);
 /// Editor content (buffered separately from saved state).
 pub static EDITOR_TITLE: GlobalSignal<String> = GlobalSignal::new(String::new);
 pub static EDITOR_CONTENT: GlobalSignal<String> = GlobalSignal::new(String::new);
+
+/// Site contract WASM (for computing contract keys).
+const SITE_CONTRACT_WASM: &[u8] = include_bytes!("../public/contracts/site_contract.wasm");
 
 // ---------------------------------------------------------------------------
 // Initialization
@@ -96,7 +109,6 @@ pub fn select_site(prefix: &str) {
     *SHOW_ADD_SITE.write() = false;
     *CURRENT_SITE.write() = Some(prefix.to_string());
 
-    // Select first page of the site
     let sites = SITES.read();
     if let Some(site) = sites.get(prefix) {
         let first_page = site.state.pages.keys().next().copied();
@@ -114,46 +126,66 @@ pub fn show_add_site_prompt() {
     *SHOW_ADD_SITE.write() = true;
 }
 
-/// Create a new owned site with the given name.
+/// Create a new owned site — generates keypair, signs initial state,
+/// PUTs to the Freenet network.
 pub fn create_new_site(name: String) {
-    let placeholder_sig = Signature::from_bytes(&[0u8; 64]);
+    // Generate Ed25519 keypair
+    let signing_key = SigningKey::generate(&mut rand::thread_rng());
+    let verifying_key = signing_key.verifying_key();
 
-    // Generate a pseudo-random prefix for now
-    // (In production this comes from the owner's actual pubkey)
-    let prefix = generate_prefix();
+    // Build parameters
+    let mut site_id = [0u8; 32];
+    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut site_id);
+    let params = SiteParameters {
+        owner: verifying_key,
+        site_id,
+    };
 
-    let mut pages = BTreeMap::new();
+    let prefix = params.site_prefix();
+
+    // Create initial state with a signed home page
+    let config = SiteConfig {
+        version: 1,
+        name: name.clone(),
+        description: String::new(),
+    };
+    let mut site_state = SiteState::new(config, &signing_key);
     let now = now_secs();
-    pages.insert(
+    let home_page = Page::new(
         1,
-        Page {
-            title: "Home".into(),
-            content: format!("# {name}\n\nWelcome to your new site.\n"),
-            updated_at: now,
-            signature: placeholder_sig,
-        },
+        "Home".into(),
+        format!("# {name}\n\nWelcome to your new site.\n"),
+        now,
+        &signing_key,
     );
+    site_state
+        .upsert_page(1, home_page, &verifying_key)
+        .expect("valid signed page");
 
+    // Compute contract key
+    let mut params_buf = Vec::new();
+    ciborium::ser::into_writer(&params, &mut params_buf).expect("CBOR params");
+    let contract_code = ContractCode::from(SITE_CONTRACT_WASM);
+    let contract_key =
+        ContractKey::from_params_and_code(Parameters::from(params_buf.clone()), &contract_code);
+
+    // Store signing key in memory
+    SIGNING_KEYS.write().insert(prefix.clone(), signing_key);
+
+    // Add to known sites
     let site = KnownSite {
         name: name.clone(),
         prefix: prefix.clone(),
         role: SiteRole::Owner,
-        state: SiteState {
-            config: SignedConfig {
-                config: SiteConfig {
-                    version: 1,
-                    name,
-                    description: String::new(),
-                },
-                signature: placeholder_sig,
-            },
-            pages,
-            next_page_id: 2,
-        },
-        owner_pubkey: [0u8; 32], // placeholder
+        state: site_state.clone(),
+        owner_pubkey: verifying_key.to_bytes(),
+        contract_key: Some(contract_key),
     };
-
     SITES.write().insert(prefix.clone(), site);
+
+    // PUT to Freenet network
+    crate::freenet_api::put_site(&params, &site_state);
+
     *SHOW_ADD_SITE.write() = false;
     select_site(&prefix);
 }
@@ -193,22 +225,48 @@ pub fn create_page(title: String) {
     let Some(prefix) = (*CURRENT_SITE.read()).clone() else {
         return;
     };
+
+    // Get signing key if owner
+    let signing_key = SIGNING_KEYS.read().get(&prefix).cloned();
+
     let mut sites = SITES.write();
     let Some(site) = sites.get_mut(&prefix) else {
         return;
     };
 
     let id = site.state.next_page_id;
-    let page = Page {
-        title,
-        content: String::new(),
-        updated_at: now_secs(),
-        signature: Signature::from_bytes(&[0u8; 64]),
+    let now = now_secs();
+
+    let page = if let Some(sk) = &signing_key {
+        Page::new(id, title, String::new(), now, sk)
+    } else {
+        // Fallback for example data (unsigned)
+        Page {
+            title,
+            content: String::new(),
+            updated_at: now,
+            signature: Signature::from_bytes(&[0u8; 64]),
+        }
     };
-    site.state.pages.insert(id, page);
+
+    site.state.pages.insert(id, page.clone());
     site.state.next_page_id = id + 1;
 
+    // Send UPDATE to network if we have a contract key
+    let contract_key = site.contract_key;
     drop(sites);
+
+    if let Some(ck) = contract_key {
+        let mut updates = BTreeMap::new();
+        updates.insert(id, page);
+        let delta = delta_core::SiteStateDelta {
+            config: None,
+            page_updates: updates,
+            page_deletions: Vec::new(),
+        };
+        crate::freenet_api::update_site(&ck, &delta);
+    }
+
     *CURRENT_PAGE.write() = Some(id);
     *EDITING.write() = true;
 }
@@ -222,15 +280,42 @@ pub fn save_current_page() {
     };
     let title = EDITOR_TITLE.read().clone();
     let content = EDITOR_CONTENT.read().clone();
+    let now = now_secs();
+
+    let signing_key = SIGNING_KEYS.read().get(&prefix).cloned();
+
+    let page = if let Some(sk) = &signing_key {
+        Page::new(page_id, title, content, now, sk)
+    } else {
+        Page {
+            title,
+            content,
+            updated_at: now,
+            signature: Signature::from_bytes(&[0u8; 64]),
+        }
+    };
 
     let mut sites = SITES.write();
-    if let Some(site) = sites.get_mut(&prefix) {
-        if let Some(page) = site.state.pages.get_mut(&page_id) {
-            page.title = title;
-            page.content = content;
-            page.updated_at = now_secs();
-        }
+    let contract_key = if let Some(site) = sites.get_mut(&prefix) {
+        site.state.pages.insert(page_id, page.clone());
+        site.contract_key
+    } else {
+        None
+    };
+    drop(sites);
+
+    // Send UPDATE to network
+    if let Some(ck) = contract_key {
+        let mut updates = BTreeMap::new();
+        updates.insert(page_id, page);
+        let delta = delta_core::SiteStateDelta {
+            config: None,
+            page_updates: updates,
+            page_deletions: Vec::new(),
+        };
+        crate::freenet_api::update_site(&ck, &delta);
     }
+
     *EDITING.write() = false;
 }
 
@@ -238,9 +323,24 @@ pub fn delete_page(page_id: PageId) {
     let Some(prefix) = (*CURRENT_SITE.read()).clone() else {
         return;
     };
+
+    let signing_key = SIGNING_KEYS.read().get(&prefix).cloned();
+
     let mut sites = SITES.write();
     if let Some(site) = sites.get_mut(&prefix) {
         site.state.pages.remove(&page_id);
+
+        // Send signed deletion to network
+        if let (Some(ck), Some(sk)) = (&site.contract_key, &signing_key) {
+            let deletion = delta_core::SignedPageDeletion::new(page_id, now_secs(), sk);
+            let delta = delta_core::SiteStateDelta {
+                config: None,
+                page_updates: BTreeMap::new(),
+                page_deletions: vec![deletion],
+            };
+            crate::freenet_api::update_site(ck, &delta);
+        }
+
         if *CURRENT_PAGE.read() == Some(page_id) {
             let next = site.state.pages.keys().next().copied();
             drop(sites);
@@ -287,14 +387,6 @@ fn slugify(title: &str) -> String {
 
 fn now_secs() -> u64 {
     chrono::Utc::now().timestamp() as u64
-}
-
-fn generate_prefix() -> String {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let bytes: [u8; 8] = rng.gen();
-    let encoded = bs58::encode(&bytes).into_string();
-    encoded[..10.min(encoded.len())].to_string()
 }
 
 fn update_hash(hash: &str) {

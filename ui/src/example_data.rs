@@ -54,6 +54,7 @@ pub fn create_example_sites() -> BTreeMap<String, KnownSite> {
                     next_page_id: 4,
                 },
                 owner_pubkey: [1u8; 32],
+                contract_key: None,
             },
         );
     }
@@ -103,6 +104,7 @@ pub fn create_example_sites() -> BTreeMap<String, KnownSite> {
                     next_page_id: 4,
                 },
                 owner_pubkey: [2u8; 32],
+                contract_key: None,
             },
         );
     }
@@ -145,6 +147,7 @@ pub fn create_example_sites() -> BTreeMap<String, KnownSite> {
                     next_page_id: 3,
                 },
                 owner_pubkey: [3u8; 32],
+                contract_key: None,
             },
         );
     }
