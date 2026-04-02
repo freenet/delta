@@ -140,7 +140,7 @@ pub fn create_new_site(name: String) {
         role: SiteRole::Owner,
         state: site_state.clone(),
         owner_pubkey: verifying_key.to_bytes(),
-        contract_key: None,
+        contract_key: Some(contract_key_from_prefix(&prefix)),
     };
     SITES.with_mut(|sites| {
         sites.insert(prefix.clone(), site);
@@ -165,30 +165,67 @@ pub fn create_new_site(name: String) {
     }
 }
 
-/// Visit an existing site by contract ID string (base58). Sends GET + SUBSCRIBE.
-pub fn visit_site(contract_id_str: String) {
-    let contract_id: ContractInstanceId = match contract_id_str.parse() {
-        Ok(id) => id,
-        Err(_) => return,
-    };
+/// Site contract WASM (for computing contract keys from prefixes).
+const SITE_CONTRACT_WASM: &[u8] = include_bytes!("../public/contracts/site_contract.wasm");
 
-    let prefix = contract_id_str[..10.min(contract_id_str.len())].to_string();
+/// Compute a contract key from a site prefix.
+/// Anyone can do this — the WASM is public and the prefix is the only parameter.
+pub fn contract_key_from_prefix(prefix: &str) -> ContractKey {
+    let params = SiteParameters {
+        prefix: prefix.to_string(),
+    };
+    let mut params_buf = Vec::new();
+    ciborium::ser::into_writer(&params, &mut params_buf).expect("CBOR params");
+    let contract_code = ContractCode::from(SITE_CONTRACT_WASM);
+    ContractKey::from_params_and_code(Parameters::from(params_buf), &contract_code)
+}
+
+/// Visit an existing site by its 10-char prefix. Computes the contract key,
+/// sends GET + SUBSCRIBE.
+pub fn visit_site(input: String) {
+    let prefix = input.trim().to_string();
+    if prefix.is_empty() {
+        return;
+    }
+
+    // If already known, just select it
+    if SITES.read().contains_key(&prefix) {
+        *SHOW_ADD_SITE.write() = false;
+        select_site(&prefix);
+        return;
+    }
+
+    let contract_key = contract_key_from_prefix(&prefix);
 
     let placeholder = KnownSite {
-        name: format!("Loading ({prefix}...)"),
+        name: "Loading...".to_string(),
         prefix: prefix.clone(),
         role: SiteRole::Visitor,
         state: SiteState::default(),
         owner_pubkey: [0u8; 32],
-        contract_key: None,
+        contract_key: Some(contract_key),
     };
-    SITES.write().insert(prefix.clone(), placeholder);
+    SITES.with_mut(|sites| {
+        sites.insert(prefix.clone(), placeholder);
+    });
 
-    crate::freenet_api::get_site_by_id(&contract_id);
-    crate::freenet_api::subscribe_to_site_by_id(&contract_id);
+    // GET + SUBSCRIBE using the computed contract key
+    crate::freenet_api::get_site(&contract_key);
+    crate::freenet_api::subscribe_to_site(&contract_key);
 
     *SHOW_ADD_SITE.write() = false;
-    select_site(&prefix);
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let prefix_clone = prefix.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            select_site(&prefix_clone);
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        select_site(&prefix);
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -19,10 +19,12 @@ dioxus = { version = "0.7.3", features = ["web"] }
 
 # Web
 web-sys = { version = "0.3.64", features = [
+    "Clipboard",
     "Document",
     "Element",
     "HtmlElement",
     "HtmlTextAreaElement",
+    "Navigator",
     "Window",
     "Storage",
 ] }

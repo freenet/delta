@@ -23,10 +23,25 @@ pub fn PagesSidebar() -> Element {
 
     rsx! {
         aside { class: "w-52 flex flex-col h-full bg-bg-warm border-r border-border",
-            // Site name header
+            // Site name header with share button
             div { class: "px-4 py-4 border-b border-border",
-                h2 { class: "text-sm font-semibold text-text-light truncate",
-                    "{site.name}"
+                div { class: "flex items-center justify-between gap-2",
+                    h2 { class: "text-sm font-semibold text-text-light truncate flex-1",
+                        "{site.name}"
+                    }
+                    {
+                        let prefix = site.prefix.clone();
+                        rsx! {
+                            button {
+                                class: "text-[10px] font-mono text-text-muted hover:text-accent px-1.5 py-0.5 rounded hover:bg-accent-glow transition-colors flex-shrink-0",
+                                title: "Copy site code to share",
+                                onclick: move |_| {
+                                    copy_to_clipboard(&prefix);
+                                },
+                                "{site.prefix}"
+                            }
+                        }
+                    }
                 }
                 if !site.state.config.config.description.is_empty() {
                     p { class: "text-[11px] text-text-muted mt-0.5 truncate",
@@ -75,5 +90,19 @@ pub fn PagesSidebar() -> Element {
                 }
             }
         }
+    }
+}
+
+fn copy_to_clipboard(text: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            let clipboard = window.navigator().clipboard();
+            let _ = clipboard.write_text(text);
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = text;
     }
 }

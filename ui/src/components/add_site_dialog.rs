@@ -84,13 +84,14 @@ pub fn AddSiteDialog() -> Element {
                     div { class: "space-y-4",
                         div {
                             label { class: "block text-xs font-medium text-text-muted-light mb-1.5 uppercase tracking-wide",
-                                "Contract ID"
+                                "Site Code"
                             }
                             input {
-                                class: "w-full px-4 py-3 bg-panel-warm border border-border-light rounded-lg text-text outline-none focus:border-accent text-sm font-mono",
+                                class: "w-full px-4 py-3 bg-panel-warm border border-border-light rounded-lg text-text outline-none focus:border-accent text-sm font-mono tracking-wider",
                                 r#type: "text",
                                 value: "{contract_id}",
-                                placeholder: "EqJ5YpEE...",
+                                placeholder: "8uYFEDnGJk",
+                                maxlength: "10",
                                 autofocus: true,
                                 oninput: move |evt| contract_id.set(evt.value().to_string()),
                                 onkeypress: move |evt| {
@@ -104,7 +105,7 @@ pub fn AddSiteDialog() -> Element {
                             }
                         }
                         p { class: "text-xs text-text-muted-light",
-                            "Enter the contract ID of a site to browse it. You can find this in the site's URL."
+                            "Enter the 10-character site code to browse it."
                         }
                         div { class: "flex gap-3 pt-2",
                             button {
