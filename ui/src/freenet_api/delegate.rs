@@ -131,11 +131,7 @@ pub fn handle_delegate_response(values: Vec<OutboundDelegateMsg>) {
                     log("Delta: signing key stored in delegate");
                 }
                 DelegateResponse::PublicKey(vk) => {
-                    let prefix = delta_core::SiteParameters {
-                        owner: vk,
-                        site_id: [0u8; 32], // prefix is from pubkey, site_id doesn't matter
-                    }
-                    .site_prefix();
+                    let prefix = delta_core::pubkey_to_prefix(&vk);
                     log(&format!("Delta: delegate has key for site prefix {prefix}"));
                     // Mark the site as owner if we have it
                     let mut sites = state::SITES.write();

@@ -1,7 +1,16 @@
 use crate::state::{KnownSite, SiteRole};
 use delta_core::{Page, SignedConfig, SiteConfig, SiteState};
-use ed25519_dalek::Signature;
+use ed25519_dalek::{Signature, SigningKey, VerifyingKey};
 use std::collections::BTreeMap;
+
+/// Create a deterministic placeholder verifying key from a seed byte.
+fn placeholder_vk(seed: u8) -> VerifyingKey {
+    let mut bytes = [0u8; 32];
+    bytes[0] = seed;
+    // Use as signing key seed to get a valid point on the curve
+    let sk = SigningKey::from_bytes(&bytes);
+    sk.verifying_key()
+}
 
 /// Create example sites for demo/testing.
 pub fn create_example_sites() -> BTreeMap<String, KnownSite> {
@@ -42,6 +51,7 @@ pub fn create_example_sites() -> BTreeMap<String, KnownSite> {
                 prefix: prefix.clone(),
                 role: SiteRole::Owner,
                 state: SiteState {
+                    owner: placeholder_vk(0),
                     config: SignedConfig {
                         config: SiteConfig {
                             version: 1,
@@ -92,6 +102,7 @@ pub fn create_example_sites() -> BTreeMap<String, KnownSite> {
                 prefix: prefix.clone(),
                 role: SiteRole::Visitor,
                 state: SiteState {
+                    owner: placeholder_vk(0),
                     config: SignedConfig {
                         config: SiteConfig {
                             version: 1,
@@ -135,6 +146,7 @@ pub fn create_example_sites() -> BTreeMap<String, KnownSite> {
                 prefix: prefix.clone(),
                 role: SiteRole::Visitor,
                 state: SiteState {
+                    owner: placeholder_vk(0),
                     config: SignedConfig {
                         config: SiteConfig {
                             version: 1,

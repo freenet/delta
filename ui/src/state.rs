@@ -109,13 +109,8 @@ pub fn create_new_site(name: String) {
     let signing_key = SigningKey::generate(&mut rand::thread_rng());
     let verifying_key = signing_key.verifying_key();
 
-    let mut site_id = [0u8; 32];
-    rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut site_id);
-    let params = SiteParameters {
-        owner: verifying_key,
-        site_id,
-    };
-    let prefix = params.site_prefix();
+    let params = SiteParameters::from_owner(&verifying_key);
+    let prefix = params.prefix.clone();
 
     let config = SiteConfig {
         version: 1,

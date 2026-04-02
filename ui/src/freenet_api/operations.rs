@@ -73,6 +73,7 @@ fn handle_site_state(key: ContractKey, state_bytes: &[u8]) {
     };
 
     let name = site_state.config.config.name.clone();
+    let owner_pubkey = site_state.owner.to_bytes();
     let prefix = key_to_prefix(&key);
 
     let mut sites = state::SITES.write();
@@ -87,7 +88,7 @@ fn handle_site_state(key: ContractKey, state_bytes: &[u8]) {
                 prefix: prefix.clone(),
                 role: SiteRole::Visitor,
                 state: site_state,
-                owner_pubkey: [0u8; 32],
+                owner_pubkey,
                 contract_key: Some(key),
             },
         );
