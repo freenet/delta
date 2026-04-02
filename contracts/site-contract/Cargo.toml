@@ -1,0 +1,19 @@
+[package]
+name = "site-contract"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ciborium.workspace = true
+ed25519-dalek.workspace = true
+freenet-stdlib.workspace = true
+freenet-scaffold.workspace = true
+delta-core.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["freenet-main-contract"]
+contract = ["freenet-stdlib/contract"]
+freenet-main-contract = []

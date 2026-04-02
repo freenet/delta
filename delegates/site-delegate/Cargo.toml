@@ -1,0 +1,18 @@
+[package]
+name = "site-delegate"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = ["freenet-main-delegate"]
+freenet-main-delegate = []
+
+[dependencies]
+ciborium.workspace = true
+freenet-stdlib.workspace = true
+serde = { workspace = true, features = ["derive"] }
+delta-core.workspace = true
+ed25519-dalek.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
