@@ -1,0 +1,20 @@
+[package]
+name = "delta-core"
+version.workspace = true
+edition.workspace = true
+authors = ["Freenet Project"]
+description = "Core library for Delta - decentralized website builder on Freenet"
+license = "LGPL-3.0"
+
+[dependencies]
+ciborium.workspace = true
+serde.workspace = true
+ed25519-dalek = { workspace = true, default-features = false, features = ["alloc", "serde"] }
+blake3.workspace = true
+freenet-scaffold.workspace = true
+freenet-scaffold-macro.workspace = true
+freenet-stdlib.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+ed25519-dalek = { workspace = true, features = ["rand_core"] }
