@@ -1,3 +1,4 @@
+mod add_site_dialog;
 mod editor;
 mod page_view;
 mod pages_sidebar;
@@ -14,16 +15,24 @@ pub fn App() -> Element {
         state::init_example_data();
     });
 
+    let show_add_site = *state::SHOW_ADD_SITE.read();
+
     rsx! {
         div { class: "flex h-screen bg-bg text-text",
             sites_sidebar::SitesSidebar {}
-            pages_sidebar::PagesSidebar {}
-            main { class: "flex-1 overflow-y-auto bg-panel",
-                {
-                    if *state::EDITING.read() {
-                        rsx! { editor::Editor {} }
-                    } else {
-                        rsx! { page_view::PageView {} }
+            if show_add_site {
+                main { class: "flex-1 overflow-y-auto bg-panel",
+                    add_site_dialog::AddSiteDialog {}
+                }
+            } else {
+                pages_sidebar::PagesSidebar {}
+                main { class: "flex-1 overflow-y-auto bg-panel",
+                    {
+                        if *state::EDITING.read() {
+                            rsx! { editor::Editor {} }
+                        } else {
+                            rsx! { page_view::PageView {} }
+                        }
                     }
                 }
             }

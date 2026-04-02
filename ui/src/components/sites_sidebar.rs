@@ -54,11 +54,15 @@ pub fn SitesSidebar() -> Element {
                 }
             }
 
-            // Add site button
+            // Add site button + build info
             div { class: "px-3 py-3 border-t border-border",
                 button {
-                    class: "btn-secondary w-full px-3 py-2 text-xs",
+                    class: "btn-secondary w-full px-3 py-2 text-xs mb-2",
+                    onclick: move |_| state::show_add_site_prompt(),
                     "+ Add Site"
+                }
+                p { class: "text-[9px] text-text-muted text-center leading-tight",
+                    "Built: {env!(\"BUILD_TIMESTAMP\")}"
                 }
             }
         }
