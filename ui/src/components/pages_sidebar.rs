@@ -25,27 +25,32 @@ pub fn PagesSidebar() -> Element {
         aside { class: "w-52 flex flex-col h-full bg-bg-warm border-r border-border",
             // Site name header with share button
             div { class: "px-4 py-4 border-b border-border",
-                div { class: "flex items-center justify-between gap-2",
-                    h2 { class: "text-sm font-semibold text-text-light truncate flex-1",
-                        "{site.name}"
-                    }
-                    {
-                        let prefix = site.prefix.clone();
-                        rsx! {
-                            button {
-                                class: "text-[10px] font-mono text-text-muted hover:text-accent px-1.5 py-0.5 rounded hover:bg-accent-glow transition-colors flex-shrink-0",
-                                title: "Copy site code to share",
-                                onclick: move |_| {
-                                    copy_to_clipboard(&prefix);
-                                },
-                                "{site.prefix}"
-                            }
-                        }
-                    }
+                h2 { class: "text-sm font-semibold text-text-light truncate",
+                    "{site.name}"
                 }
                 if !site.state.config.config.description.is_empty() {
                     p { class: "text-[11px] text-text-muted mt-0.5 truncate",
                         "{site.state.config.config.description}"
+                    }
+                }
+                // Share / copy code button
+                {
+                    let prefix = site.prefix.clone();
+                    let mut copied = use_signal(|| false);
+                    rsx! {
+                        button {
+                            class: "mt-2 w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg bg-accent-glow hover:bg-accent-soft text-accent text-xs font-mono tracking-wide transition-colors",
+                            title: "Copy site code to share",
+                            onclick: move |_| {
+                                copy_to_clipboard(&prefix);
+                                copied.set(true);
+                            },
+                            if *copied.read() {
+                                "Copied!"
+                            } else {
+                                "Share: {site.prefix}"
+                            }
+                        }
                     }
                 }
             }
