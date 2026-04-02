@@ -102,6 +102,23 @@ pub fn show_add_site_prompt() {
     *SHOW_ADD_SITE.write() = true;
 }
 
+/// Remove a site from the sidebar.
+pub fn remove_site(prefix: &str) {
+    SITES.with_mut(|sites| {
+        sites.remove(prefix);
+    });
+    // If we removed the currently selected site, select another
+    if CURRENT_SITE.read().as_deref() == Some(prefix) {
+        let next = SITES.read().keys().next().cloned();
+        if let Some(next_prefix) = next {
+            select_site(&next_prefix);
+        } else {
+            *CURRENT_SITE.write() = None;
+            *CURRENT_PAGE.write() = None;
+        }
+    }
+}
+
 /// Create a new owned site. Signs initial state locally (key is in memory
 /// momentarily), PUTs to network, then stores key in delegate for future
 /// signing. The key is NOT kept in browser memory after this.

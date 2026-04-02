@@ -89,6 +89,7 @@ fn site_row(prefix: &str, site: &state::KnownSite, current_prefix: &Option<Strin
     let is_selected = current_prefix.as_deref() == Some(prefix);
     let is_owner = site.role == SiteRole::Owner;
     let prefix_owned = prefix.to_string();
+    let prefix_for_remove = prefix.to_string();
 
     let row_class = if is_selected {
         "site-selected bg-surface"
@@ -102,17 +103,28 @@ fn site_row(prefix: &str, site: &state::KnownSite, current_prefix: &Option<Strin
         "site-avatar site-avatar-visitor"
     };
 
-    // First letter of site name for avatar
     let initial = site.name.chars().next().unwrap_or('?');
 
     rsx! {
-        button {
-            class: "w-full flex items-center gap-2.5 px-3 py-2 text-left transition-all-fast {row_class}",
-            onclick: move |_| state::select_site(&prefix_owned),
-            span { class: "{avatar_class}", "{initial}" }
-            div { class: "min-w-0 flex-1",
-                div { class: "text-sm text-text-light truncate font-medium", "{site.name}" }
-                div { class: "text-[10px] text-text-muted font-mono truncate", "{site.prefix}" }
+        div { class: "group relative flex items-center {row_class} transition-all-fast",
+            button {
+                class: "w-full flex items-center gap-2.5 px-3 py-2 text-left",
+                onclick: move |_| state::select_site(&prefix_owned),
+                span { class: "{avatar_class}", "{initial}" }
+                div { class: "min-w-0 flex-1",
+                    div { class: "text-sm text-text-light truncate font-medium", "{site.name}" }
+                    div { class: "text-[10px] text-text-muted font-mono truncate", "{site.prefix}" }
+                }
+            }
+            // Remove button — visible on hover
+            button {
+                class: "absolute right-1 top-1/2 -translate-y-1/2 w-5 h-5 flex items-center justify-center rounded text-text-muted hover:text-text hover:bg-surface-hover opacity-0 group-hover:opacity-100 transition-opacity text-xs",
+                title: "Remove site",
+                onclick: move |evt| {
+                    evt.stop_propagation();
+                    state::remove_site(&prefix_for_remove);
+                },
+                "\u{00d7}" // ×
             }
         }
     }
