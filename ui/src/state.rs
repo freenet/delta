@@ -38,9 +38,6 @@ pub static SHOW_ADD_SITE: GlobalSignal<bool> = GlobalSignal::new(|| false);
 pub static EDITOR_TITLE: GlobalSignal<String> = GlobalSignal::new(String::new);
 pub static EDITOR_CONTENT: GlobalSignal<String> = GlobalSignal::new(String::new);
 
-/// Site contract WASM (for computing contract keys).
-const SITE_CONTRACT_WASM: &[u8] = include_bytes!("../public/contracts/site_contract.wasm");
-
 // ---------------------------------------------------------------------------
 // Initialization
 // ---------------------------------------------------------------------------
@@ -120,7 +117,6 @@ pub fn create_new_site(name: String) {
     };
     let prefix = params.site_prefix();
 
-    // Sign initial state locally (we have the key right now)
     let config = SiteConfig {
         version: 1,
         name: name.clone(),
@@ -139,34 +135,39 @@ pub fn create_new_site(name: String) {
         .upsert_page(1, home_page, &verifying_key)
         .expect("valid signed page");
 
-    // Compute contract key
-    let mut params_buf = Vec::new();
-    ciborium::ser::into_writer(&params, &mut params_buf).expect("CBOR params");
-    let contract_code = ContractCode::from(SITE_CONTRACT_WASM);
-    let contract_key =
-        ContractKey::from_params_and_code(Parameters::from(params_buf.clone()), &contract_code);
-
-    // Store signing key in delegate (persists across page refreshes)
+    // Store signing key in delegate for persistence
     let sk_bytes = signing_key.to_bytes();
     crate::freenet_api::delegate::store_signing_key(&sk_bytes);
-    // Key is dropped after this function — all future signing goes through delegate
 
-    // Add to known sites
     let site = KnownSite {
         name: name.clone(),
         prefix: prefix.clone(),
         role: SiteRole::Owner,
         state: site_state.clone(),
         owner_pubkey: verifying_key.to_bytes(),
-        contract_key: Some(contract_key),
+        contract_key: None,
     };
-    SITES.write().insert(prefix.clone(), site);
+    SITES.with_mut(|sites| {
+        sites.insert(prefix.clone(), site);
+    });
 
-    // PUT to Freenet network
+    // PUT to Freenet network (if connected)
     crate::freenet_api::put_site(&params, &site_state);
 
     *SHOW_ADD_SITE.write() = false;
-    select_site(&prefix);
+
+    // Defer site selection so Dioxus can re-render with the new site first
+    #[cfg(target_arch = "wasm32")]
+    {
+        let prefix_clone = prefix.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            select_site(&prefix_clone);
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        select_site(&prefix);
+    }
 }
 
 /// Visit an existing site by contract ID string (base58). Sends GET + SUBSCRIBE.

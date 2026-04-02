@@ -28,6 +28,19 @@ pub fn connect_to_freenet() {
         let ws_url = get_websocket_url();
         web_sys::console::log_1(&format!("Delta: connecting to {ws_url}").into());
 
+        // Check if we're likely on a Freenet gateway (URL contains /v1/contract/)
+        // On a dev server, WebSocket will fail and crash the WASM runtime
+        let is_gateway = web_sys::window()
+            .and_then(|w| w.location().pathname().ok())
+            .map(|p| p.contains("/v1/contract/"))
+            .unwrap_or(false);
+
+        if !is_gateway {
+            web_sys::console::log_1(&"Delta: not on gateway, skipping WebSocket connection".into());
+            *CONNECTION_STATUS.write() = ConnectionStatus::Disconnected;
+            return;
+        }
+
         let websocket = match web_sys::WebSocket::new(&ws_url) {
             Ok(ws) => ws,
             Err(e) => {
@@ -43,16 +56,31 @@ pub fn connect_to_freenet() {
             move |result| match result {
                 Ok(response) => super::operations::handle_response(response),
                 Err(e) => {
-                    web_sys::console::error_1(&format!("Delta: API error: {e:?}").into());
+                    let msg = format!("Delta: API error: {e:?}");
+                    let truncated = if msg.len() > 200 {
+                        format!("{}...", &msg[..200])
+                    } else {
+                        msg
+                    };
+                    web_sys::console::error_1(&truncated.into());
                 }
             },
             move |error| {
-                web_sys::console::error_1(&format!("Delta: connection error: {error}").into());
-                *CONNECTION_STATUS.write() = ConnectionStatus::Error(error.to_string());
+                let msg = error.to_string();
+                let truncated = if msg.len() > 200 {
+                    format!("Delta: connection error: {}...", &msg[..200])
+                } else {
+                    format!("Delta: connection error: {msg}")
+                };
+                web_sys::console::error_1(&truncated.into());
+                *CONNECTION_STATUS.write() =
+                    ConnectionStatus::Error("Connection failed".to_string());
             },
             move || {
                 web_sys::console::log_1(&"Delta: connected to Freenet".into());
                 *CONNECTION_STATUS.write() = ConnectionStatus::Connected;
+                // Now that we're connected, register the delegate
+                super::delegate::register_delegate();
             },
         );
 

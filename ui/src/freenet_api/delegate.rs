@@ -4,10 +4,13 @@
 //! the delegate signs with its stored key and returns the signed object.
 //! The response handler then sends the signed data to the network.
 
+#[allow(unused_imports)]
 use ciborium::{de::from_reader, ser::into_writer};
 use delta_core::{DelegateResponse, PageId};
 use dioxus::prelude::*;
+#[allow(unused_imports)]
 use freenet_stdlib::client_api::ClientRequest;
+#[allow(unused_imports)]
 use freenet_stdlib::client_api::DelegateRequest as StdlibDelegateRequest;
 use freenet_stdlib::prelude::*;
 use std::collections::BTreeMap;

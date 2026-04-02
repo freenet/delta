@@ -11,14 +11,11 @@ use crate::state;
 
 #[component]
 pub fn App() -> Element {
-    // Initialize example data and connect to Freenet on first render
-    use_effect(|| {
+    // Initialize once — use_hook runs only on first mount, not on re-renders
+    use_hook(|| {
         state::init_example_data();
         setup_hash_listener();
         freenet_api::connect_to_freenet();
-        // Delegate registration happens after connection is established.
-        // For now, register immediately — the WebSocket will queue the message.
-        freenet_api::register_delegate();
     });
 
     let show_add_site = *state::SHOW_ADD_SITE.read();
