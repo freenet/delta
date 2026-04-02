@@ -15,8 +15,8 @@ pub fn handle_response(response: HostResponse) {
         HostResponse::ContractResponse(contract_response) => {
             handle_contract_response(contract_response);
         }
-        HostResponse::DelegateResponse { .. } => {
-            log("Delta: delegate response received");
+        HostResponse::DelegateResponse { key: _, values } => {
+            super::delegate::handle_delegate_response(values);
         }
         HostResponse::Ok => {}
         other => {
@@ -131,7 +131,13 @@ fn handle_site_delta(key: ContractKey, delta_bytes: &[u8]) {
 /// Subscribe to a site contract to receive live updates.
 #[allow(dead_code)]
 pub fn subscribe_to_site(contract_key: &ContractKey) {
-    let key = *contract_key.id();
+    subscribe_to_site_by_id(contract_key.id());
+}
+
+/// Subscribe by ContractInstanceId directly.
+#[allow(dead_code)]
+pub fn subscribe_to_site_by_id(id: &ContractInstanceId) {
+    let key = *id;
     send(move |api| {
         Box::pin(async move {
             let request =
@@ -144,7 +150,13 @@ pub fn subscribe_to_site(contract_key: &ContractKey) {
 /// GET a site contract's current state.
 #[allow(dead_code)]
 pub fn get_site(contract_key: &ContractKey) {
-    let key = *contract_key.id();
+    get_site_by_id(contract_key.id());
+}
+
+/// GET by ContractInstanceId directly.
+#[allow(dead_code)]
+pub fn get_site_by_id(id: &ContractInstanceId) {
+    let key = *id;
     send(move |api| {
         Box::pin(async move {
             let request = ClientRequest::ContractOp(ContractRequest::Get {

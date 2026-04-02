@@ -78,7 +78,7 @@ pub fn SitesSidebar() -> Element {
                     }
                 }
                 p { class: "text-[9px] text-text-muted text-center leading-tight",
-                    "Built: {env!(\"BUILD_TIMESTAMP\")}"
+                    "Built: {format_build_time_local()}"
                 }
             }
         }
@@ -115,5 +115,38 @@ fn site_row(prefix: &str, site: &state::KnownSite, current_prefix: &Option<Strin
                 div { class: "text-[10px] text-text-muted font-mono truncate", "{site.prefix}" }
             }
         }
+    }
+}
+
+const BUILD_TIMESTAMP_ISO: &str = env!("BUILD_TIMESTAMP_ISO", "unknown");
+
+/// Convert UTC ISO timestamp to local time using browser's Date API.
+fn format_build_time_local() -> String {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use js_sys::Date;
+        let date = Date::new(&wasm_bindgen::JsValue::from_str(BUILD_TIMESTAMP_ISO));
+        if date.to_string().as_string().is_some() {
+            let year = date.get_full_year();
+            let month = date.get_month() + 1;
+            let day = date.get_date();
+            let hours = date.get_hours();
+            let minutes = date.get_minutes();
+            let offset_min = date.get_timezone_offset() as i32;
+            let tz_str = if offset_min == 0 {
+                "UTC".to_string()
+            } else {
+                let sign = if offset_min <= 0 { '+' } else { '-' };
+                let abs = offset_min.unsigned_abs();
+                format!("UTC{sign}{}", abs / 60)
+            };
+            format!("{year:04}-{month:02}-{day:02} {hours:02}:{minutes:02} {tz_str}")
+        } else {
+            BUILD_TIMESTAMP_ISO.to_string()
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        BUILD_TIMESTAMP_ISO.to_string()
     }
 }
