@@ -33,20 +33,20 @@ pub fn PagesSidebar() -> Element {
                         "{site.state.config.config.description}"
                     }
                 }
-                // Share / copy code button
+                // Share — copies full URL with hash
                 {
                     let prefix = site.prefix.clone();
                     let mut copied = use_signal(|| false);
                     rsx! {
                         button {
                             class: "mt-2 w-full flex items-center justify-center gap-1.5 px-2 py-1.5 rounded-lg bg-accent-glow hover:bg-accent-soft text-accent text-xs font-mono tracking-wide transition-colors",
-                            title: "Copy site code to share",
+                            title: "Copy shareable link",
                             onclick: move |_| {
-                                copy_to_clipboard(&prefix);
+                                copy_share_url(&prefix);
                                 copied.set(true);
                             },
                             if *copied.read() {
-                                "Copied!"
+                                "Link copied!"
                             } else {
                                 "Share: {site.prefix}"
                             }
@@ -98,16 +98,22 @@ pub fn PagesSidebar() -> Element {
     }
 }
 
-fn copy_to_clipboard(text: &str) {
+/// Copy the full shareable URL (base URL + #prefix) to clipboard.
+fn copy_share_url(prefix: &str) {
     #[cfg(target_arch = "wasm32")]
     {
         if let Some(window) = web_sys::window() {
+            // Build URL: current origin + pathname + #prefix
+            let location = window.location();
+            let origin = location.origin().unwrap_or_default();
+            let pathname = location.pathname().unwrap_or_default();
+            let url = format!("{origin}{pathname}#{prefix}");
             let clipboard = window.navigator().clipboard();
-            let _ = clipboard.write_text(text);
+            let _ = clipboard.write_text(&url);
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let _ = text;
+        let _ = prefix;
     }
 }
