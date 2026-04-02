@@ -50,8 +50,9 @@ pub fn register_delegate() {
                     Ok(_) => {
                         log("Delta: delegate registered");
                         drop(api);
-                        // Check current delegate for stored key
+                        // Load persisted data
                         request_public_key();
+                        load_known_sites();
                         // Try to migrate from legacy delegates
                         fire_legacy_migration();
                     }
@@ -67,6 +68,27 @@ pub fn store_signing_key(key_bytes: &[u8; 32]) {
     let request = delta_core::DelegateRequest::StoreSigningKey {
         key_bytes: key_bytes.to_vec(),
     };
+    send_delegate_request(&request);
+}
+
+/// Save the current known sites list to the delegate for persistence.
+pub fn save_known_sites() {
+    let sites = state::SITES.read();
+    let records: Vec<delta_core::KnownSiteRecord> = sites
+        .values()
+        .map(|s| delta_core::KnownSiteRecord {
+            prefix: s.prefix.clone(),
+            name: s.name.clone(),
+            is_owner: s.role == state::SiteRole::Owner,
+        })
+        .collect();
+    let request = delta_core::DelegateRequest::StoreKnownSites { sites: records };
+    send_delegate_request(&request);
+}
+
+/// Request the delegate to load known sites.
+fn load_known_sites() {
+    let request = delta_core::DelegateRequest::GetKnownSites;
     send_delegate_request(&request);
 }
 
@@ -162,6 +184,16 @@ pub fn handle_delegate_response(values: Vec<OutboundDelegateMsg>) {
                         "Delta: delegate signed config v{}",
                         config.config.version
                     ));
+                }
+                DelegateResponse::SitesStored => {
+                    log("Delta: known sites saved to delegate");
+                }
+                DelegateResponse::KnownSites(records) => {
+                    log(&format!(
+                        "Delta: loaded {} known site(s) from delegate",
+                        records.len()
+                    ));
+                    restore_known_sites(records);
                 }
                 DelegateResponse::Error(e) => {
                     log(&format!("Delta: delegate error: {e}"));
@@ -262,6 +294,54 @@ fn send_delegate_request(request: &delta_core::DelegateRequest) {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = request;
+    }
+}
+
+/// Restore known sites from delegate-persisted records.
+/// For each site, creates a placeholder entry and sends GET+SUBSCRIBE.
+fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
+    for record in records {
+        let prefix = record.prefix.clone();
+
+        // Skip if already loaded (e.g. from hash route)
+        if state::SITES.read().contains_key(&prefix) {
+            continue;
+        }
+
+        let role = if record.is_owner {
+            state::SiteRole::Owner
+        } else {
+            state::SiteRole::Visitor
+        };
+
+        let contract_key = state::contract_key_from_prefix(&prefix);
+
+        let site = state::KnownSite {
+            name: record.name,
+            prefix: prefix.clone(),
+            role,
+            state: delta_core::SiteState::default(),
+            owner_pubkey: [0u8; 32],
+            contract_key: Some(contract_key),
+        };
+
+        state::SITES.with_mut(|sites| {
+            sites.insert(prefix.clone(), site);
+        });
+
+        // GET + SUBSCRIBE to reload the site content
+        super::operations::get_site(&contract_key);
+        super::operations::subscribe_to_site(&contract_key);
+    }
+
+    // Select the first site if none selected
+    #[cfg(target_arch = "wasm32")]
+    if state::CURRENT_SITE.read().is_none() {
+        if let Some(prefix) = state::SITES.read().keys().next().cloned() {
+            wasm_bindgen_futures::spawn_local(async move {
+                state::select_site(&prefix);
+            });
+        }
     }
 }
 

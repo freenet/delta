@@ -112,6 +112,7 @@ pub fn remove_site(prefix: &str) {
     SITES.with_mut(|sites| {
         sites.remove(prefix);
     });
+    crate::freenet_api::delegate::save_known_sites();
     // If we removed the currently selected site, select another
     if CURRENT_SITE.read().as_deref() == Some(prefix) {
         let next = SITES.read().keys().next().cloned();
@@ -167,6 +168,7 @@ pub fn create_new_site(name: String) {
     SITES.with_mut(|sites| {
         sites.insert(prefix.clone(), site);
     });
+    crate::freenet_api::delegate::save_known_sites();
 
     // PUT to Freenet network (if connected)
     crate::freenet_api::put_site(&params, &site_state);
@@ -230,6 +232,7 @@ pub fn visit_site(input: String) {
     SITES.with_mut(|sites| {
         sites.insert(prefix.clone(), placeholder);
     });
+    crate::freenet_api::delegate::save_known_sites();
 
     // GET + SUBSCRIBE using the computed contract key
     crate::freenet_api::get_site(&contract_key);

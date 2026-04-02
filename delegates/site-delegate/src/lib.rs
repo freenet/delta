@@ -9,6 +9,7 @@ use freenet_stdlib::prelude::{
 };
 
 const SIGNING_KEY_STORAGE_KEY: &str = "delta:signing_key";
+const KNOWN_SITES_STORAGE_KEY: &str = "delta:known_sites";
 
 pub struct SiteDelegate;
 
@@ -97,6 +98,25 @@ fn handle_app_message(
             Ok(key) => DelegateResponse::PublicKey(key.verifying_key()),
             Err(e) => DelegateResponse::Error(e),
         },
+
+        DelegateRequest::StoreKnownSites { sites } => {
+            let mut buf = Vec::new();
+            into_writer(&sites, &mut buf)
+                .map_err(|e| DelegateError::Other(format!("CBOR serialization: {e}")))?;
+            ctx.set_secret(KNOWN_SITES_STORAGE_KEY.as_bytes(), &buf);
+            DelegateResponse::SitesStored
+        }
+
+        DelegateRequest::GetKnownSites => {
+            if let Some(data) = ctx.get_secret(KNOWN_SITES_STORAGE_KEY.as_bytes()) {
+                match from_reader::<Vec<delta_core::KnownSiteRecord>, _>(data.as_slice()) {
+                    Ok(sites) => DelegateResponse::KnownSites(sites),
+                    Err(e) => DelegateResponse::Error(format!("deserialize known sites: {e}")),
+                }
+            } else {
+                DelegateResponse::KnownSites(Vec::new())
+            }
+        }
     };
 
     let mut payload = Vec::new();

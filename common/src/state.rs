@@ -444,6 +444,14 @@ fn deletion_signing_bytes(page_id: PageId, deleted_at: u64) -> Vec<u8> {
 // Delegate request/response types
 // ---------------------------------------------------------------------------
 
+/// A lightweight record of a known site (stored in delegate for persistence).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct KnownSiteRecord {
+    pub prefix: String,
+    pub name: String,
+    pub is_owner: bool,
+}
+
 /// Requests from the UI to the delegate.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum DelegateRequest {
@@ -462,6 +470,10 @@ pub enum DelegateRequest {
     SignConfig { config: SiteConfig },
     /// Get the owner's public key.
     GetPublicKey,
+    /// Store the list of known sites (for persistence across refreshes).
+    StoreKnownSites { sites: Vec<KnownSiteRecord> },
+    /// Retrieve the list of known sites.
+    GetKnownSites,
 }
 
 /// Responses from the delegate to the UI.
@@ -477,6 +489,10 @@ pub enum DelegateResponse {
     SignedConfig(SignedConfig),
     /// The owner's public key.
     PublicKey(VerifyingKey),
+    /// Stored known sites.
+    SitesStored,
+    /// Retrieved known sites.
+    KnownSites(Vec<KnownSiteRecord>),
     /// An error occurred.
     Error(String),
 }
