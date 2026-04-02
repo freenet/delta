@@ -1,0 +1,19 @@
+[application]
+name = "delta"
+default_platform = "web"
+out_dir = "dist"
+asset_dir = "assets"
+
+[web.app]
+title = "Delta"
+
+[web.watcher]
+reload_html = true
+watch_path = ["src", "assets"]
+
+[web.resource]
+script = []
+include = []
+
+[web.resource.dev]
+script = []

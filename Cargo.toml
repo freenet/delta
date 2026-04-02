@@ -3,6 +3,7 @@ members = [
     "common",
     "contracts/site-contract",
     "delegates/site-delegate",
+    "ui",
 ]
 resolver = "2"
 
