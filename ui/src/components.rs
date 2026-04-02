@@ -21,6 +21,7 @@ pub fn App() -> Element {
     let show_add_site = *state::SHOW_ADD_SITE.read();
 
     rsx! {
+        document::Link { rel: "icon", href: asset!("/assets/favicon.svg") }
         div { class: "flex h-screen bg-bg text-text",
             sites_sidebar::SitesSidebar {}
             if show_add_site {
