@@ -6,13 +6,12 @@ use crate::state;
 pub fn Editor() -> Element {
     let Some((_page_id, _page)) = state::current_page() else {
         return rsx! {
-            div { class: "flex items-center justify-center h-full text-text-muted",
+            div { class: "flex items-center justify-center h-full text-text-muted-light",
                 p { "No page selected" }
             }
         };
     };
 
-    // Initialize editor content when entering edit mode
     use_effect(move || {
         if let Some((_, page)) = state::current_page() {
             *state::EDITOR_TITLE.write() = page.title.clone();
@@ -25,11 +24,11 @@ pub fn Editor() -> Element {
     let preview_html = markdown::to_html(&content);
 
     rsx! {
-        div { class: "flex flex-col h-full",
+        div { class: "flex flex-col h-full bg-panel",
             // Toolbar
-            div { class: "flex items-center gap-3 px-6 py-3 border-b border-border bg-surface",
+            div { class: "flex items-center gap-3 px-6 py-3 border-b border-border-light",
                 input {
-                    class: "text-xl font-bold bg-transparent border-none outline-none flex-1 text-text placeholder-text-muted",
+                    class: "text-xl bg-transparent border-none outline-none flex-1 text-text placeholder-text-muted-light font-semibold",
                     r#type: "text",
                     value: "{title}",
                     placeholder: "Page title",
@@ -38,12 +37,12 @@ pub fn Editor() -> Element {
                     },
                 }
                 button {
-                    class: "px-4 py-2 text-sm bg-accent text-text-inverse rounded-lg hover:bg-accent-hover font-medium transition-colors",
+                    class: "btn-primary px-5 py-2 text-sm",
                     onclick: move |_| state::save_current_page(),
                     "Save"
                 }
                 button {
-                    class: "px-4 py-2 text-sm bg-surface-hover text-text rounded-lg hover:bg-border transition-colors",
+                    class: "btn-ghost px-4 py-2 text-sm",
                     onclick: move |_| {
                         *state::EDITING.write() = false;
                     },
@@ -54,12 +53,12 @@ pub fn Editor() -> Element {
             // Editor + Preview split
             div { class: "flex flex-1 overflow-hidden",
                 // Editor pane
-                div { class: "flex-1 flex flex-col border-r border-border",
-                    div { class: "px-4 py-2 text-[10px] font-semibold text-text-muted bg-surface border-b border-border uppercase tracking-widest",
+                div { class: "flex-1 flex flex-col border-r border-border-light",
+                    div { class: "px-4 py-2 text-[10px] font-semibold text-text-muted-light border-b border-border-light uppercase tracking-[0.1em] bg-panel-warm",
                         "Markdown"
                     }
                     textarea {
-                        class: "editor-textarea flex-1 w-full p-4 resize-none outline-none text-sm",
+                        class: "editor-textarea flex-1 w-full p-5 resize-none outline-none",
                         value: "{content}",
                         placeholder: "Write your page content in Markdown...",
                         oninput: move |evt| {
@@ -70,10 +69,10 @@ pub fn Editor() -> Element {
 
                 // Preview pane
                 div { class: "flex-1 flex flex-col bg-panel",
-                    div { class: "px-4 py-2 text-[10px] font-semibold text-text-muted bg-surface border-b border-border uppercase tracking-widest",
+                    div { class: "px-4 py-2 text-[10px] font-semibold text-text-muted-light border-b border-border-light uppercase tracking-[0.1em] bg-panel-warm",
                         "Preview"
                     }
-                    div { class: "flex-1 overflow-y-auto p-6",
+                    div { class: "flex-1 overflow-y-auto p-8",
                         div {
                             class: "prose max-w-none",
                             dangerous_inner_html: "{preview_html}"

@@ -8,7 +8,6 @@ pub fn SitesSidebar() -> Element {
     let sites = state::SITES.read();
     let current_prefix = (*state::CURRENT_SITE.read()).clone();
 
-    // Separate owned and visited sites
     let mut owned: Vec<_> = sites
         .iter()
         .filter(|(_, s)| s.role == SiteRole::Owner)
@@ -21,44 +20,44 @@ pub fn SitesSidebar() -> Element {
     visited.sort_by_key(|(_, s)| s.name.to_lowercase());
 
     rsx! {
-        aside { class: "w-52 border-r border-border flex flex-col h-full bg-bg",
-            // Header
-            div { class: "p-4 border-b border-border",
-                h1 { class: "text-base font-bold text-text tracking-tight", "Delta" }
-                p { class: "text-xs text-text-muted mt-0.5", "Decentralized sites" }
+        aside { class: "w-56 flex flex-col h-full bg-bg border-r border-border",
+
+            // Logo header
+            div { class: "px-4 py-4 border-b border-border",
+                div { class: "flex items-center gap-2.5",
+                    span { class: "delta-mark", "\u{0394}" }
+                    div {
+                        span { class: "delta-logo text-text-light text-[17px]", "Delta" }
+                        p { class: "text-[10px] text-text-muted leading-tight mt-0.5", "Decentralized publishing" }
+                    }
+                }
             }
 
             // Sites list
-            nav { class: "flex-1 overflow-y-auto px-2 py-3",
-                // My Sites section
+            nav { class: "flex-1 overflow-y-auto py-3",
                 if !owned.is_empty() {
-                    div { class: "mb-4",
-                        p { class: "px-2 mb-1 text-[10px] font-semibold text-text-muted uppercase tracking-widest",
-                            "My Sites"
-                        }
+                    div { class: "mb-5",
+                        p { class: "section-label mb-2", "My Sites" }
                         for (prefix, site) in owned.iter() {
-                            { site_button(prefix, site, &current_prefix) }
+                            { site_row(prefix, site, &current_prefix) }
                         }
                     }
                 }
 
-                // Visited section
                 if !visited.is_empty() {
                     div {
-                        p { class: "px-2 mb-1 text-[10px] font-semibold text-text-muted uppercase tracking-widest",
-                            "Visited"
-                        }
+                        p { class: "section-label mb-2", "Visited" }
                         for (prefix, site) in visited.iter() {
-                            { site_button(prefix, site, &current_prefix) }
+                            { site_row(prefix, site, &current_prefix) }
                         }
                     }
                 }
             }
 
-            // Add site
-            div { class: "p-3 border-t border-border",
+            // Add site button
+            div { class: "px-3 py-3 border-t border-border",
                 button {
-                    class: "w-full px-3 py-2 text-xs bg-surface text-text-muted rounded-lg hover:bg-surface-hover transition-colors",
+                    class: "btn-secondary w-full px-3 py-2 text-xs",
                     "+ Add Site"
                 }
             }
@@ -66,21 +65,35 @@ pub fn SitesSidebar() -> Element {
     }
 }
 
-fn site_button(prefix: &str, site: &state::KnownSite, current_prefix: &Option<String>) -> Element {
+fn site_row(prefix: &str, site: &state::KnownSite, current_prefix: &Option<String>) -> Element {
     let is_selected = current_prefix.as_deref() == Some(prefix);
-    let bg = if is_selected {
-        "bg-accent-soft text-accent font-medium"
-    } else {
-        "hover:bg-surface-hover text-text"
-    };
+    let is_owner = site.role == SiteRole::Owner;
     let prefix_owned = prefix.to_string();
+
+    let row_class = if is_selected {
+        "site-selected bg-surface"
+    } else {
+        "hover:bg-surface-hover"
+    };
+
+    let avatar_class = if is_owner {
+        "site-avatar site-avatar-owner"
+    } else {
+        "site-avatar site-avatar-visitor"
+    };
+
+    // First letter of site name for avatar
+    let initial = site.name.chars().next().unwrap_or('?');
 
     rsx! {
         button {
-            class: "w-full text-left px-2.5 py-1.5 rounded-lg text-sm mb-0.5 transition-colors {bg}",
+            class: "w-full flex items-center gap-2.5 px-3 py-2 text-left transition-all-fast {row_class}",
             onclick: move |_| state::select_site(&prefix_owned),
-            div { class: "truncate", "{site.name}" }
-            div { class: "text-[10px] text-text-muted font-mono truncate", "{site.prefix}" }
+            span { class: "{avatar_class}", "{initial}" }
+            div { class: "min-w-0 flex-1",
+                div { class: "text-sm text-text-light truncate font-medium", "{site.name}" }
+                div { class: "text-[10px] text-text-muted font-mono truncate", "{site.prefix}" }
+            }
         }
     }
 }

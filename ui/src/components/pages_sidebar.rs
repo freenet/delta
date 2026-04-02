@@ -7,9 +7,9 @@ use crate::state::SiteRole;
 pub fn PagesSidebar() -> Element {
     let Some(site) = state::current_site() else {
         return rsx! {
-            aside { class: "w-56 border-r border-border flex flex-col h-full bg-surface",
-                div { class: "flex items-center justify-center h-full text-text-muted text-sm",
-                    "Select a site"
+            aside { class: "w-52 flex flex-col h-full bg-bg-warm border-r border-border",
+                div { class: "flex items-center justify-center h-full",
+                    p { class: "text-sm text-text-muted italic", "Select a site" }
                 }
             }
         };
@@ -22,45 +22,51 @@ pub fn PagesSidebar() -> Element {
     sorted_pages.sort_by_key(|(id, _)| *id);
 
     rsx! {
-        aside { class: "w-56 border-r border-border flex flex-col h-full bg-surface",
-            // Site header
-            div { class: "p-4 border-b border-border",
-                h2 { class: "text-sm font-bold text-text truncate",
+        aside { class: "w-52 flex flex-col h-full bg-bg-warm border-r border-border",
+            // Site name header
+            div { class: "px-4 py-4 border-b border-border",
+                h2 { class: "text-sm font-semibold text-text-light truncate",
                     "{site.name}"
                 }
                 if !site.state.config.config.description.is_empty() {
-                    p { class: "text-xs text-text-muted mt-0.5 truncate",
+                    p { class: "text-[11px] text-text-muted mt-0.5 truncate",
                         "{site.state.config.config.description}"
                     }
                 }
             }
 
             // Pages list
-            nav { class: "flex-1 overflow-y-auto p-2",
+            nav { class: "flex-1 overflow-y-auto py-2 px-2",
+                p { class: "section-label mb-2 px-0", "Pages" }
                 for (&id, page) in sorted_pages.iter() {
                     {
                         let is_selected = current_page == Some(id);
-                        let bg = if is_selected {
-                            "bg-panel text-text font-medium shadow-sm"
+                        let item_class = if is_selected {
+                            "page-item page-item-selected"
                         } else {
-                            "hover:bg-surface-hover text-text"
+                            "page-item hover:bg-surface-hover"
+                        };
+                        let text_class = if is_selected {
+                            "text-text font-medium"
+                        } else {
+                            "text-text-light"
                         };
                         rsx! {
                             button {
-                                class: "w-full text-left px-3 py-2 rounded-lg text-sm mb-0.5 transition-colors {bg}",
+                                class: "w-full text-left px-3 py-2 rounded-lg text-sm mb-0.5 transition-all-fast {item_class}",
                                 onclick: move |_| state::select_page(id),
-                                "{page.title}"
+                                span { class: "{text_class}", "{page.title}" }
                             }
                         }
                     }
                 }
             }
 
-            // New page button (only for owners)
+            // New page (owner only)
             if is_owner {
-                div { class: "p-3 border-t border-border",
+                div { class: "px-3 py-3 border-t border-border",
                     button {
-                        class: "w-full px-3 py-2 text-sm bg-accent text-text-inverse rounded-lg hover:bg-accent-hover font-medium transition-colors",
+                        class: "btn-primary w-full px-3 py-2 text-sm",
                         onclick: move |_| {
                             state::create_page("New Page".into());
                         },

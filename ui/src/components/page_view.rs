@@ -8,10 +8,12 @@ use delta_core::PageId;
 pub fn PageView() -> Element {
     let Some((page_id, page)) = state::current_page() else {
         return rsx! {
-            div { class: "flex items-center justify-center h-full text-text-muted",
+            div { class: "flex items-center justify-center h-full",
                 div { class: "text-center",
-                    p { class: "text-lg", "No page selected" }
-                    p { class: "text-sm mt-1", "Choose a page from the sidebar" }
+                    span { class: "delta-mark text-3xl w-12 h-12 text-[28px] opacity-30 mb-4 inline-flex items-center justify-center rounded-xl",
+                        "\u{0394}"
+                    }
+                    p { class: "text-text-muted-light text-sm mt-4", "Select a page to start reading" }
                 }
             }
         };
@@ -24,21 +26,19 @@ pub fn PageView() -> Element {
     let rendered_html = render_markdown(&page.content);
 
     rsx! {
-        div { class: "max-w-3xl mx-auto px-8 py-8",
+        div { class: "max-w-2xl mx-auto px-10 py-12",
             // Page header
-            div { class: "flex items-center justify-between mb-8",
-                h1 { class: "text-3xl font-bold text-text",
-                    "{page.title}"
-                }
+            div { class: "flex items-start justify-between mb-2",
+                div { class: "flex-1 min-w-0" }
                 if is_owner {
-                    div { class: "flex gap-2",
+                    div { class: "flex gap-2 ml-4 flex-shrink-0",
                         button {
-                            class: "px-4 py-2 text-sm bg-accent text-text-inverse rounded-lg hover:bg-accent-hover font-medium transition-colors",
+                            class: "btn-primary px-4 py-2 text-sm",
                             onclick: move |_| state::start_editing(),
                             "Edit"
                         }
                         button {
-                            class: "px-4 py-2 text-sm bg-surface text-text-muted rounded-lg hover:bg-surface-hover transition-colors",
+                            class: "btn-ghost px-4 py-2 text-sm",
                             onclick: move |_| state::delete_page(page_id),
                             "Delete"
                         }
@@ -46,35 +46,30 @@ pub fn PageView() -> Element {
                 }
             }
 
-            // Rendered markdown content
-            // Page links are rendered as onclick handlers that call navigate_to_page
+            // Rendered markdown
             div {
                 class: "prose",
                 dangerous_inner_html: "{rendered_html}",
                 onclick: move |evt| {
-                    // Intercept clicks on internal page links
                     handle_link_click(evt);
                 },
             }
 
-            // Page metadata
-            div { class: "mt-12 pt-4 border-t border-border text-xs text-text-muted",
-                "Page #{page_id} · Updated {format_timestamp(page.updated_at)}"
+            // Footer
+            div { class: "mt-16 pt-4 border-t border-border-light",
+                p { class: "text-[11px] text-text-muted-light tracking-wide",
+                    "Page {page_id} · Updated {format_timestamp(page.updated_at)}"
+                }
             }
         }
     }
 }
 
-/// Handle clicks on links within rendered markdown.
-/// Internal page links have href="/page/{id}" and are intercepted.
 fn handle_link_click(evt: Event<MouseData>) {
-    // We need to check if the clicked element (or parent) is an anchor
-    // with an internal page link. In WASM, we read the event target.
     #[cfg(target_arch = "wasm32")]
     {
         use wasm_bindgen::JsCast;
         if let Some(target) = evt.data().downcast::<web_sys::MouseEvent>() {
-            // Walk up to find the <a> element
             if let Some(element) = target
                 .target()
                 .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
@@ -87,7 +82,6 @@ fn handle_link_click(evt: Event<MouseData>) {
 
                 if let Some(a) = anchor {
                     if let Some(href) = a.get_attribute("href") {
-                        // Check if it's an internal page link: /page_id/slug
                         let path = href.trim_start_matches('/');
                         if let Some(id_str) = path.split('/').next() {
                             if let Ok(page_id) = id_str.parse::<PageId>() {
@@ -104,13 +98,11 @@ fn handle_link_click(evt: Event<MouseData>) {
     let _ = evt;
 }
 
-/// Render markdown to HTML, resolving `[[id|text]]` page links.
 fn render_markdown(content: &str) -> String {
     let resolved = resolve_page_links(content);
     markdown::to_html(&resolved)
 }
 
-/// Replace `[[id|Display Text]]` with internal links.
 fn resolve_page_links(content: &str) -> String {
     let mut result = String::with_capacity(content.len());
     let mut rest = content;
@@ -130,7 +122,6 @@ fn resolve_page_links(content: &str) -> String {
                         .map(|p| p.title.clone())
                         .unwrap_or_else(|| display.to_string());
                     let slug = slugify(&title);
-                    // Use /id/slug format — intercepted by onclick handler
                     result.push_str(&format!("[{title}](/{id}/{slug})"));
                 } else {
                     result.push_str(&format!("[[{link_content}]]"));
@@ -161,6 +152,6 @@ fn slugify(title: &str) -> String {
 fn format_timestamp(ts: u64) -> String {
     use chrono::{DateTime, Utc};
     let dt = DateTime::<Utc>::from_timestamp(ts as i64, 0);
-    dt.map(|d| d.format("%b %d, %Y at %H:%M UTC").to_string())
+    dt.map(|d| d.format("%b %d, %Y").to_string())
         .unwrap_or_else(|| "unknown".to_string())
 }
