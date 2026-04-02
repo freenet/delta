@@ -1,9 +1,9 @@
 fn main() {
-    // Embed build timestamp so the UI can display it
+    // Embed build timestamp in ISO 8601 format so the UI can convert to local time
     let now = chrono::Utc::now();
     println!(
-        "cargo:rustc-env=BUILD_TIMESTAMP={}",
-        now.format("%Y-%m-%d %H:%M UTC")
+        "cargo:rustc-env=BUILD_TIMESTAMP_ISO={}",
+        now.format("%Y-%m-%dT%H:%M:%SZ")
     );
 
     // Get git commit hash if available

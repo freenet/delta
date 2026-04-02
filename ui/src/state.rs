@@ -169,8 +169,10 @@ pub fn create_new_site(name: String) {
     let contract_key =
         ContractKey::from_params_and_code(Parameters::from(params_buf.clone()), &contract_code);
 
-    // Store signing key in memory
+    // Store signing key in memory and persist to delegate
+    let sk_bytes = signing_key.to_bytes();
     SIGNING_KEYS.write().insert(prefix.clone(), signing_key);
+    crate::freenet_api::delegate::store_signing_key(&prefix, &sk_bytes);
 
     // Add to known sites
     let site = KnownSite {
@@ -185,6 +187,35 @@ pub fn create_new_site(name: String) {
 
     // PUT to Freenet network
     crate::freenet_api::put_site(&params, &site_state);
+
+    *SHOW_ADD_SITE.write() = false;
+    select_site(&prefix);
+}
+
+/// Visit an existing site by contract ID string (base58). Sends GET + SUBSCRIBE.
+pub fn visit_site(contract_id_str: String) {
+    // Parse base58 contract ID
+    let contract_id: ContractInstanceId = match contract_id_str.parse() {
+        Ok(id) => id,
+        Err(_) => return, // TODO: show error in UI
+    };
+
+    let prefix = contract_id_str[..10.min(contract_id_str.len())].to_string();
+
+    // Add placeholder entry so it shows in the sidebar immediately
+    let placeholder = KnownSite {
+        name: format!("Loading ({prefix}...)"),
+        prefix: prefix.clone(),
+        role: SiteRole::Visitor,
+        state: SiteState::default(),
+        owner_pubkey: [0u8; 32],
+        contract_key: None, // We only have the instance ID, not the full key
+    };
+    SITES.write().insert(prefix.clone(), placeholder);
+
+    // GET the site state and SUBSCRIBE for updates
+    crate::freenet_api::get_site_by_id(&contract_id);
+    crate::freenet_api::subscribe_to_site_by_id(&contract_id);
 
     *SHOW_ADD_SITE.write() = false;
     select_site(&prefix);

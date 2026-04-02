@@ -16,6 +16,9 @@ pub fn App() -> Element {
         state::init_example_data();
         setup_hash_listener();
         freenet_api::connect_to_freenet();
+        // Delegate registration happens after connection is established.
+        // For now, register immediately — the WebSocket will queue the message.
+        freenet_api::register_delegate();
     });
 
     let show_add_site = *state::SHOW_ADD_SITE.read();
