@@ -1,12 +1,36 @@
+use chrono::Utc;
+use serde::Deserialize;
+use std::env;
+use std::fs;
+use std::path::Path;
+
+#[derive(Deserialize)]
+struct LegacyDelegates {
+    #[serde(default)]
+    entry: Vec<LegacyEntry>,
+}
+
+#[derive(Deserialize)]
+struct LegacyEntry {
+    version: String,
+    description: String,
+    date: String,
+    delegate_key: String,
+    code_hash: String,
+}
+
 fn main() {
-    // Embed build timestamp in ISO 8601 format so the UI can convert to local time
-    let now = chrono::Utc::now();
+    generate_build_info();
+    generate_legacy_delegates();
+}
+
+fn generate_build_info() {
+    let now = Utc::now();
     println!(
         "cargo:rustc-env=BUILD_TIMESTAMP_ISO={}",
-        now.format("%Y-%m-%dT%H:%M:%SZ")
+        now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
     );
 
-    // Get git commit hash if available
     let git_hash = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
@@ -15,4 +39,89 @@ fn main() {
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=GIT_COMMIT={git_hash}");
+}
+
+fn generate_legacy_delegates() {
+    let toml_path = Path::new("..").join("legacy_delegates.toml");
+
+    let toml_content = match fs::read_to_string(&toml_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "cargo:warning=legacy_delegates.toml not found ({}), using empty list",
+                e
+            );
+            let out_dir = env::var("OUT_DIR").unwrap();
+            let dest = Path::new(&out_dir).join("legacy_delegates.rs");
+            fs::write(
+                dest,
+                "pub const LEGACY_DELEGATES: &[([u8; 32], [u8; 32])] = &[];\n",
+            )
+            .unwrap();
+            return;
+        }
+    };
+
+    let parsed: LegacyDelegates =
+        toml::from_str(&toml_content).expect("Failed to parse legacy_delegates.toml");
+
+    let mut code = String::new();
+    code.push_str(
+        "// AUTO-GENERATED from legacy_delegates.toml — do not edit.\n\n\
+         pub const LEGACY_DELEGATES: &[([u8; 32], [u8; 32])] = &[\n",
+    );
+
+    for entry in &parsed.entry {
+        let dk_bytes = hex_to_byte_array(&entry.delegate_key, &entry.version, "delegate_key");
+        let ch_bytes = hex_to_byte_array(&entry.code_hash, &entry.version, "code_hash");
+
+        code.push_str(&format!(
+            "    // {}: {} ({})\n",
+            entry.version, entry.description, entry.date
+        ));
+        code.push_str("    (\n");
+        code.push_str(&format_byte_array(&dk_bytes, "        "));
+        code.push_str(&format_byte_array(&ch_bytes, "        "));
+        code.push_str("    ),\n");
+    }
+
+    code.push_str("];\n");
+
+    let out_dir = env::var("OUT_DIR").unwrap();
+    let dest = Path::new(&out_dir).join("legacy_delegates.rs");
+    let existing = fs::read_to_string(&dest).unwrap_or_default();
+    if existing != code {
+        fs::write(&dest, &code).unwrap();
+    }
+}
+
+fn hex_to_byte_array(hex: &str, version: &str, field: &str) -> [u8; 32] {
+    assert!(
+        hex.len() == 64,
+        "{version} {field} hex has {} chars, expected 64",
+        hex.len()
+    );
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect();
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    arr
+}
+
+fn format_byte_array(arr: &[u8; 32], indent: &str) -> String {
+    let mut s = format!("{indent}[\n");
+    for chunk in arr.chunks(10) {
+        s.push_str(&format!("{indent}    "));
+        for (i, b) in chunk.iter().enumerate() {
+            if i > 0 {
+                s.push_str(", ");
+            }
+            s.push_str(&format!("{b}"));
+        }
+        s.push_str(",\n");
+    }
+    s.push_str(&format!("{indent}],\n"));
+    s
 }

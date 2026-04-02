@@ -1,0 +1,17 @@
+# Legacy Delegate Registry
+#
+# Single source of truth for all previous delegate WASM versions.
+# When the delegate WASM changes (code changes, dependency updates, etc.),
+# add the OLD delegate's keys here so the migration system can transfer
+# signing keys from the old delegate to the new one.
+#
+# Fields:
+#   code_hash    = BLAKE3 hash of the raw delegate WASM bytes (hex, 64 chars)
+#   delegate_key = BLAKE3(code_hash_bytes) — the delegate key (hex, 64 chars)
+#
+# To add a new entry:  ./scripts/add-migration.sh VERSION "DESCRIPTION"
+# To validate entries: cargo test -p delta-core --test migration_test
+# To sync WASMs:       ./scripts/sync-wasm.sh
+
+# No entries yet — this is the initial release.
+# When site_delegate.wasm changes, run add-migration.sh BEFORE rebuilding.
