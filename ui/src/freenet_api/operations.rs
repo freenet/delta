@@ -1,5 +1,6 @@
 use ciborium::de::from_reader;
 use delta_core::SiteState;
+use dioxus::prelude::ReadableExt;
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse};
 use freenet_stdlib::prelude::*;
 use std::sync::Arc;
@@ -74,12 +75,26 @@ fn handle_site_state(key: ContractKey, state_bytes: &[u8]) {
 
     let name = site_state.config.config.name.clone();
     let owner_pubkey = site_state.owner.to_bytes();
-    let prefix = key_to_prefix(&key);
+    // Derive prefix from owner pubkey
+    let prefix_from_pubkey = delta_core::pubkey_to_prefix(&site_state.owner);
+
+    // Try to find existing entry: first by pubkey-derived prefix, then by contract key
+    let prefix = if state::SITES.read().contains_key(&prefix_from_pubkey) {
+        prefix_from_pubkey
+    } else if let Some(p) = find_prefix_for_contract_key(&key) {
+        p
+    } else {
+        prefix_from_pubkey
+    };
 
     let mut sites = state::SITES.write();
     if let Some(existing) = sites.get_mut(&prefix) {
         existing.state = site_state;
         existing.name = name;
+        existing.owner_pubkey = owner_pubkey;
+        if existing.contract_key.is_none() {
+            existing.contract_key = Some(key);
+        }
     } else {
         sites.insert(
             prefix.clone(),
@@ -109,7 +124,11 @@ fn handle_site_delta(key: ContractKey, delta_bytes: &[u8]) {
         }
     };
 
-    let prefix = key_to_prefix(&key);
+    let prefix = find_prefix_for_contract_key(&key);
+    let Some(prefix) = prefix else {
+        log(&format!("Delta: delta for unknown contract key {key}"));
+        return;
+    };
     let mut sites = state::SITES.write();
 
     if let Some(site) = sites.get_mut(&prefix) {
@@ -251,10 +270,15 @@ where
     }
 }
 
-/// Derive a short prefix from a contract key (first 10 chars of encoded ID).
-fn key_to_prefix(key: &ContractKey) -> String {
-    let encoded = key.encoded_contract_id();
-    encoded[..10.min(encoded.len())].to_string()
+/// Find the site prefix that corresponds to a contract key by checking existing sites.
+fn find_prefix_for_contract_key(key: &ContractKey) -> Option<String> {
+    let sites = state::SITES.read();
+    for (prefix, site) in sites.iter() {
+        if site.contract_key.as_ref() == Some(key) {
+            return Some(prefix.clone());
+        }
+    }
+    None
 }
 
 fn log(msg: &str) {
