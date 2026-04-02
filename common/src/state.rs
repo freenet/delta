@@ -13,24 +13,41 @@ pub type PageId = u64;
 // Parameters (fixed at contract creation, determines contract key)
 // ---------------------------------------------------------------------------
 
-/// Length of the site prefix used in URLs (first N chars of base58-encoded owner pubkey).
+/// Length of the site prefix (first N chars of base58-encoded owner pubkey).
 pub const SITE_PREFIX_LEN: usize = 10;
 
-/// Contract parameters — the owner's public key and a unique site ID.
+/// Contract parameters = the 10-char site prefix.
+///
+/// This is the ONLY parameter — it determines the contract key via
+/// `BLAKE3(BLAKE3(site_contract.wasm) || prefix_bytes)`.
+///
+/// The contract validates that the owner's public key (in the state)
+/// produces this prefix when base58-encoded. This means anyone who
+/// knows the 10-char prefix can reconstruct the full contract key.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SiteParameters {
-    pub owner: VerifyingKey,
-    /// Random bytes to make the contract key unique per site.
-    pub site_id: [u8; 32],
+    /// The 10-char base58 prefix derived from the owner's public key.
+    pub prefix: String,
 }
 
 impl SiteParameters {
-    /// Short prefix for URLs, derived from the owner's public key.
-    /// First 10 characters of base58-encoded pubkey (~58 bits, collision-safe into billions).
-    pub fn site_prefix(&self) -> String {
-        let encoded = bs58::encode(self.owner.as_bytes()).into_string();
-        encoded[..SITE_PREFIX_LEN.min(encoded.len())].to_string()
+    /// Create parameters from an owner's public key.
+    pub fn from_owner(owner: &VerifyingKey) -> Self {
+        Self {
+            prefix: pubkey_to_prefix(owner),
+        }
     }
+
+    /// Validate that a public key matches these parameters.
+    pub fn matches_owner(&self, owner: &VerifyingKey) -> bool {
+        pubkey_to_prefix(owner) == self.prefix
+    }
+}
+
+/// Derive the 10-char site prefix from an owner's public key.
+pub fn pubkey_to_prefix(owner: &VerifyingKey) -> String {
+    let encoded = bs58::encode(owner.as_bytes()).into_string();
+    encoded[..SITE_PREFIX_LEN.min(encoded.len())].to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -40,6 +57,8 @@ impl SiteParameters {
 /// Top-level state for a Delta site.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SiteState {
+    /// The site owner's public key. All signatures are verified against this.
+    pub owner: VerifyingKey,
     pub config: SignedConfig,
     pub pages: BTreeMap<PageId, Page>,
     /// Next page ID to assign. Monotonically increasing.
@@ -48,7 +67,18 @@ pub struct SiteState {
 
 impl Default for SiteState {
     fn default() -> Self {
+        // Default uses a zeroed key — only valid for empty/placeholder states
+        let zero_bytes = [0u8; 32];
+        let owner = VerifyingKey::from_bytes(&zero_bytes).unwrap_or_else(|_| {
+            // Fallback: this will fail verification but won't panic
+            VerifyingKey::from_bytes(&[
+                1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+                0, 0, 0, 0,
+            ])
+            .expect("hardcoded valid point")
+        });
         Self {
+            owner,
             config: SignedConfig::default(),
             pages: BTreeMap::new(),
             next_page_id: 1,
@@ -60,6 +90,7 @@ impl SiteState {
     /// Create a new site with initial config, signed by the owner.
     pub fn new(config: SiteConfig, owner_key: &SigningKey) -> Self {
         Self {
+            owner: owner_key.verifying_key(),
             config: SignedConfig::new(config, owner_key),
             pages: BTreeMap::new(),
             next_page_id: 1,
@@ -67,10 +98,20 @@ impl SiteState {
     }
 
     /// Verify the entire state against the site parameters.
+    /// Checks that the owner pubkey produces the expected prefix,
+    /// and all signatures are valid.
     pub fn verify(&self, params: &SiteParameters) -> Result<(), String> {
-        self.config.verify(&params.owner)?;
+        // Verify that the owner's pubkey matches the prefix in parameters
+        if !params.matches_owner(&self.owner) {
+            return Err(format!(
+                "owner pubkey doesn't match parameters prefix: expected {}, got {}",
+                params.prefix,
+                pubkey_to_prefix(&self.owner)
+            ));
+        }
+        self.config.verify(&self.owner)?;
         for (&page_id, page) in &self.pages {
-            page.verify(page_id, &params.owner)?;
+            page.verify(page_id, &self.owner)?;
         }
         Ok(())
     }
@@ -303,34 +344,37 @@ impl SiteState {
         }
     }
 
-    /// Apply a delta to this state. Verifies all signatures.
+    /// Apply a delta to this state. Verifies all signatures against the
+    /// owner pubkey embedded in the state.
     pub fn apply_delta(
         &mut self,
         delta: &SiteStateDelta,
         params: &SiteParameters,
     ) -> Result<(), String> {
+        let owner = self.owner;
+
         if let Some(new_config) = &delta.config {
-            new_config.verify(&params.owner)?;
+            new_config.verify(&owner)?;
             if new_config.config.version > self.config.config.version {
                 self.config = new_config.clone();
             }
         }
 
         for (&page_id, page) in &delta.page_updates {
-            // Only accept if newer than what we have
             let dominated = self
                 .pages
                 .get(&page_id)
                 .is_some_and(|existing| existing.updated_at >= page.updated_at);
             if !dominated {
-                self.upsert_page(page_id, page.clone(), &params.owner)?;
+                self.upsert_page(page_id, page.clone(), &owner)?;
             }
         }
 
         for deletion in &delta.page_deletions {
-            self.delete_page(deletion, &params.owner)?;
+            self.delete_page(deletion, &owner)?;
         }
 
+        let _ = params;
         Ok(())
     }
 
@@ -451,10 +495,7 @@ mod tests {
     }
 
     fn make_params(owner: &SigningKey) -> SiteParameters {
-        SiteParameters {
-            owner: owner.verifying_key(),
-            site_id: [0u8; 32],
-        }
+        SiteParameters::from_owner(&owner.verifying_key())
     }
 
     #[test]
@@ -471,7 +512,7 @@ mod tests {
         );
 
         let page = Page::new(1, "Home".into(), "# Welcome".into(), 1000, &owner);
-        site.upsert_page(1, page, &params.owner).unwrap();
+        site.upsert_page(1, page, &owner.verifying_key()).unwrap();
 
         assert_eq!(site.pages.len(), 1);
         assert_eq!(site.pages[&1].title, "Home");
@@ -487,7 +528,7 @@ mod tests {
         let mut site = SiteState::new(SiteConfig::default(), &owner);
 
         let page = Page::new(1, "Hacked".into(), "bad content".into(), 1000, &attacker);
-        let result = site.upsert_page(1, page, &params.owner);
+        let result = site.upsert_page(1, page, &owner.verifying_key());
         assert!(result.is_err());
     }
 
@@ -498,10 +539,12 @@ mod tests {
         let mut site = SiteState::new(SiteConfig::default(), &owner);
 
         let page_v1 = Page::new(1, "Home".into(), "# V1".into(), 1000, &owner);
-        site.upsert_page(1, page_v1, &params.owner).unwrap();
+        site.upsert_page(1, page_v1, &owner.verifying_key())
+            .unwrap();
 
         let page_v2 = Page::new(1, "Home".into(), "# V2".into(), 2000, &owner);
-        site.upsert_page(1, page_v2, &params.owner).unwrap();
+        site.upsert_page(1, page_v2, &owner.verifying_key())
+            .unwrap();
 
         assert_eq!(site.pages[&1].content, "# V2");
     }
@@ -513,10 +556,11 @@ mod tests {
         let mut site = SiteState::new(SiteConfig::default(), &owner);
 
         let page = Page::new(1, "Old Title".into(), "content".into(), 1000, &owner);
-        site.upsert_page(1, page, &params.owner).unwrap();
+        site.upsert_page(1, page, &owner.verifying_key()).unwrap();
 
         let renamed = Page::new(1, "New Title".into(), "content".into(), 2000, &owner);
-        site.upsert_page(1, renamed, &params.owner).unwrap();
+        site.upsert_page(1, renamed, &owner.verifying_key())
+            .unwrap();
 
         assert_eq!(site.pages[&1].title, "New Title");
         assert_eq!(site.pages.len(), 1);
@@ -529,11 +573,11 @@ mod tests {
         let mut site = SiteState::new(SiteConfig::default(), &owner);
 
         let page = Page::new(1, "Home".into(), "content".into(), 1000, &owner);
-        site.upsert_page(1, page, &params.owner).unwrap();
+        site.upsert_page(1, page, &owner.verifying_key()).unwrap();
         assert_eq!(site.pages.len(), 1);
 
         let deletion = SignedPageDeletion::new(1, 2000, &owner);
-        site.delete_page(&deletion, &params.owner).unwrap();
+        site.delete_page(&deletion, &owner.verifying_key()).unwrap();
         assert!(site.pages.is_empty());
     }
 
@@ -546,7 +590,7 @@ mod tests {
         let summary_before = site.summarize();
 
         let page = Page::new(1, "Home".into(), "# Hello".into(), 1000, &owner);
-        site.upsert_page(1, page, &params.owner).unwrap();
+        site.upsert_page(1, page, &owner.verifying_key()).unwrap();
 
         let delta = site
             .compute_delta(&summary_before)
@@ -568,10 +612,10 @@ mod tests {
         let mut site_b = SiteState::new(SiteConfig::default(), &owner);
 
         let old = Page::new(1, "Home".into(), "old".into(), 1000, &owner);
-        site_a.upsert_page(1, old, &params.owner).unwrap();
+        site_a.upsert_page(1, old, &owner.verifying_key()).unwrap();
 
         let new = Page::new(1, "Home".into(), "new".into(), 2000, &owner);
-        site_b.upsert_page(1, new, &params.owner).unwrap();
+        site_b.upsert_page(1, new, &owner.verifying_key()).unwrap();
 
         site_a.merge(&params, &site_b).unwrap();
         assert_eq!(site_a.pages[&1].content, "new");
@@ -584,11 +628,11 @@ mod tests {
         let mut site = SiteState::new(SiteConfig::default(), &owner);
 
         let p1 = Page::new(1, "A".into(), "a".into(), 1000, &owner);
-        site.upsert_page(1, p1, &params.owner).unwrap();
+        site.upsert_page(1, p1, &owner.verifying_key()).unwrap();
         assert_eq!(site.next_page_id, 2);
 
         let p5 = Page::new(5, "B".into(), "b".into(), 2000, &owner);
-        site.upsert_page(5, p5, &params.owner).unwrap();
+        site.upsert_page(5, p5, &owner.verifying_key()).unwrap();
         assert_eq!(site.next_page_id, 6);
     }
 }
