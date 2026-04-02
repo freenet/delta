@@ -15,9 +15,7 @@ pub struct KnownSite {
     pub prefix: String,
     pub role: SiteRole,
     pub state: SiteState,
-    /// Full owner pubkey bytes (for resolving prefix back to params).
     pub owner_pubkey: [u8; 32],
-    /// Contract key (if known — set after PUT or GET).
     #[serde(skip)]
     pub contract_key: Option<ContractKey>,
 }
@@ -28,32 +26,15 @@ pub enum SiteRole {
     Visitor,
 }
 
-/// Owner signing keys, keyed by site prefix.
-/// Held in browser memory — lost on page refresh.
-/// (Delegate persistence comes later.)
-pub static SIGNING_KEYS: GlobalSignal<BTreeMap<String, SigningKey>> =
-    GlobalSignal::new(BTreeMap::new);
-
 // ---------------------------------------------------------------------------
 // Global signals
 // ---------------------------------------------------------------------------
 
-/// All known sites, keyed by their 10-char prefix.
 pub static SITES: GlobalSignal<BTreeMap<String, KnownSite>> = GlobalSignal::new(BTreeMap::new);
-
-/// Currently selected site prefix.
 pub static CURRENT_SITE: GlobalSignal<Option<String>> = GlobalSignal::new(|| None);
-
-/// Currently selected page ID within the current site.
 pub static CURRENT_PAGE: GlobalSignal<Option<PageId>> = GlobalSignal::new(|| None);
-
-/// Whether we're in edit mode.
 pub static EDITING: GlobalSignal<bool> = GlobalSignal::new(|| false);
-
-/// Whether the "add site" dialog is showing.
 pub static SHOW_ADD_SITE: GlobalSignal<bool> = GlobalSignal::new(|| false);
-
-/// Editor content (buffered separately from saved state).
 pub static EDITOR_TITLE: GlobalSignal<String> = GlobalSignal::new(String::new);
 pub static EDITOR_CONTENT: GlobalSignal<String> = GlobalSignal::new(String::new);
 
@@ -78,7 +59,6 @@ pub fn init_example_data() {
 // Route parsing / updating
 // ---------------------------------------------------------------------------
 
-/// Parse hash route: #prefix/page_id/slug → (prefix, page_id)
 #[allow(dead_code)]
 pub fn parse_hash_route(hash: &str) -> Option<(String, Option<PageId>)> {
     let hash = hash.trim_start_matches('#').trim_start_matches('/');
@@ -91,7 +71,6 @@ pub fn parse_hash_route(hash: &str) -> Option<(String, Option<PageId>)> {
     Some((prefix, page_id))
 }
 
-/// Build a hash route for a site + optional page.
 pub fn build_hash_route(prefix: &str, page_id: Option<PageId>, title: Option<&str>) -> String {
     match (page_id, title) {
         (Some(id), Some(t)) => format!("#{}/{}/{}", prefix, id, slugify(t)),
@@ -126,24 +105,22 @@ pub fn show_add_site_prompt() {
     *SHOW_ADD_SITE.write() = true;
 }
 
-/// Create a new owned site — generates keypair, signs initial state,
-/// PUTs to the Freenet network.
+/// Create a new owned site. Signs initial state locally (key is in memory
+/// momentarily), PUTs to network, then stores key in delegate for future
+/// signing. The key is NOT kept in browser memory after this.
 pub fn create_new_site(name: String) {
-    // Generate Ed25519 keypair
     let signing_key = SigningKey::generate(&mut rand::thread_rng());
     let verifying_key = signing_key.verifying_key();
 
-    // Build parameters
     let mut site_id = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rand::thread_rng(), &mut site_id);
     let params = SiteParameters {
         owner: verifying_key,
         site_id,
     };
-
     let prefix = params.site_prefix();
 
-    // Create initial state with a signed home page
+    // Sign initial state locally (we have the key right now)
     let config = SiteConfig {
         version: 1,
         name: name.clone(),
@@ -169,10 +146,10 @@ pub fn create_new_site(name: String) {
     let contract_key =
         ContractKey::from_params_and_code(Parameters::from(params_buf.clone()), &contract_code);
 
-    // Store signing key in memory and persist to delegate
+    // Store signing key in delegate (persists across page refreshes)
     let sk_bytes = signing_key.to_bytes();
-    SIGNING_KEYS.write().insert(prefix.clone(), signing_key);
-    crate::freenet_api::delegate::store_signing_key(&prefix, &sk_bytes);
+    crate::freenet_api::delegate::store_signing_key(&sk_bytes);
+    // Key is dropped after this function — all future signing goes through delegate
 
     // Add to known sites
     let site = KnownSite {
@@ -194,26 +171,23 @@ pub fn create_new_site(name: String) {
 
 /// Visit an existing site by contract ID string (base58). Sends GET + SUBSCRIBE.
 pub fn visit_site(contract_id_str: String) {
-    // Parse base58 contract ID
     let contract_id: ContractInstanceId = match contract_id_str.parse() {
         Ok(id) => id,
-        Err(_) => return, // TODO: show error in UI
+        Err(_) => return,
     };
 
     let prefix = contract_id_str[..10.min(contract_id_str.len())].to_string();
 
-    // Add placeholder entry so it shows in the sidebar immediately
     let placeholder = KnownSite {
         name: format!("Loading ({prefix}...)"),
         prefix: prefix.clone(),
         role: SiteRole::Visitor,
         state: SiteState::default(),
         owner_pubkey: [0u8; 32],
-        contract_key: None, // We only have the instance ID, not the full key
+        contract_key: None,
     };
     SITES.write().insert(prefix.clone(), placeholder);
 
-    // GET the site state and SUBSCRIBE for updates
     crate::freenet_api::get_site_by_id(&contract_id);
     crate::freenet_api::subscribe_to_site_by_id(&contract_id);
 
@@ -252,56 +226,68 @@ pub fn select_page(page_id: PageId) {
     }
 }
 
+/// Create a new page. For owned sites with a contract key, sends to delegate
+/// for signing. For example data, creates with placeholder signature.
 pub fn create_page(title: String) {
     let Some(prefix) = (*CURRENT_SITE.read()).clone() else {
         return;
     };
 
-    // Get signing key if owner
-    let signing_key = SIGNING_KEYS.read().get(&prefix).cloned();
-
-    let mut sites = SITES.write();
-    let Some(site) = sites.get_mut(&prefix) else {
+    let sites = SITES.read();
+    let Some(site) = sites.get(&prefix) else {
         return;
     };
 
     let id = site.state.next_page_id;
     let now = now_secs();
-
-    let page = if let Some(sk) = &signing_key {
-        Page::new(id, title, String::new(), now, sk)
-    } else {
-        // Fallback for example data (unsigned)
-        Page {
-            title,
-            content: String::new(),
-            updated_at: now,
-            signature: Signature::from_bytes(&[0u8; 64]),
-        }
-    };
-
-    site.state.pages.insert(id, page.clone());
-    site.state.next_page_id = id + 1;
-
-    // Send UPDATE to network if we have a contract key
     let contract_key = site.contract_key;
+    let is_owner = site.role == SiteRole::Owner;
     drop(sites);
 
-    if let Some(ck) = contract_key {
-        let mut updates = BTreeMap::new();
-        updates.insert(id, page);
-        let delta = delta_core::SiteStateDelta {
-            config: None,
-            page_updates: updates,
-            page_deletions: Vec::new(),
-        };
-        crate::freenet_api::update_site(&ck, &delta);
+    if is_owner {
+        if let Some(ck) = contract_key {
+            // Send to delegate for signing — response handler will update state + network
+            crate::freenet_api::delegate::request_sign_page(
+                &prefix,
+                ck,
+                id,
+                title.clone(),
+                String::new(),
+                now,
+            );
+            // Optimistically add to local state with placeholder sig
+            let mut sites = SITES.write();
+            if let Some(site) = sites.get_mut(&prefix) {
+                let page = Page {
+                    title,
+                    content: String::new(),
+                    updated_at: now,
+                    signature: Signature::from_bytes(&[0u8; 64]),
+                };
+                site.state.pages.insert(id, page);
+                site.state.next_page_id = id + 1;
+            }
+        } else {
+            // Example data / offline — unsigned placeholder
+            let mut sites = SITES.write();
+            if let Some(site) = sites.get_mut(&prefix) {
+                let page = Page {
+                    title,
+                    content: String::new(),
+                    updated_at: now,
+                    signature: Signature::from_bytes(&[0u8; 64]),
+                };
+                site.state.pages.insert(id, page);
+                site.state.next_page_id = id + 1;
+            }
+        }
     }
 
     *CURRENT_PAGE.write() = Some(id);
     *EDITING.write() = true;
 }
 
+/// Save the current page edit. Routes through delegate for signing if connected.
 pub fn save_current_page() {
     let Some(prefix) = (*CURRENT_SITE.read()).clone() else {
         return;
@@ -313,38 +299,36 @@ pub fn save_current_page() {
     let content = EDITOR_CONTENT.read().clone();
     let now = now_secs();
 
-    let signing_key = SIGNING_KEYS.read().get(&prefix).cloned();
-
-    let page = if let Some(sk) = &signing_key {
-        Page::new(page_id, title, content, now, sk)
-    } else {
-        Page {
-            title,
-            content,
-            updated_at: now,
-            signature: Signature::from_bytes(&[0u8; 64]),
-        }
-    };
-
-    let mut sites = SITES.write();
-    let contract_key = if let Some(site) = sites.get_mut(&prefix) {
-        site.state.pages.insert(page_id, page.clone());
-        site.contract_key
-    } else {
-        None
-    };
+    let sites = SITES.read();
+    let contract_key = sites.get(&prefix).and_then(|s| s.contract_key);
+    let is_owner = sites
+        .get(&prefix)
+        .map(|s| s.role == SiteRole::Owner)
+        .unwrap_or(false);
     drop(sites);
 
-    // Send UPDATE to network
-    if let Some(ck) = contract_key {
-        let mut updates = BTreeMap::new();
-        updates.insert(page_id, page);
-        let delta = delta_core::SiteStateDelta {
-            config: None,
-            page_updates: updates,
-            page_deletions: Vec::new(),
-        };
-        crate::freenet_api::update_site(&ck, &delta);
+    if is_owner {
+        if let Some(ck) = contract_key {
+            // Send to delegate for signing
+            crate::freenet_api::delegate::request_sign_page(
+                &prefix,
+                ck,
+                page_id,
+                title.clone(),
+                content.clone(),
+                now,
+            );
+        }
+    }
+
+    // Optimistically update local state
+    let mut sites = SITES.write();
+    if let Some(site) = sites.get_mut(&prefix) {
+        if let Some(page) = site.state.pages.get_mut(&page_id) {
+            page.title = title;
+            page.content = content;
+            page.updated_at = now;
+        }
     }
 
     *EDITING.write() = false;
@@ -355,23 +339,24 @@ pub fn delete_page(page_id: PageId) {
         return;
     };
 
-    let signing_key = SIGNING_KEYS.read().get(&prefix).cloned();
+    let sites = SITES.read();
+    let contract_key = sites.get(&prefix).and_then(|s| s.contract_key);
+    let is_owner = sites
+        .get(&prefix)
+        .map(|s| s.role == SiteRole::Owner)
+        .unwrap_or(false);
+    drop(sites);
 
+    if is_owner {
+        if let Some(ck) = contract_key {
+            crate::freenet_api::delegate::request_sign_deletion(&prefix, ck, page_id, now_secs());
+        }
+    }
+
+    // Optimistically remove locally
     let mut sites = SITES.write();
     if let Some(site) = sites.get_mut(&prefix) {
         site.state.pages.remove(&page_id);
-
-        // Send signed deletion to network
-        if let (Some(ck), Some(sk)) = (&site.contract_key, &signing_key) {
-            let deletion = delta_core::SignedPageDeletion::new(page_id, now_secs(), sk);
-            let delta = delta_core::SiteStateDelta {
-                config: None,
-                page_updates: BTreeMap::new(),
-                page_deletions: vec![deletion],
-            };
-            crate::freenet_api::update_site(ck, &delta);
-        }
-
         if *CURRENT_PAGE.read() == Some(page_id) {
             let next = site.state.pages.keys().next().copied();
             drop(sites);
@@ -388,7 +373,6 @@ pub fn start_editing() {
     }
 }
 
-/// Navigate to a page by ID (used by page links in rendered markdown).
 #[allow(dead_code)]
 pub fn navigate_to_page(page_id: PageId) {
     let sites = SITES.read();

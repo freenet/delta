@@ -1,14 +1,26 @@
-//! Delegate integration for persistent signing key storage.
+//! Delegate integration for signing and key persistence.
+//!
+//! All signing goes through the delegate. The UI sends content to sign,
+//! the delegate signs with its stored key and returns the signed object.
+//! The response handler then sends the signed data to the network.
 
 use ciborium::{de::from_reader, ser::into_writer};
-use delta_core::DelegateResponse;
+use delta_core::{DelegateResponse, PageId};
+use dioxus::prelude::*;
 use freenet_stdlib::client_api::ClientRequest;
-// Alias to avoid collision with delta_core::DelegateRequest
 use freenet_stdlib::client_api::DelegateRequest as StdlibDelegateRequest;
 use freenet_stdlib::prelude::*;
+use std::collections::BTreeMap;
+
+use crate::state;
 
 /// Site delegate WASM.
 const SITE_DELEGATE_WASM: &[u8] = include_bytes!("../../public/contracts/site_delegate.wasm");
+
+/// Pending signed pages waiting to be sent to the network.
+/// Maps (site_prefix, page_id) → contract key to update.
+pub static PENDING_UPDATES: GlobalSignal<BTreeMap<(String, PageId), ContractKey>> =
+    GlobalSignal::new(BTreeMap::new);
 
 /// Register the site delegate with the Freenet node.
 pub fn register_delegate() {
@@ -29,7 +41,12 @@ pub fn register_delegate() {
             let mut api = super::connection::WEB_API.write();
             if let Some(web_api) = api.as_mut() {
                 match web_api.send(request).await {
-                    Ok(_) => log("Delta: delegate registered"),
+                    Ok(_) => {
+                        log("Delta: delegate registered");
+                        // Check if delegate has a stored key (for page refresh recovery)
+                        drop(api);
+                        request_public_key();
+                    }
                     Err(e) => log(&format!("Delta: delegate registration failed: {e:?}")),
                 }
             }
@@ -38,15 +55,62 @@ pub fn register_delegate() {
 }
 
 /// Store a signing key in the delegate's secret storage.
-pub fn store_signing_key(prefix: &str, key_bytes: &[u8; 32]) {
+pub fn store_signing_key(key_bytes: &[u8; 32]) {
     let request = delta_core::DelegateRequest::StoreSigningKey {
         key_bytes: key_bytes.to_vec(),
     };
     send_delegate_request(&request);
-    let _ = prefix; // prefix used for logging context
 }
 
-/// Handle a delegate response.
+/// Ask the delegate to sign a page. The response will be handled by
+/// `handle_delegate_response` which sends the UPDATE to the network.
+pub fn request_sign_page(
+    site_prefix: &str,
+    contract_key: ContractKey,
+    page_id: PageId,
+    title: String,
+    content: String,
+    updated_at: u64,
+) {
+    // Register pending update so the response handler knows where to send it
+    PENDING_UPDATES
+        .write()
+        .insert((site_prefix.to_string(), page_id), contract_key);
+
+    let request = delta_core::DelegateRequest::SignPage {
+        page_id,
+        title,
+        content,
+        updated_at,
+    };
+    send_delegate_request(&request);
+}
+
+/// Ask the delegate to sign a page deletion.
+pub fn request_sign_deletion(
+    site_prefix: &str,
+    contract_key: ContractKey,
+    page_id: PageId,
+    deleted_at: u64,
+) {
+    PENDING_UPDATES
+        .write()
+        .insert((site_prefix.to_string(), page_id), contract_key);
+
+    let request = delta_core::DelegateRequest::SignPageDeletion {
+        page_id,
+        deleted_at,
+    };
+    send_delegate_request(&request);
+}
+
+/// Ask the delegate for the stored public key (checks if key exists).
+fn request_public_key() {
+    let request = delta_core::DelegateRequest::GetPublicKey;
+    send_delegate_request(&request);
+}
+
+/// Handle a delegate response — route signed objects to the network.
 pub fn handle_delegate_response(values: Vec<OutboundDelegateMsg>) {
     for msg in values {
         if let OutboundDelegateMsg::ApplicationMessage(app_msg) = msg {
@@ -64,21 +128,102 @@ pub fn handle_delegate_response(values: Vec<OutboundDelegateMsg>) {
                     log("Delta: signing key stored in delegate");
                 }
                 DelegateResponse::PublicKey(vk) => {
-                    log(&format!(
-                        "Delta: delegate has public key: {}",
-                        bs58::encode(vk.as_bytes()).into_string()
-                    ));
+                    let prefix = delta_core::SiteParameters {
+                        owner: vk,
+                        site_id: [0u8; 32], // prefix is from pubkey, site_id doesn't matter
+                    }
+                    .site_prefix();
+                    log(&format!("Delta: delegate has key for site prefix {prefix}"));
+                    // Mark the site as owner if we have it
+                    let mut sites = state::SITES.write();
+                    if let Some(site) = sites.get_mut(&prefix) {
+                        site.role = state::SiteRole::Owner;
+                        site.owner_pubkey = vk.to_bytes();
+                    }
                 }
-                DelegateResponse::SignedPage { page_id, page: _ } => {
+                DelegateResponse::SignedPage { page_id, page } => {
                     log(&format!("Delta: delegate signed page {page_id}"));
+                    // Find the pending update and send to network
+                    handle_signed_page(page_id, page);
+                }
+                DelegateResponse::SignedDeletion(deletion) => {
+                    log(&format!(
+                        "Delta: delegate signed deletion for page {}",
+                        deletion.page_id
+                    ));
+                    handle_signed_deletion(deletion);
+                }
+                DelegateResponse::SignedConfig(config) => {
+                    log(&format!(
+                        "Delta: delegate signed config v{}",
+                        config.config.version
+                    ));
                 }
                 DelegateResponse::Error(e) => {
                     log(&format!("Delta: delegate error: {e}"));
                 }
-                _ => {}
             }
         }
     }
+}
+
+/// After receiving a signed page from the delegate, update local state and send to network.
+fn handle_signed_page(page_id: PageId, page: delta_core::Page) {
+    // Find which site/contract this is for
+    let pending = PENDING_UPDATES.write().remove(&find_pending_key(page_id));
+
+    // Update local state
+    let prefix = state::CURRENT_SITE.read().clone();
+    if let Some(prefix) = &prefix {
+        let mut sites = state::SITES.write();
+        if let Some(site) = sites.get_mut(prefix) {
+            site.state.pages.insert(page_id, page.clone());
+            if page_id >= site.state.next_page_id {
+                site.state.next_page_id = page_id + 1;
+            }
+        }
+    }
+
+    // Send UPDATE to network
+    if let Some(contract_key) = pending {
+        let mut updates = BTreeMap::new();
+        updates.insert(page_id, page);
+        let delta = delta_core::SiteStateDelta {
+            config: None,
+            page_updates: updates,
+            page_deletions: Vec::new(),
+        };
+        super::operations::update_site(&contract_key, &delta);
+    }
+}
+
+/// After receiving a signed deletion, update local state and send to network.
+fn handle_signed_deletion(deletion: delta_core::SignedPageDeletion) {
+    let page_id = deletion.page_id;
+    let pending = PENDING_UPDATES.write().remove(&find_pending_key(page_id));
+
+    let prefix = state::CURRENT_SITE.read().clone();
+    if let Some(prefix) = &prefix {
+        let mut sites = state::SITES.write();
+        if let Some(site) = sites.get_mut(prefix) {
+            site.state.pages.remove(&page_id);
+        }
+    }
+
+    if let Some(contract_key) = pending {
+        let delta = delta_core::SiteStateDelta {
+            config: None,
+            page_updates: BTreeMap::new(),
+            page_deletions: vec![deletion],
+        };
+        super::operations::update_site(&contract_key, &delta);
+    }
+}
+
+/// Find the pending key for a page_id (searches current site).
+fn find_pending_key(page_id: PageId) -> (String, PageId) {
+    let prefix = state::CURRENT_SITE.read().clone().unwrap_or_default();
+    (prefix, page_id)
 }
 
 fn send_delegate_request(request: &delta_core::DelegateRequest) {
