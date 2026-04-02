@@ -41,3 +41,47 @@ args = ["test"]
 description = "Run clippy"
 command = "cargo"
 args = ["clippy", "--", "-D", "warnings"]
+
+[tasks.add-migration]
+description = "Record current delegate WASM hash before rebuilding"
+script = '''
+if [ -z "$1" ] || [ -z "$2" ]; then
+    echo "Usage: cargo make add-migration -- VERSION DESCRIPTION"
+    echo "Example: cargo make add-migration -- V2 'Before stdlib bump'"
+    exit 1
+fi
+./scripts/add-migration.sh "$1" "$2"
+'''
+
+[tasks.sync-wasm]
+description = "Rebuild and copy contract/delegate WASMs to committed locations"
+script = "./scripts/sync-wasm.sh"
+
+[tasks.publish-delta]
+description = "Build, sign, and publish Delta to Freenet"
+dependencies = ["build-tailwind"]
+script = '''
+#!/bin/bash
+set -e
+cd ui && dx build --release
+cd ..
+cp ui/assets/styles.css target/dx/delta-ui/release/web/public/
+cp ui/assets/main.css target/dx/delta-ui/release/web/public/
+cd target/dx/delta-ui/release/web/public
+tar -cJf ../../../webapp/webapp.tar.xz *
+cd ../../../../..
+WCT=$(which web-container-tool 2>/dev/null || echo "/home/ian/code/freenet/river/main/target/native/x86_64-unknown-linux-gnu/release/web-container-tool")
+VERSION=$(($(date +%s) / 60))
+$WCT sign \
+    --input target/webapp/webapp.tar.xz \
+    --output target/webapp/webapp.metadata \
+    --parameters target/webapp/webapp.parameters \
+    --key-file ~/.config/delta/web-container-keys.toml \
+    --version $VERSION
+fdev publish \
+    --code published-contract/web_container_contract.wasm \
+    --parameters published-contract/webapp.parameters \
+    contract \
+    --webapp-archive target/webapp/webapp.tar.xz \
+    --webapp-metadata target/webapp/webapp.metadata
+'''

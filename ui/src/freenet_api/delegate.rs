@@ -20,6 +20,9 @@ use crate::state;
 /// Site delegate WASM.
 const SITE_DELEGATE_WASM: &[u8] = include_bytes!("../../public/contracts/site_delegate.wasm");
 
+// Legacy delegate keys for migration (auto-generated from legacy_delegates.toml).
+include!(concat!(env!("OUT_DIR"), "/legacy_delegates.rs"));
+
 /// Pending signed pages waiting to be sent to the network.
 /// Maps (site_prefix, page_id) → contract key to update.
 pub static PENDING_UPDATES: GlobalSignal<BTreeMap<(String, PageId), ContractKey>> =
@@ -46,9 +49,11 @@ pub fn register_delegate() {
                 match web_api.send(request).await {
                     Ok(_) => {
                         log("Delta: delegate registered");
-                        // Check if delegate has a stored key (for page refresh recovery)
                         drop(api);
+                        // Check current delegate for stored key
                         request_public_key();
+                        // Try to migrate from legacy delegates
+                        fire_legacy_migration();
                     }
                     Err(e) => log(&format!("Delta: delegate registration failed: {e:?}")),
                 }
@@ -257,6 +262,57 @@ fn send_delegate_request(request: &delta_core::DelegateRequest) {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let _ = request;
+    }
+}
+
+/// Attempt to migrate signing keys from legacy delegate versions.
+/// Fires GetPublicKey to each legacy delegate — if one responds,
+/// the key gets migrated to the current delegate.
+fn fire_legacy_migration() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // CodeHash is available via freenet_stdlib::prelude::* (already imported)
+
+        if LEGACY_DELEGATES.is_empty() {
+            return;
+        }
+
+        log(&format!(
+            "Delta: attempting migration from {} legacy delegate(s)",
+            LEGACY_DELEGATES.len()
+        ));
+
+        for (i, (key_bytes, code_hash_bytes)) in LEGACY_DELEGATES.iter().enumerate() {
+            let legacy_code_hash = CodeHash::new(*code_hash_bytes);
+            let legacy_delegate_key = DelegateKey::new(*key_bytes, legacy_code_hash);
+
+            let request = delta_core::DelegateRequest::GetPublicKey;
+            let mut payload = Vec::new();
+            if into_writer(&request, &mut payload).is_err() {
+                continue;
+            }
+
+            let app_msg = ApplicationMessage::new(payload).processed(false);
+            let client_request =
+                ClientRequest::DelegateOp(StdlibDelegateRequest::ApplicationMessages {
+                    key: legacy_delegate_key,
+                    params: Parameters::from(Vec::<u8>::new()),
+                    inbound: vec![InboundDelegateMsg::ApplicationMessage(app_msg)],
+                });
+
+            let idx = i;
+            wasm_bindgen_futures::spawn_local(async move {
+                let mut api = super::connection::WEB_API.write();
+                if let Some(web_api) = api.as_mut() {
+                    match web_api.send(client_request).await {
+                        Ok(_) => log(&format!("Delta: legacy migration request #{idx} sent")),
+                        Err(_) => {
+                            // Expected if legacy delegate isn't installed
+                        }
+                    }
+                }
+            });
+        }
     }
 }
 
