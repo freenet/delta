@@ -1,5 +1,6 @@
 use dioxus::prelude::*;
 
+use crate::freenet_api::ConnectionStatus;
 use crate::state;
 use crate::state::SiteRole;
 
@@ -60,6 +61,21 @@ pub fn SitesSidebar() -> Element {
                     class: "btn-secondary w-full px-3 py-2 text-xs mb-2",
                     onclick: move |_| state::show_add_site_prompt(),
                     "+ Add Site"
+                }
+                {
+                    let status = crate::freenet_api::CONNECTION_STATUS.read();
+                    let (dot_color, status_text) = match &*status {
+                        ConnectionStatus::Connected => ("bg-green-500", "Connected"),
+                        ConnectionStatus::Connecting => ("bg-yellow-500", "Connecting..."),
+                        ConnectionStatus::Disconnected => ("bg-gray-400", "Offline"),
+                        ConnectionStatus::Error(_) => ("bg-red-500", "Error"),
+                    };
+                    rsx! {
+                        div { class: "flex items-center justify-center gap-1.5 mb-1",
+                            span { class: "w-1.5 h-1.5 rounded-full {dot_color} inline-block" }
+                            span { class: "text-[9px] text-text-muted", "{status_text}" }
+                        }
+                    }
                 }
                 p { class: "text-[9px] text-text-muted text-center leading-tight",
                     "Built: {env!(\"BUILD_TIMESTAMP\")}"

@@ -50,9 +50,6 @@ pub fn PageView() -> Element {
             div {
                 class: "prose",
                 dangerous_inner_html: "{rendered_html}",
-                onclick: move |evt| {
-                    handle_link_click(evt);
-                },
             }
 
             // Footer
@@ -65,45 +62,16 @@ pub fn PageView() -> Element {
     }
 }
 
-fn handle_link_click(evt: Event<MouseData>) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        use wasm_bindgen::JsCast;
-        if let Some(target) = evt.data().downcast::<web_sys::MouseEvent>() {
-            if let Some(element) = target
-                .target()
-                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
-            {
-                let anchor = if element.tag_name() == "A" {
-                    Some(element)
-                } else {
-                    element.closest("a").ok().flatten()
-                };
-
-                if let Some(a) = anchor {
-                    if let Some(href) = a.get_attribute("href") {
-                        let path = href.trim_start_matches('/');
-                        if let Some(id_str) = path.split('/').next() {
-                            if let Ok(page_id) = id_str.parse::<PageId>() {
-                                evt.prevent_default();
-                                state::navigate_to_page(page_id);
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-    let _ = evt;
-}
-
+/// Render markdown to HTML, resolving `[[id|text]]` page links as hash links.
 fn render_markdown(content: &str) -> String {
     let resolved = resolve_page_links(content);
     markdown::to_html(&resolved)
 }
 
+/// Replace `[[id|Display Text]]` with hash-routed links.
 fn resolve_page_links(content: &str) -> String {
+    let prefix = state::CURRENT_SITE.read().clone().unwrap_or_default();
+
     let mut result = String::with_capacity(content.len());
     let mut rest = content;
 
@@ -117,12 +85,13 @@ fn resolve_page_links(content: &str) -> String {
                 if let Ok(id) = id_str.trim().parse::<PageId>() {
                     let title = state::SITES
                         .read()
-                        .get(&state::CURRENT_SITE.read().clone().unwrap_or_default())
+                        .get(&prefix)
                         .and_then(|s| s.state.pages.get(&id))
                         .map(|p| p.title.clone())
                         .unwrap_or_else(|| display.to_string());
-                    let slug = slugify(&title);
-                    result.push_str(&format!("[{title}](/{id}/{slug})"));
+                    // Hash link so the hashchange listener picks it up
+                    let hash = state::build_hash_route(&prefix, Some(id), Some(&title));
+                    result.push_str(&format!("[{title}]({hash})"));
                 } else {
                     result.push_str(&format!("[[{link_content}]]"));
                 }
@@ -137,16 +106,6 @@ fn resolve_page_links(content: &str) -> String {
     }
     result.push_str(rest);
     result
-}
-
-fn slugify(title: &str) -> String {
-    title
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string()
 }
 
 fn format_timestamp(ts: u64) -> String {
