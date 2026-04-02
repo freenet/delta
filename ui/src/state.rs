@@ -42,13 +42,18 @@ pub static EDITOR_CONTENT: GlobalSignal<String> = GlobalSignal::new(String::new)
 // Initialization
 // ---------------------------------------------------------------------------
 
-pub fn init_example_data() {
-    let sites = crate::example_data::create_example_sites();
-    let first_prefix = sites.keys().next().cloned();
-    *SITES.write() = sites;
-
-    if let Some(prefix) = first_prefix {
-        select_site(&prefix);
+/// Initialize from URL hash if present (e.g. user arrived via a shared link).
+pub fn init_from_hash() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            let hash = window.location().hash().unwrap_or_default();
+            if let Some((prefix, page_id)) = parse_hash_route(&hash) {
+                // User arrived via a shared link — visit that site
+                visit_site(prefix);
+                return;
+            }
+        }
     }
 }
 

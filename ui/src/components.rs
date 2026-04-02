@@ -13,12 +13,15 @@ use crate::state;
 pub fn App() -> Element {
     // Initialize once — use_hook runs only on first mount, not on re-renders
     use_hook(|| {
-        state::init_example_data();
         setup_hash_listener();
         freenet_api::connect_to_freenet();
+        // If URL has a hash route, navigate to that site
+        state::init_from_hash();
     });
 
     let show_add_site = *state::SHOW_ADD_SITE.read();
+    let has_sites = !state::SITES.read().is_empty();
+    let has_current = state::CURRENT_SITE.read().is_some();
 
     rsx! {
         document::Link { rel: "icon", href: asset!("/assets/favicon.svg") }
@@ -27,6 +30,26 @@ pub fn App() -> Element {
             if show_add_site {
                 main { class: "flex-1 overflow-y-auto bg-panel",
                     add_site_dialog::AddSiteDialog {}
+                }
+            } else if !has_sites || !has_current {
+                // Welcome screen — no sites yet
+                main { class: "flex-1 overflow-y-auto bg-panel",
+                    div { class: "flex items-center justify-center h-full",
+                        div { class: "text-center max-w-md mx-8",
+                            span { class: "delta-mark inline-flex mb-6 w-16 h-16 text-[32px] rounded-2xl", "\u{0394}" }
+                            h1 { class: "text-2xl font-semibold text-text mb-2", "Welcome to Delta" }
+                            p { class: "text-sm text-text-muted-light mb-8 leading-relaxed",
+                                "Decentralized publishing on Freenet. Create your own site or visit one using a site code."
+                            }
+                            div { class: "flex gap-3 justify-center",
+                                button {
+                                    class: "btn-primary px-6 py-3 text-sm",
+                                    onclick: move |_| state::show_add_site_prompt(),
+                                    "Get Started"
+                                }
+                            }
+                        }
+                    }
                 }
             } else {
                 pages_sidebar::PagesSidebar {}

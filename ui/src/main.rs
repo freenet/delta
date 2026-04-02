@@ -1,5 +1,4 @@
 mod components;
-mod example_data;
 mod freenet_api;
 mod state;
 
