@@ -664,6 +664,7 @@ dependencies = [
 name = "delta-ui"
 version = "0.1.0"
 dependencies = [
+ "bs58",
  "chrono",
  "ciborium",
  "delta-core",

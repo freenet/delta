@@ -1,4 +1,4 @@
-use delta_core::{Page, PageId, SiteState};
+use delta_core::{Page, PageId, SignedConfig, SiteConfig, SiteState};
 use dioxus::prelude::*;
 use ed25519_dalek::Signature;
 use serde::{Deserialize, Serialize};
@@ -39,6 +39,9 @@ pub static CURRENT_PAGE: GlobalSignal<Option<PageId>> = GlobalSignal::new(|| Non
 
 /// Whether we're in edit mode.
 pub static EDITING: GlobalSignal<bool> = GlobalSignal::new(|| false);
+
+/// Whether the "add site" dialog is showing.
+pub static SHOW_ADD_SITE: GlobalSignal<bool> = GlobalSignal::new(|| false);
 
 /// Editor content (buffered separately from saved state).
 pub static EDITOR_TITLE: GlobalSignal<String> = GlobalSignal::new(String::new);
@@ -90,6 +93,7 @@ pub fn build_hash_route(prefix: &str, page_id: Option<PageId>, title: Option<&st
 
 pub fn select_site(prefix: &str) {
     *EDITING.write() = false;
+    *SHOW_ADD_SITE.write() = false;
     *CURRENT_SITE.write() = Some(prefix.to_string());
 
     // Select first page of the site
@@ -97,7 +101,6 @@ pub fn select_site(prefix: &str) {
     if let Some(site) = sites.get(prefix) {
         let first_page = site.state.pages.keys().next().copied();
         *CURRENT_PAGE.write() = first_page;
-        // Update URL hash
         if let Some(page_id) = first_page {
             let title = site.state.pages.get(&page_id).map(|p| p.title.as_str());
             update_hash(&build_hash_route(prefix, Some(page_id), title));
@@ -105,6 +108,54 @@ pub fn select_site(prefix: &str) {
             update_hash(&build_hash_route(prefix, None, None));
         }
     }
+}
+
+pub fn show_add_site_prompt() {
+    *SHOW_ADD_SITE.write() = true;
+}
+
+/// Create a new owned site with the given name.
+pub fn create_new_site(name: String) {
+    let placeholder_sig = Signature::from_bytes(&[0u8; 64]);
+
+    // Generate a pseudo-random prefix for now
+    // (In production this comes from the owner's actual pubkey)
+    let prefix = generate_prefix();
+
+    let mut pages = BTreeMap::new();
+    let now = now_secs();
+    pages.insert(
+        1,
+        Page {
+            title: "Home".into(),
+            content: format!("# {name}\n\nWelcome to your new site.\n"),
+            updated_at: now,
+            signature: placeholder_sig,
+        },
+    );
+
+    let site = KnownSite {
+        name: name.clone(),
+        prefix: prefix.clone(),
+        role: SiteRole::Owner,
+        state: SiteState {
+            config: SignedConfig {
+                config: SiteConfig {
+                    version: 1,
+                    name,
+                    description: String::new(),
+                },
+                signature: placeholder_sig,
+            },
+            pages,
+            next_page_id: 2,
+        },
+        owner_pubkey: [0u8; 32], // placeholder
+    };
+
+    SITES.write().insert(prefix.clone(), site);
+    *SHOW_ADD_SITE.write() = false;
+    select_site(&prefix);
 }
 
 // ---------------------------------------------------------------------------
@@ -128,7 +179,6 @@ pub fn select_page(page_id: PageId) {
     *EDITING.write() = false;
     *CURRENT_PAGE.write() = Some(page_id);
 
-    // Update URL hash
     if let Some(prefix) = &*CURRENT_SITE.read() {
         let sites = SITES.read();
         let title = sites
@@ -207,10 +257,9 @@ pub fn start_editing() {
     }
 }
 
-/// Navigate to a page by ID (used by page links).
+/// Navigate to a page by ID (used by page links in rendered markdown).
 #[allow(dead_code)]
 pub fn navigate_to_page(page_id: PageId) {
-    // Check if page exists in current site
     let sites = SITES.read();
     if let Some(prefix) = &*CURRENT_SITE.read() {
         if let Some(site) = sites.get(prefix) {
@@ -240,13 +289,19 @@ fn now_secs() -> u64 {
     chrono::Utc::now().timestamp() as u64
 }
 
+fn generate_prefix() -> String {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+    let bytes: [u8; 8] = rng.gen();
+    let encoded = bs58::encode(&bytes).into_string();
+    encoded[..10.min(encoded.len())].to_string()
+}
+
 fn update_hash(hash: &str) {
     #[cfg(target_arch = "wasm32")]
     {
         if let Some(window) = web_sys::window() {
-            if let Ok(location) = window.location().set_hash(hash) {
-                let _ = location;
-            }
+            let _ = window.location().set_hash(hash);
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
