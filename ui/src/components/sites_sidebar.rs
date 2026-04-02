@@ -90,6 +90,7 @@ fn site_row(prefix: &str, site: &state::KnownSite, current_prefix: &Option<Strin
     let is_owner = site.role == SiteRole::Owner;
     let prefix_owned = prefix.to_string();
     let prefix_for_remove = prefix.to_string();
+    let mut confirming_remove = use_signal(|| false);
 
     let row_class = if is_selected {
         "site-selected bg-surface"
@@ -109,22 +110,36 @@ fn site_row(prefix: &str, site: &state::KnownSite, current_prefix: &Option<Strin
         div { class: "group relative flex items-center {row_class} transition-all-fast",
             button {
                 class: "w-full flex items-center gap-2.5 px-3 py-2 text-left",
-                onclick: move |_| state::select_site(&prefix_owned),
+                onclick: move |_| {
+                    confirming_remove.set(false);
+                    state::select_site(&prefix_owned);
+                },
                 span { class: "{avatar_class}", "{initial}" }
                 div { class: "min-w-0 flex-1",
                     div { class: "text-sm text-text-light truncate font-medium", "{site.name}" }
                     div { class: "text-[10px] text-text-muted font-mono truncate", "{site.prefix}" }
                 }
             }
-            // Remove button — visible on hover
-            button {
-                class: "absolute right-1 top-1/2 -translate-y-1/2 w-5 h-5 flex items-center justify-center rounded text-text-muted hover:text-text hover:bg-surface-hover opacity-0 group-hover:opacity-100 transition-opacity text-xs",
-                title: "Remove site",
-                onclick: move |evt| {
-                    evt.stop_propagation();
-                    state::remove_site(&prefix_for_remove);
-                },
-                "\u{00d7}" // ×
+            // Remove: two-click confirm
+            if *confirming_remove.read() {
+                button {
+                    class: "absolute right-1 top-1/2 -translate-y-1/2 px-2 py-1 rounded text-[10px] font-medium bg-red-500/20 text-red-400 hover:bg-red-500/30 transition-colors",
+                    onclick: move |evt| {
+                        evt.stop_propagation();
+                        state::remove_site(&prefix_for_remove);
+                    },
+                    "Remove?"
+                }
+            } else {
+                button {
+                    class: "absolute right-1 top-1/2 -translate-y-1/2 w-6 h-6 flex items-center justify-center rounded text-text-muted hover:text-text hover:bg-surface-hover opacity-0 group-hover:opacity-100 transition-opacity text-sm",
+                    title: "Remove site from list",
+                    onclick: move |evt| {
+                        evt.stop_propagation();
+                        confirming_remove.set(true);
+                    },
+                    "\u{00d7}"
+                }
             }
         }
     }
@@ -132,7 +147,6 @@ fn site_row(prefix: &str, site: &state::KnownSite, current_prefix: &Option<Strin
 
 const BUILD_TIMESTAMP_ISO: &str = env!("BUILD_TIMESTAMP_ISO", "unknown");
 
-/// Convert UTC ISO timestamp to local time using browser's Date API.
 fn format_build_time_local() -> String {
     #[cfg(target_arch = "wasm32")]
     {
