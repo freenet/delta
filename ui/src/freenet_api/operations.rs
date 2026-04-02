@@ -230,7 +230,7 @@ pub fn update_site(contract_key: &ContractKey, delta: &delta_core::SiteStateDelt
         Box::pin(async move {
             let request = ClientRequest::ContractOp(ContractRequest::Update {
                 key,
-                data: UpdateData::State(buf.into()),
+                data: UpdateData::Delta(StateDelta::from(buf)),
             });
             api.send(request).await
         })
