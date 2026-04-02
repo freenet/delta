@@ -1,0 +1,43 @@
+[config]
+skip_core_tasks = true
+default_to_workspace = false
+
+[tasks.build-tailwind]
+description = "Build Tailwind CSS"
+command = "npm"
+args = ["run", "build:css"]
+cwd = "./ui"
+
+[tasks.watch-tailwind]
+description = "Watch and rebuild Tailwind CSS"
+command = "npm"
+args = ["run", "watch:css"]
+cwd = "./ui"
+
+[tasks.build-ui]
+description = "Build the UI (CSS + WASM)"
+dependencies = ["build-tailwind"]
+script = '''
+cd ui && dx build
+# Copy CSS to output since dx doesn't auto-copy style resources
+cp ui/assets/styles.css target/dx/delta-ui/debug/web/public/ 2>/dev/null || true
+cp ui/assets/main.css target/dx/delta-ui/debug/web/public/ 2>/dev/null || true
+'''
+
+[tasks.serve]
+description = "Serve the built UI locally"
+dependencies = ["build-ui"]
+script = '''
+echo "Serving at http://127.0.0.1:8083/"
+cd target/dx/delta-ui/debug/web/public && python3 -m http.server 8083
+'''
+
+[tasks.test]
+description = "Run all tests"
+command = "cargo"
+args = ["test"]
+
+[tasks.clippy]
+description = "Run clippy"
+command = "cargo"
+args = ["clippy", "--", "-D", "warnings"]

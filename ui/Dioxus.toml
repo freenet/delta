@@ -12,6 +12,7 @@ reload_html = true
 watch_path = ["src", "assets"]
 
 [web.resource]
+style = ["styles.css", "main.css"]
 script = []
 include = []
 

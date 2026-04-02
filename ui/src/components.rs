@@ -14,9 +14,9 @@ pub fn App() -> Element {
     });
 
     rsx! {
-        div { class: "flex h-screen bg-white text-gray-900",
+        div { class: "flex h-screen bg-bg text-text",
             sidebar::Sidebar {}
-            main { class: "flex-1 overflow-y-auto",
+            main { class: "flex-1 overflow-y-auto bg-panel",
                 {
                     if *state::EDITING.read() {
                         rsx! { editor::Editor {} }

@@ -7,8 +7,11 @@ use delta_core::PageId;
 pub fn PageView() -> Element {
     let Some((page_id, page)) = state::current_page() else {
         return rsx! {
-            div { class: "flex items-center justify-center h-full text-gray-400",
-                p { "Select a page or create a new one" }
+            div { class: "flex items-center justify-center h-full text-text-muted",
+                div { class: "text-center",
+                    p { class: "text-lg", "No page selected" }
+                    p { class: "text-sm mt-1", "Choose a page from the sidebar or create a new one" }
+                }
             }
         };
     };
@@ -18,18 +21,18 @@ pub fn PageView() -> Element {
     rsx! {
         div { class: "max-w-3xl mx-auto px-8 py-8",
             // Page header
-            div { class: "flex items-center justify-between mb-6",
-                h1 { class: "text-3xl font-bold text-gray-900",
+            div { class: "flex items-center justify-between mb-8",
+                h1 { class: "text-3xl font-bold text-text",
                     "{page.title}"
                 }
                 div { class: "flex gap-2",
                     button {
-                        class: "px-3 py-1.5 text-sm bg-gray-100 text-gray-700 rounded-md hover:bg-gray-200",
+                        class: "px-4 py-2 text-sm bg-accent text-text-inverse rounded-lg hover:bg-accent-hover font-medium transition-colors",
                         onclick: move |_| state::start_editing(),
                         "Edit"
                     }
                     button {
-                        class: "px-3 py-1.5 text-sm bg-red-50 text-red-600 rounded-md hover:bg-red-100",
+                        class: "px-4 py-2 text-sm bg-surface text-text-muted rounded-lg hover:bg-surface-hover transition-colors",
                         onclick: move |_| state::delete_page(page_id),
                         "Delete"
                     }
@@ -43,8 +46,8 @@ pub fn PageView() -> Element {
             }
 
             // Page metadata
-            div { class: "mt-8 pt-4 border-t border-gray-100 text-xs text-gray-400",
-                "Page #{page_id} · Last updated: {format_timestamp(page.updated_at)}"
+            div { class: "mt-12 pt-4 border-t border-border text-xs text-text-muted",
+                "Page #{page_id} · Updated {format_timestamp(page.updated_at)}"
             }
         }
     }
@@ -69,7 +72,6 @@ fn resolve_page_links(content: &str) -> String {
             let link_content = &after_open[..end];
             if let Some((id_str, display)) = link_content.split_once('|') {
                 if let Ok(id) = id_str.trim().parse::<PageId>() {
-                    // Look up current title from state
                     let title = state::SITE
                         .read()
                         .pages
@@ -77,9 +79,8 @@ fn resolve_page_links(content: &str) -> String {
                         .map(|p| p.title.clone())
                         .unwrap_or_else(|| display.to_string());
                     let slug = slugify(&title);
-                    result.push_str(&format!("[{title}](/{id}/{slug})",));
+                    result.push_str(&format!("[{title}](/{id}/{slug})"));
                 } else {
-                    // Not a valid ID, keep as-is
                     result.push_str(&format!("[[{link_content}]]"));
                 }
             } else {
@@ -108,6 +109,6 @@ fn slugify(title: &str) -> String {
 fn format_timestamp(ts: u64) -> String {
     use chrono::{DateTime, Utc};
     let dt = DateTime::<Utc>::from_timestamp(ts as i64, 0);
-    dt.map(|d| d.format("%Y-%m-%d %H:%M UTC").to_string())
+    dt.map(|d| d.format("%b %d, %Y at %H:%M UTC").to_string())
         .unwrap_or_else(|| "unknown".to_string())
 }

@@ -6,7 +6,7 @@ use crate::state;
 pub fn Editor() -> Element {
     let Some((page_id, _page)) = state::current_page() else {
         return rsx! {
-            div { class: "flex items-center justify-center h-full text-gray-400",
+            div { class: "flex items-center justify-center h-full text-text-muted",
                 p { "No page selected" }
             }
         };
@@ -28,9 +28,9 @@ pub fn Editor() -> Element {
     rsx! {
         div { class: "flex flex-col h-full",
             // Toolbar
-            div { class: "flex items-center gap-3 px-6 py-3 border-b border-gray-200 bg-gray-50",
+            div { class: "flex items-center gap-3 px-6 py-3 border-b border-border bg-surface",
                 input {
-                    class: "text-xl font-bold bg-transparent border-none outline-none flex-1 text-gray-900",
+                    class: "text-xl font-bold bg-transparent border-none outline-none flex-1 text-text placeholder-text-muted",
                     r#type: "text",
                     value: "{title}",
                     placeholder: "Page title",
@@ -39,12 +39,12 @@ pub fn Editor() -> Element {
                     },
                 }
                 button {
-                    class: "px-4 py-1.5 text-sm bg-blue-600 text-white rounded-md hover:bg-blue-700",
+                    class: "px-4 py-2 text-sm bg-accent text-text-inverse rounded-lg hover:bg-accent-hover font-medium transition-colors",
                     onclick: move |_| state::save_current_page(),
                     "Save"
                 }
                 button {
-                    class: "px-4 py-1.5 text-sm bg-gray-100 text-gray-700 rounded-md hover:bg-gray-200",
+                    class: "px-4 py-2 text-sm bg-surface-hover text-text rounded-lg hover:bg-border transition-colors",
                     onclick: move |_| {
                         *state::EDITING.write() = false;
                     },
@@ -55,12 +55,12 @@ pub fn Editor() -> Element {
             // Editor + Preview split
             div { class: "flex flex-1 overflow-hidden",
                 // Editor pane
-                div { class: "flex-1 flex flex-col border-r border-gray-200",
-                    div { class: "px-4 py-2 text-xs font-medium text-gray-500 bg-gray-50 border-b border-gray-100",
+                div { class: "flex-1 flex flex-col border-r border-border",
+                    div { class: "px-4 py-2 text-xs font-medium text-text-muted bg-surface border-b border-border uppercase tracking-wide",
                         "Markdown"
                     }
                     textarea {
-                        class: "editor-textarea flex-1 w-full p-4 resize-none outline-none text-sm text-gray-800 bg-white",
+                        class: "editor-textarea flex-1 w-full p-4 resize-none outline-none text-sm",
                         value: "{content}",
                         placeholder: "Write your page content in Markdown...",
                         oninput: move |evt| {
@@ -70,8 +70,8 @@ pub fn Editor() -> Element {
                 }
 
                 // Preview pane
-                div { class: "flex-1 flex flex-col",
-                    div { class: "px-4 py-2 text-xs font-medium text-gray-500 bg-gray-50 border-b border-gray-100",
+                div { class: "flex-1 flex flex-col bg-panel",
+                    div { class: "px-4 py-2 text-xs font-medium text-text-muted bg-surface border-b border-border uppercase tracking-wide",
                         "Preview"
                     }
                     div { class: "flex-1 overflow-y-auto p-6",
