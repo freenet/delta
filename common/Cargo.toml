@@ -11,6 +11,7 @@ ciborium.workspace = true
 serde.workspace = true
 ed25519-dalek = { workspace = true, default-features = false, features = ["alloc", "serde"] }
 blake3.workspace = true
+bs58.workspace = true
 freenet-scaffold.workspace = true
 freenet-scaffold-macro.workspace = true
 freenet-stdlib.workspace = true

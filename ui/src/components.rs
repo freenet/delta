@@ -1,6 +1,7 @@
 mod editor;
 mod page_view;
-mod sidebar;
+mod pages_sidebar;
+mod sites_sidebar;
 
 use dioxus::prelude::*;
 
@@ -15,7 +16,8 @@ pub fn App() -> Element {
 
     rsx! {
         div { class: "flex h-screen bg-bg text-text",
-            sidebar::Sidebar {}
+            sites_sidebar::SitesSidebar {}
+            pages_sidebar::PagesSidebar {}
             main { class: "flex-1 overflow-y-auto bg-panel",
                 {
                     if *state::EDITING.read() {

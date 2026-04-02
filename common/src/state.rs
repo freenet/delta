@@ -13,12 +13,24 @@ pub type PageId = u64;
 // Parameters (fixed at contract creation, determines contract key)
 // ---------------------------------------------------------------------------
 
+/// Length of the site prefix used in URLs (first N chars of base58-encoded owner pubkey).
+pub const SITE_PREFIX_LEN: usize = 10;
+
 /// Contract parameters — the owner's public key and a unique site ID.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SiteParameters {
     pub owner: VerifyingKey,
     /// Random bytes to make the contract key unique per site.
     pub site_id: [u8; 32],
+}
+
+impl SiteParameters {
+    /// Short prefix for URLs, derived from the owner's public key.
+    /// First 10 characters of base58-encoded pubkey (~58 bits, collision-safe into billions).
+    pub fn site_prefix(&self) -> String {
+        let encoded = bs58::encode(self.owner.as_bytes()).into_string();
+        encoded[..SITE_PREFIX_LEN.min(encoded.len())].to_string()
+    }
 }
 
 // ---------------------------------------------------------------------------

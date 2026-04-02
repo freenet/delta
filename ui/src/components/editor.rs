@@ -4,7 +4,7 @@ use crate::state;
 
 #[component]
 pub fn Editor() -> Element {
-    let Some((page_id, _page)) = state::current_page() else {
+    let Some((_page_id, _page)) = state::current_page() else {
         return rsx! {
             div { class: "flex items-center justify-center h-full text-text-muted",
                 p { "No page selected" }
@@ -14,8 +14,7 @@ pub fn Editor() -> Element {
 
     // Initialize editor content when entering edit mode
     use_effect(move || {
-        let page = state::SITE.read().pages.get(&page_id).cloned();
-        if let Some(page) = page {
+        if let Some((_, page)) = state::current_page() {
             *state::EDITOR_TITLE.write() = page.title.clone();
             *state::EDITOR_CONTENT.write() = page.content.clone();
         }
@@ -56,7 +55,7 @@ pub fn Editor() -> Element {
             div { class: "flex flex-1 overflow-hidden",
                 // Editor pane
                 div { class: "flex-1 flex flex-col border-r border-border",
-                    div { class: "px-4 py-2 text-xs font-medium text-text-muted bg-surface border-b border-border uppercase tracking-wide",
+                    div { class: "px-4 py-2 text-[10px] font-semibold text-text-muted bg-surface border-b border-border uppercase tracking-widest",
                         "Markdown"
                     }
                     textarea {
@@ -71,7 +70,7 @@ pub fn Editor() -> Element {
 
                 // Preview pane
                 div { class: "flex-1 flex flex-col bg-panel",
-                    div { class: "px-4 py-2 text-xs font-medium text-text-muted bg-surface border-b border-border uppercase tracking-wide",
+                    div { class: "px-4 py-2 text-[10px] font-semibold text-text-muted bg-surface border-b border-border uppercase tracking-widest",
                         "Preview"
                     }
                     div { class: "flex-1 overflow-y-auto p-6",
