@@ -25,13 +25,29 @@ pub fn PageView() -> Element {
 
     let rendered_html = render_markdown(&page.content);
 
+    let site_prefix = state::current_site()
+        .map(|s| s.prefix.clone())
+        .unwrap_or_default();
+    let page_title_for_share = page.title.clone();
+    let mut link_copied = use_signal(|| false);
+
     rsx! {
         div { class: "max-w-2xl mx-auto px-10 py-12",
             // Page header
             div { class: "flex items-start justify-between mb-2",
                 div { class: "flex-1 min-w-0" }
-                if is_owner {
-                    div { class: "flex gap-2 ml-4 flex-shrink-0",
+                div { class: "flex gap-2 ml-4 flex-shrink-0",
+                    // Share button — always visible
+                    button {
+                        class: "px-3 py-2 text-sm text-text-muted hover:text-accent hover:bg-accent-glow rounded-lg transition-colors",
+                        title: "Copy link to this page",
+                        onclick: move |_| {
+                            copy_page_url(&site_prefix, page_id, &page_title_for_share);
+                            link_copied.set(true);
+                        },
+                        if *link_copied.read() { "Copied!" } else { "Share" }
+                    }
+                    if is_owner {
                         button {
                             class: "btn-primary px-4 py-2 text-sm",
                             onclick: move |_| state::start_editing(),
@@ -106,6 +122,46 @@ fn resolve_page_links(content: &str) -> String {
     }
     result.push_str(rest);
     result
+}
+
+/// Copy the full URL for a specific page to clipboard.
+fn copy_page_url(prefix: &str, page_id: PageId, title: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        if let Some(window) = web_sys::window() {
+            let location = window.location();
+            let origin = location.origin().unwrap_or_default();
+            let pathname = location.pathname().unwrap_or_default();
+            let hash = state::build_hash_route(prefix, Some(page_id), Some(title));
+            let url = format!("{origin}{pathname}{hash}");
+            let clipboard = window.navigator().clipboard();
+            let _ = clipboard.write_text(&url);
+
+            // Also update the hash via postMessage for #3747
+            let msg = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(
+                &msg,
+                &wasm_bindgen::JsValue::from_str("__freenet_shell__"),
+                &wasm_bindgen::JsValue::TRUE,
+            );
+            let _ = js_sys::Reflect::set(
+                &msg,
+                &wasm_bindgen::JsValue::from_str("type"),
+                &wasm_bindgen::JsValue::from_str("hash"),
+            );
+            let _ = js_sys::Reflect::set(
+                &msg,
+                &wasm_bindgen::JsValue::from_str("hash"),
+                &wasm_bindgen::JsValue::from_str(&hash),
+            );
+            let target = window.parent().ok().flatten().unwrap_or(window);
+            let _ = target.post_message(&msg, "*");
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (prefix, page_id, title);
+    }
 }
 
 fn format_timestamp(ts: u64) -> String {
