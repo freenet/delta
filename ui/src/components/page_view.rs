@@ -7,13 +7,17 @@ use delta_core::PageId;
 #[component]
 pub fn PageView() -> Element {
     let Some((page_id, page)) = state::current_page() else {
+        // Check if we're waiting for a site to load vs no site selected
+        let is_loading = state::CURRENT_SITE.read().is_some();
         return rsx! {
             div { class: "flex items-center justify-center h-full",
                 div { class: "text-center",
-                    span { class: "delta-mark text-3xl w-12 h-12 text-[28px] opacity-30 mb-4 inline-flex items-center justify-center rounded-xl",
+                    span { class: "delta-mark w-10 h-10 text-[22px] opacity-20 mb-4 inline-flex items-center justify-center rounded-xl loading-pulse",
                         "\u{0394}"
                     }
-                    p { class: "text-text-muted-light text-sm mt-4", "Select a page to start reading" }
+                    p { class: "text-text-muted-light text-sm mt-4",
+                        if is_loading { "Loading..." } else { "Select a page to start reading" }
+                    }
                 }
             }
         };

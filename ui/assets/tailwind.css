@@ -366,3 +366,12 @@ html, body {
 .transition-all-fast {
   transition: all 0.1s ease;
 }
+
+/* Loading pulse */
+.loading-pulse {
+  animation: gentle-pulse 2s ease-in-out infinite;
+}
+@keyframes gentle-pulse {
+  0%, 100% { opacity: 0.15; }
+  50% { opacity: 0.35; }
+}
