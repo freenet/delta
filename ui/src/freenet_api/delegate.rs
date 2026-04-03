@@ -24,9 +24,11 @@ const SITE_DELEGATE_WASM: &[u8] = include_bytes!("../../public/contracts/site_de
 include!(concat!(env!("OUT_DIR"), "/legacy_delegates.rs"));
 
 /// Pending signed pages waiting to be sent to the network.
-/// Maps (site_prefix, page_id) → contract key to update.
 pub static PENDING_UPDATES: GlobalSignal<BTreeMap<(String, PageId), ContractKey>> =
     GlobalSignal::new(BTreeMap::new);
+
+/// Pending config update waiting for delegate signature.
+static PENDING_CONFIG: GlobalSignal<Option<ContractKey>> = GlobalSignal::new(|| None);
 
 /// Register the site delegate with the Freenet node.
 pub fn register_delegate() {
@@ -134,6 +136,23 @@ pub fn request_sign_deletion(
     send_delegate_request(&request);
 }
 
+/// Ask the delegate to sign a config update (e.g. rename).
+pub fn request_sign_config(site_prefix: &str, contract_key: ContractKey, new_name: String) {
+    *PENDING_CONFIG.write() = Some(contract_key);
+
+    let sites = state::SITES.read();
+    let config = if let Some(site) = sites.get(site_prefix) {
+        site.state.config.config.clone()
+    } else {
+        return;
+    };
+    drop(sites);
+
+    let request = delta_core::DelegateRequest::SignConfig { config };
+    send_delegate_request(&request);
+    let _ = new_name; // name already set in config
+}
+
 /// Ask the delegate for the stored public key (checks if key exists).
 fn request_public_key() {
     let request = delta_core::DelegateRequest::GetPublicKey;
@@ -179,11 +198,12 @@ pub fn handle_delegate_response(values: Vec<OutboundDelegateMsg>) {
                     ));
                     handle_signed_deletion(deletion);
                 }
-                DelegateResponse::SignedConfig(config) => {
+                DelegateResponse::SignedConfig(signed_config) => {
                     log(&format!(
                         "Delta: delegate signed config v{}",
-                        config.config.version
+                        signed_config.config.version
                     ));
+                    handle_signed_config(signed_config);
                 }
                 DelegateResponse::SitesStored => {
                     log("Delta: known sites saved to delegate");
@@ -230,6 +250,30 @@ fn handle_signed_page(page_id: PageId, page: delta_core::Page) {
             page_deletions: Vec::new(),
         };
         super::operations::update_site(&contract_key, &delta);
+    }
+}
+
+/// After receiving a signed config, update local state and send to network.
+fn handle_signed_config(signed_config: delta_core::SignedConfig) {
+    let contract_key = PENDING_CONFIG.write().take();
+
+    // Update local state
+    if let Some(prefix) = state::CURRENT_SITE.read().clone() {
+        let mut sites = state::SITES.write();
+        if let Some(site) = sites.get_mut(&prefix) {
+            site.state.config = signed_config.clone();
+            site.name = signed_config.config.name.clone();
+        }
+    }
+
+    // Send UPDATE to network
+    if let Some(ck) = contract_key {
+        let delta = delta_core::SiteStateDelta {
+            config: Some(signed_config),
+            page_updates: BTreeMap::new(),
+            page_deletions: Vec::new(),
+        };
+        super::operations::update_site(&ck, &delta);
     }
 }
 
