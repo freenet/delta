@@ -377,7 +377,11 @@ fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
         super::operations::get_site(&contract_key);
     }
 
-    // Select the first site if none selected
+    // Replay any pending hash navigation (from deep link)
+    // This runs AFTER known sites are restored, so the site might already be known
+    crate::components::replay_pending_hash();
+
+    // Select the first site if none selected (and no pending hash handled it)
     #[cfg(target_arch = "wasm32")]
     if state::CURRENT_SITE.read().is_none() {
         if let Some(prefix) = state::SITES.read().keys().next().cloned() {

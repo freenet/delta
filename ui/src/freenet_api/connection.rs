@@ -79,10 +79,8 @@ pub fn connect_to_freenet() {
             move || {
                 web_sys::console::log_1(&"Delta: connected to Freenet".into());
                 *CONNECTION_STATUS.write() = ConnectionStatus::Connected;
-                // Now that we're connected, register the delegate
+                // Register delegate — hash replay happens after known sites load
                 super::delegate::register_delegate();
-                // Replay any hash navigation that arrived before connection
-                crate::components::replay_pending_hash();
             },
         );
 
