@@ -110,39 +110,96 @@ pub(crate) fn set_document_title(title: &str) {
     }
 }
 
-/// Set up a listener for hash changes so page links work.
+/// Set up listeners for hash changes (internal navigation) and
+/// __freenet_shell__ hash messages (deep-link from parent shell).
 fn setup_hash_listener() {
     #[cfg(target_arch = "wasm32")]
     {
         use wasm_bindgen::prelude::*;
         use wasm_bindgen::JsCast;
 
-        let closure = Closure::<dyn Fn()>::new(|| {
-            if let Some(window) = web_sys::window() {
-                let hash = window.location().hash().unwrap_or_default();
-                if let Some((prefix, page_id)) = state::parse_hash_route(&hash) {
-                    let sites = state::SITES.read();
-                    if sites.contains_key(&prefix) {
-                        let current = state::CURRENT_SITE.read().clone();
-                        drop(sites);
+        // Handle internal hashchange events
+        let hashchange = Closure::<dyn Fn()>::new(|| {
+            handle_hash_navigation();
+        });
+        if let Some(window) = web_sys::window() {
+            let _ = window.add_event_listener_with_callback(
+                "hashchange",
+                hashchange.as_ref().unchecked_ref(),
+            );
+        }
+        hashchange.forget();
 
-                        if current.as_deref() != Some(&prefix) {
-                            state::select_site(&prefix);
-                        }
-                        if let Some(pid) = page_id {
-                            if *state::CURRENT_PAGE.read() != Some(pid) {
-                                state::select_page(pid);
+        // Handle __freenet_shell__ hash messages from parent shell (deep-linking)
+        let message_handler =
+            Closure::<dyn Fn(web_sys::MessageEvent)>::new(|event: web_sys::MessageEvent| {
+                let data = event.data();
+                if let Some(obj) = data.dyn_ref::<js_sys::Object>() {
+                    // Check if it's a __freenet_shell__ message
+                    let is_shell = js_sys::Reflect::get(obj, &"__freenet_shell__".into())
+                        .ok()
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if !is_shell {
+                        return;
+                    }
+                    let msg_type = js_sys::Reflect::get(obj, &"type".into())
+                        .ok()
+                        .and_then(|v| v.as_string())
+                        .unwrap_or_default();
+                    if msg_type == "hash" {
+                        if let Some(hash) = js_sys::Reflect::get(obj, &"hash".into())
+                            .ok()
+                            .and_then(|v| v.as_string())
+                        {
+                            web_sys::console::log_1(
+                                &format!("Delta: received hash from shell: {hash}").into(),
+                            );
+                            // Navigate to the hash route
+                            if let Some((prefix, page_id)) = state::parse_hash_route(&hash) {
+                                if let Some(pid) = page_id {
+                                    *state::PENDING_PAGE_ID.write() = Some(pid);
+                                }
+                                // If site is known, select it; otherwise visit it
+                                if state::SITES.read().contains_key(&prefix) {
+                                    state::select_site(&prefix);
+                                } else {
+                                    state::visit_site(prefix);
+                                }
                             }
                         }
                     }
                 }
-            }
-        });
-
+            });
         if let Some(window) = web_sys::window() {
-            let _ = window
-                .add_event_listener_with_callback("hashchange", closure.as_ref().unchecked_ref());
+            let _ = window.add_event_listener_with_callback(
+                "message",
+                message_handler.as_ref().unchecked_ref(),
+            );
         }
-        closure.forget();
+        message_handler.forget();
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn handle_hash_navigation() {
+    if let Some(window) = web_sys::window() {
+        let hash = window.location().hash().unwrap_or_default();
+        if let Some((prefix, page_id)) = state::parse_hash_route(&hash) {
+            let sites = state::SITES.read();
+            if sites.contains_key(&prefix) {
+                let current = state::CURRENT_SITE.read().clone();
+                drop(sites);
+
+                if current.as_deref() != Some(&prefix) {
+                    state::select_site(&prefix);
+                }
+                if let Some(pid) = page_id {
+                    if *state::CURRENT_PAGE.read() != Some(pid) {
+                        state::select_page(pid);
+                    }
+                }
+            }
+        }
     }
 }

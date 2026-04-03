@@ -26,6 +26,7 @@ web-sys = { version = "0.3.64", features = [
     "History",
     "HtmlDocument",
     "HtmlElement",
+    "MessageEvent",
     "HtmlTextAreaElement",
     "Navigator",
     "Window",
