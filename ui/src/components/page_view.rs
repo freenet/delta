@@ -142,19 +142,41 @@ fn resolve_page_links(content: &str) -> String {
 }
 
 /// Copy the full URL for a specific page to clipboard.
+/// Uses execCommand('copy') fallback since the Clipboard API is blocked
+/// in sandboxed iframes without clipboard-write permission.
 fn copy_page_url(prefix: &str, page_id: PageId, title: &str) {
     #[cfg(target_arch = "wasm32")]
     {
+        use wasm_bindgen::JsCast;
         if let Some(window) = web_sys::window() {
             let location = window.location();
             let origin = location.origin().unwrap_or_default();
             let pathname = location.pathname().unwrap_or_default();
             let hash = state::build_hash_route(prefix, Some(page_id), Some(title));
             let url = format!("{origin}{pathname}{hash}");
-            let clipboard = window.navigator().clipboard();
-            let _ = clipboard.write_text(&url);
 
-            // Also update the hash via postMessage for #3747
+            // Use textarea + execCommand fallback (works in sandboxed iframes)
+            if let Some(doc) = window.document() {
+                if let Ok(el) = doc.create_element("textarea") {
+                    if let Some(textarea) = el.dyn_ref::<web_sys::HtmlTextAreaElement>() {
+                        textarea.set_value(&url);
+                        if let Some(style) = textarea.dyn_ref::<web_sys::HtmlElement>().map(|e| e.style()) {
+                            let _ = style.set_property("position", "fixed");
+                            let _ = style.set_property("opacity", "0");
+                        }
+                        if let Some(body) = doc.body() {
+                            let _ = body.append_child(textarea);
+                            textarea.select();
+                            if let Some(html_doc) = doc.dyn_ref::<web_sys::HtmlDocument>() {
+                                let _ = html_doc.exec_command("copy");
+                            }
+                            let _ = body.remove_child(textarea);
+                        }
+                    }
+                }
+            }
+
+            // Send hash to parent shell for URL bar update (#3747)
             let msg = js_sys::Object::new();
             let _ = js_sys::Reflect::set(
                 &msg,
