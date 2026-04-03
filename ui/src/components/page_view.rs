@@ -160,7 +160,10 @@ fn copy_page_url(prefix: &str, page_id: PageId, title: &str) {
                 if let Ok(el) = doc.create_element("textarea") {
                     if let Some(textarea) = el.dyn_ref::<web_sys::HtmlTextAreaElement>() {
                         textarea.set_value(&url);
-                        if let Some(style) = textarea.dyn_ref::<web_sys::HtmlElement>().map(|e| e.style()) {
+                        if let Some(style) = textarea
+                            .dyn_ref::<web_sys::HtmlElement>()
+                            .map(|e| e.style())
+                        {
                             let _ = style.set_property("position", "fixed");
                             let _ = style.set_property("opacity", "0");
                         }
