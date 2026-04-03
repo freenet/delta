@@ -329,9 +329,8 @@ fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
             sites.insert(prefix.clone(), site);
         });
 
-        // GET + SUBSCRIBE to reload the site content
+        // GET the site — SUBSCRIBE happens after GET succeeds
         super::operations::get_site(&contract_key);
-        super::operations::subscribe_to_site(&contract_key);
     }
 
     // Select the first site if none selected

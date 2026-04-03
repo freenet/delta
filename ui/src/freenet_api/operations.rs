@@ -34,6 +34,9 @@ fn handle_contract_response(response: ContractResponse) {
             if !state_bytes.is_empty() {
                 handle_site_state(key, &state_bytes);
             }
+            // Subscribe AFTER successful GET (not before)
+            log(&format!("Delta: subscribing to {key}"));
+            subscribe_to_site(&key);
         }
         ContractResponse::UpdateNotification { key, update } => {
             log(&format!("Delta: update notification for {key}"));
@@ -49,6 +52,9 @@ fn handle_contract_response(response: ContractResponse) {
         }
         ContractResponse::PutResponse { key } => {
             log(&format!("Delta: PUT succeeded for {key}"));
+            // Subscribe to our own site after successful PUT
+            log(&format!("Delta: subscribing to {key}"));
+            subscribe_to_site(&key);
         }
         ContractResponse::UpdateResponse { key, .. } => {
             log(&format!("Delta: UPDATE succeeded for {key}"));

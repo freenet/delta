@@ -259,9 +259,8 @@ pub fn visit_site(input: String) {
     });
     crate::freenet_api::delegate::save_known_sites();
 
-    // GET + SUBSCRIBE using the computed contract key
+    // GET the site — SUBSCRIBE happens after GET succeeds
     crate::freenet_api::get_site(&contract_key);
-    crate::freenet_api::subscribe_to_site(&contract_key);
 
     *SHOW_ADD_SITE.write() = false;
 
