@@ -30,6 +30,7 @@ pub fn PageView() -> Element {
         .unwrap_or_default();
     let page_title_for_share = page.title.clone();
     let mut link_copied = use_signal(|| false);
+    let mut confirming_delete = use_signal(|| false);
 
     rsx! {
         div { class: "max-w-2xl mx-auto px-10 py-12",
@@ -53,10 +54,26 @@ pub fn PageView() -> Element {
                             onclick: move |_| state::start_editing(),
                             "Edit"
                         }
-                        button {
-                            class: "btn-ghost px-4 py-2 text-sm",
-                            onclick: move |_| state::delete_page(page_id),
-                            "Delete"
+                        if *confirming_delete.read() {
+                            button {
+                                class: "px-4 py-2 text-sm bg-red-500/20 text-red-400 hover:bg-red-500/30 rounded-lg transition-colors font-medium",
+                                onclick: move |_| {
+                                    confirming_delete.set(false);
+                                    state::delete_page(page_id);
+                                },
+                                "Confirm Delete"
+                            }
+                            button {
+                                class: "btn-ghost px-3 py-2 text-sm",
+                                onclick: move |_| confirming_delete.set(false),
+                                "Cancel"
+                            }
+                        } else {
+                            button {
+                                class: "btn-ghost px-4 py-2 text-sm",
+                                onclick: move |_| confirming_delete.set(true),
+                                "Delete"
+                            }
                         }
                     }
                 }
