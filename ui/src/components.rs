@@ -22,6 +22,7 @@ pub fn App() -> Element {
             )
             .into(),
         );
+        set_document_title("Delta");
         setup_hash_listener();
         freenet_api::connect_to_freenet();
         state::init_from_hash();
@@ -72,6 +73,40 @@ pub fn App() -> Element {
                 }
             }
         }
+    }
+}
+
+/// Set the document title, notifying the gateway shell via postMessage.
+fn set_document_title(title: &str) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::JsValue;
+        if let Some(window) = web_sys::window() {
+            // Set title on our own document
+            if let Some(doc) = window.document() {
+                doc.set_title(title);
+            }
+            // Notify the gateway shell (we're inside an iframe)
+            let msg = js_sys::Object::new();
+            let _ = js_sys::Reflect::set(
+                &msg,
+                &JsValue::from_str("__freenet_shell__"),
+                &JsValue::TRUE,
+            );
+            let _ = js_sys::Reflect::set(
+                &msg,
+                &JsValue::from_str("type"),
+                &JsValue::from_str("title"),
+            );
+            let _ =
+                js_sys::Reflect::set(&msg, &JsValue::from_str("title"), &JsValue::from_str(title));
+            let target = window.parent().ok().flatten().unwrap_or(window);
+            let _ = target.post_message(&msg, "*");
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = title;
     }
 }
 
