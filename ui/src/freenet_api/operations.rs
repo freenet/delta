@@ -108,6 +108,18 @@ fn handle_site_state(key: ContractKey, state_bytes: &[u8]) {
             },
         );
     }
+    drop(sites);
+
+    // If this is the currently selected site, re-select to pick up
+    // pending page from hash route and update title
+    if state::CURRENT_SITE.read().as_deref() == Some(&prefix) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            wasm_bindgen_futures::spawn_local(async move {
+                state::select_site(&prefix);
+            });
+        }
+    }
 }
 
 /// Process a delta update for a site.

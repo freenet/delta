@@ -43,15 +43,20 @@ pub static EDITOR_CONTENT: GlobalSignal<String> = GlobalSignal::new(String::new)
 // ---------------------------------------------------------------------------
 
 /// Initialize from URL hash if present (e.g. user arrived via a shared link).
+/// Pending page to select after site loads from network.
+pub static PENDING_PAGE_ID: GlobalSignal<Option<PageId>> = GlobalSignal::new(|| None);
+
 pub fn init_from_hash() {
     #[cfg(target_arch = "wasm32")]
     {
         if let Some(window) = web_sys::window() {
             let hash = window.location().hash().unwrap_or_default();
             if let Some((prefix, page_id)) = parse_hash_route(&hash) {
-                // User arrived via a shared link — visit that site
+                // Store page_id to select once the site content loads
+                if let Some(pid) = page_id {
+                    *PENDING_PAGE_ID.write() = Some(pid);
+                }
                 visit_site(prefix);
-                return;
             }
         }
     }
@@ -92,13 +97,26 @@ pub fn select_site(prefix: &str) {
 
     let sites = SITES.read();
     if let Some(site) = sites.get(prefix) {
-        let first_page = site.state.pages.keys().next().copied();
-        *CURRENT_PAGE.write() = first_page;
-        if let Some(page_id) = first_page {
-            let title = site.state.pages.get(&page_id).map(|p| p.title.as_str());
-            update_hash(&build_hash_route(prefix, Some(page_id), title));
+        // Check if there's a pending page from hash route
+        let pending = PENDING_PAGE_ID.write().take();
+        let target_page = if let Some(pid) = pending {
+            if site.state.pages.contains_key(&pid) {
+                Some(pid)
+            } else {
+                site.state.pages.keys().next().copied()
+            }
+        } else {
+            site.state.pages.keys().next().copied()
+        };
+
+        *CURRENT_PAGE.write() = target_page;
+        if let Some(page_id) = target_page {
+            let page_title = site.state.pages.get(&page_id).map(|p| p.title.as_str());
+            update_hash(&build_hash_route(prefix, Some(page_id), page_title));
+            update_document_title(Some(&site.name), page_title);
         } else {
             update_hash(&build_hash_route(prefix, None, None));
+            update_document_title(Some(&site.name), None);
         }
     }
 }
@@ -276,11 +294,13 @@ pub fn select_page(page_id: PageId) {
 
     if let Some(prefix) = &*CURRENT_SITE.read() {
         let sites = SITES.read();
-        let title = sites
-            .get(prefix)
+        let site = sites.get(prefix);
+        let page_title = site
             .and_then(|s| s.state.pages.get(&page_id))
             .map(|p| p.title.as_str());
-        update_hash(&build_hash_route(prefix, Some(page_id), title));
+        let site_name = site.map(|s| s.name.as_str());
+        update_hash(&build_hash_route(prefix, Some(page_id), page_title));
+        update_document_title(site_name, page_title);
     }
 }
 
@@ -460,6 +480,16 @@ fn slugify(title: &str) -> String {
 
 fn now_secs() -> u64 {
     chrono::Utc::now().timestamp() as u64
+}
+
+/// Update the browser tab title: "Page — Site — Delta"
+fn update_document_title(site_name: Option<&str>, page_title: Option<&str>) {
+    let title = match (page_title, site_name) {
+        (Some(page), Some(site)) => format!("{page} — {site} — Delta"),
+        (None, Some(site)) => format!("{site} — Delta"),
+        _ => "Delta".to_string(),
+    };
+    crate::components::set_document_title(&title);
 }
 
 fn update_hash(hash: &str) {

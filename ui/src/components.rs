@@ -77,7 +77,7 @@ pub fn App() -> Element {
 }
 
 /// Set the document title, notifying the gateway shell via postMessage.
-fn set_document_title(title: &str) {
+pub(crate) fn set_document_title(title: &str) {
     #[cfg(target_arch = "wasm32")]
     {
         use wasm_bindgen::JsValue;
