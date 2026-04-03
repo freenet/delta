@@ -53,17 +53,46 @@ pub static PENDING_HASH: GlobalSignal<Option<String>> = GlobalSignal::new(|| Non
 pub fn init_from_hash() {
     #[cfg(target_arch = "wasm32")]
     {
-        if let Some(window) = web_sys::window() {
-            let hash = window.location().hash().unwrap_or_default();
-            if let Some((prefix, page_id)) = parse_hash_route(&hash) {
-                // Store page_id to select once the site content loads
-                if let Some(pid) = page_id {
-                    *PENDING_PAGE_ID.write() = Some(pid);
+        // Try immediately (in case iframe src includes hash)
+        if try_hash_from_location() {
+            return;
+        }
+        // Also retry after a delay - the shell postMessage might arrive late
+        wasm_bindgen_futures::spawn_local(async {
+            for _ in 0..5 {
+                gloo_timers::future::sleep(std::time::Duration::from_millis(500)).await;
+                if try_hash_from_location() {
+                    return;
                 }
-                visit_site(prefix);
+                // Check if pending hash was set by message handler
+                if PENDING_HASH.read().is_some() || CURRENT_SITE.read().is_some() {
+                    return;
+                }
             }
+        });
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn try_hash_from_location() -> bool {
+    if let Some(window) = web_sys::window() {
+        let hash = window.location().hash().unwrap_or_default();
+        if let Some((prefix, page_id)) = parse_hash_route(&hash) {
+            // Don't re-navigate if we're already on this site
+            if CURRENT_SITE.read().as_deref() == Some(&prefix) {
+                return true;
+            }
+            web_sys::console::log_1(
+                &format!("Delta: navigating from location hash: {hash}").into(),
+            );
+            if let Some(pid) = page_id {
+                *PENDING_PAGE_ID.write() = Some(pid);
+            }
+            visit_site(prefix);
+            return true;
         }
     }
+    false
 }
 
 // ---------------------------------------------------------------------------
