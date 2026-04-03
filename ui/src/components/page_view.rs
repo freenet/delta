@@ -49,6 +49,15 @@ pub fn PageView() -> Element {
                         onclick: move |_| {
                             copy_page_url(&site_prefix, page_id, &page_title_for_share);
                             link_copied.set(true);
+                            // Reset after 2 seconds
+                            #[cfg(target_arch = "wasm32")]
+                            {
+                                let mut signal = link_copied;
+                                wasm_bindgen_futures::spawn_local(async move {
+                                    gloo_timers::future::sleep(std::time::Duration::from_secs(2)).await;
+                                    signal.set(false);
+                                });
+                            }
                         },
                         if *link_copied.read() { "Copied!" } else { "Share" }
                     }
