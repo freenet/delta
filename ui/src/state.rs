@@ -465,8 +465,14 @@ fn now_secs() -> u64 {
 fn update_hash(hash: &str) {
     #[cfg(target_arch = "wasm32")]
     {
+        // Use history.replaceState to update the hash without triggering
+        // navigation — set_hash causes "Unsafe attempt to load URL" errors
+        // inside the gateway's sandboxed iframe.
         if let Some(window) = web_sys::window() {
-            let _ = window.location().set_hash(hash);
+            let _ = window.history().ok().and_then(|h| {
+                h.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(hash))
+                    .ok()
+            });
         }
     }
     #[cfg(not(target_arch = "wasm32"))]
