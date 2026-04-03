@@ -52,8 +52,10 @@ pub fn Editor() -> Element {
 
             // Editor + Preview split
             div { class: "flex flex-1 overflow-hidden",
-                // Editor pane — 60% width, preview gets the rest
-                div { class: "w-3/5 flex flex-col border-r border-border-light",
+                // Editor pane — 60% width
+                div {
+                    class: "flex flex-col border-r border-border-light",
+                    style: "width: 60%; min-width: 400px;",
                     div { class: "px-4 py-2 text-[10px] font-semibold text-text-muted-light border-b border-border-light uppercase tracking-[0.1em] bg-panel-warm",
                         "Markdown"
                     }
@@ -67,8 +69,10 @@ pub fn Editor() -> Element {
                     }
                 }
 
-                // Preview pane — takes remaining 40%
-                div { class: "flex-1 flex flex-col bg-panel min-w-0",
+                // Preview pane — remaining 40%
+                div {
+                    class: "flex flex-col bg-panel min-w-0 overflow-hidden",
+                    style: "flex: 1;",
                     div { class: "px-4 py-2 text-[10px] font-semibold text-text-muted-light border-b border-border-light uppercase tracking-[0.1em] bg-panel-warm",
                         "Preview"
                     }
