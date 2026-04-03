@@ -37,12 +37,12 @@ pub fn Editor() -> Element {
                     },
                 }
                 button {
-                    class: "btn-primary px-5 py-2 text-sm",
+                    class: "px-4 py-1.5 text-sm text-accent border border-accent hover:bg-accent hover:text-text-inverse rounded-lg transition-colors font-medium",
                     onclick: move |_| state::save_current_page(),
                     "Save"
                 }
                 button {
-                    class: "btn-ghost px-4 py-2 text-sm",
+                    class: "px-4 py-1.5 text-sm text-text-muted hover:text-text transition-colors rounded",
                     onclick: move |_| {
                         *state::EDITING.write() = false;
                     },

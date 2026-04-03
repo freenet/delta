@@ -37,10 +37,10 @@ pub fn PageView() -> Element {
             // Page header
             div { class: "flex items-start justify-between mb-2",
                 div { class: "flex-1 min-w-0" }
-                div { class: "flex gap-2 ml-4 flex-shrink-0",
-                    // Share button — always visible
+                div { class: "flex items-center gap-1 ml-4 flex-shrink-0",
+                    // All actions as uniform quiet text buttons — content is the star
                     button {
-                        class: "px-3 py-2 text-sm text-text-muted hover:text-accent hover:bg-accent-glow rounded-lg transition-colors",
+                        class: "px-3 py-1.5 text-xs text-text-muted hover:text-accent transition-colors rounded",
                         title: "Copy link to this page",
                         onclick: move |_| {
                             copy_page_url(&site_prefix, page_id, &page_title_for_share);
@@ -50,27 +50,27 @@ pub fn PageView() -> Element {
                     }
                     if is_owner {
                         button {
-                            class: "btn-primary px-4 py-2 text-sm",
+                            class: "px-3 py-1.5 text-xs text-text-muted hover:text-accent transition-colors rounded",
                             onclick: move |_| state::start_editing(),
                             "Edit"
                         }
                         if *confirming_delete.read() {
                             button {
-                                class: "px-4 py-2 text-sm bg-red-500/20 text-red-400 hover:bg-red-500/30 rounded-lg transition-colors font-medium",
+                                class: "px-3 py-1.5 text-xs text-red-400 hover:text-red-300 transition-colors rounded",
                                 onclick: move |_| {
                                     confirming_delete.set(false);
                                     state::delete_page(page_id);
                                 },
-                                "Confirm Delete"
+                                "Yes, delete"
                             }
                             button {
-                                class: "btn-ghost px-3 py-2 text-sm",
+                                class: "px-3 py-1.5 text-xs text-text-muted hover:text-text transition-colors rounded",
                                 onclick: move |_| confirming_delete.set(false),
                                 "Cancel"
                             }
                         } else {
                             button {
-                                class: "btn-ghost px-4 py-2 text-sm",
+                                class: "px-3 py-1.5 text-xs text-text-muted hover:text-red-400 transition-colors rounded",
                                 onclick: move |_| confirming_delete.set(true),
                                 "Delete"
                             }
