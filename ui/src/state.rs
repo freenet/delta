@@ -46,6 +46,10 @@ pub static EDITOR_CONTENT: GlobalSignal<String> = GlobalSignal::new(String::new)
 /// Pending page to select after site loads from network.
 pub static PENDING_PAGE_ID: GlobalSignal<Option<PageId>> = GlobalSignal::new(|| None);
 
+/// Pending hash route to process after WebSocket connects.
+#[allow(dead_code)]
+pub static PENDING_HASH: GlobalSignal<Option<String>> = GlobalSignal::new(|| None);
+
 pub fn init_from_hash() {
     #[cfg(target_arch = "wasm32")]
     {

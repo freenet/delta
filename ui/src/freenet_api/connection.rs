@@ -81,6 +81,8 @@ pub fn connect_to_freenet() {
                 *CONNECTION_STATUS.write() = ConnectionStatus::Connected;
                 // Now that we're connected, register the delegate
                 super::delegate::register_delegate();
+                // Replay any hash navigation that arrived before connection
+                crate::components::replay_pending_hash();
             },
         );
 

@@ -155,17 +155,19 @@ fn setup_hash_listener() {
                             web_sys::console::log_1(
                                 &format!("Delta: received hash from shell: {hash}").into(),
                             );
-                            // Navigate to the hash route
-                            if let Some((prefix, page_id)) = state::parse_hash_route(&hash) {
-                                if let Some(pid) = page_id {
-                                    *state::PENDING_PAGE_ID.write() = Some(pid);
-                                }
-                                // If site is known, select it; otherwise visit it
-                                if state::SITES.read().contains_key(&prefix) {
-                                    state::select_site(&prefix);
-                                } else {
-                                    state::visit_site(prefix);
-                                }
+                            // Check if WebSocket is connected
+                            let connected = matches!(
+                                &*freenet_api::CONNECTION_STATUS.read(),
+                                freenet_api::ConnectionStatus::Connected
+                            );
+                            if connected {
+                                navigate_from_hash(&hash);
+                            } else {
+                                // Queue for when connection is ready
+                                web_sys::console::log_1(
+                                    &"Delta: queuing hash for after connection".into(),
+                                );
+                                *state::PENDING_HASH.write() = Some(hash);
                             }
                         }
                     }
@@ -178,6 +180,31 @@ fn setup_hash_listener() {
             );
         }
         message_handler.forget();
+    }
+}
+
+/// Navigate to a hash route - called when connected.
+#[allow(dead_code)]
+fn navigate_from_hash(hash: &str) {
+    if let Some((prefix, page_id)) = state::parse_hash_route(hash) {
+        if let Some(pid) = page_id {
+            *state::PENDING_PAGE_ID.write() = Some(pid);
+        }
+        if state::SITES.read().contains_key(&prefix) {
+            state::select_site(&prefix);
+        } else {
+            state::visit_site(prefix);
+        }
+    }
+}
+
+/// Replay any pending hash navigation after connection is established.
+#[allow(dead_code)]
+pub fn replay_pending_hash() {
+    if let Some(hash) = state::PENDING_HASH.write().take() {
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(&format!("Delta: replaying queued hash: {hash}").into());
+        navigate_from_hash(&hash);
     }
 }
 
