@@ -63,18 +63,18 @@ pub fn PagesSidebar() -> Element {
                     {
                         let is_selected = current_page == Some(id);
                         let item_class = if is_selected {
-                            "page-item page-item-selected"
+                            "bg-accent-soft border-l-2 border-accent rounded-r-lg"
                         } else {
-                            "page-item hover:bg-surface-hover"
+                            "hover:bg-surface-hover rounded-lg"
                         };
                         let text_class = if is_selected {
-                            "text-text font-medium"
+                            "text-accent font-medium"
                         } else {
                             "text-text-light"
                         };
                         rsx! {
                             button {
-                                class: "w-full text-left px-3 py-2 rounded-lg text-sm mb-0.5 transition-all-fast {item_class}",
+                                class: "w-full text-left px-3 py-2 text-sm mb-0.5 transition-all-fast {item_class}",
                                 onclick: move |_| state::select_page(id),
                                 span { class: "{text_class}", "{page.title}" }
                             }
