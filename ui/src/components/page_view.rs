@@ -37,7 +37,7 @@ pub fn PageView() -> Element {
     let mut confirming_delete = use_signal(|| false);
 
     rsx! {
-        div { class: "max-w-2xl mx-auto px-10 py-12",
+        div { class: "max-w-4xl mx-auto px-10 py-12",
             // Page header
             div { class: "flex items-start justify-between mb-2",
                 div { class: "flex-1 min-w-0" }
