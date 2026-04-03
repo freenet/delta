@@ -13,9 +13,17 @@ use crate::state;
 pub fn App() -> Element {
     // Initialize once — use_hook runs only on first mount, not on re-renders
     use_hook(|| {
+        #[cfg(target_arch = "wasm32")]
+        web_sys::console::log_1(
+            &format!(
+                "Delta: built {} ({})",
+                env!("BUILD_TIMESTAMP_ISO"),
+                env!("GIT_COMMIT")
+            )
+            .into(),
+        );
         setup_hash_listener();
         freenet_api::connect_to_freenet();
-        // If URL has a hash route, navigate to that site
         state::init_from_hash();
     });
 
