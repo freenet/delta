@@ -87,7 +87,6 @@ pub fn SitesSidebar() -> Element {
 
 fn site_row(prefix: &str, site: &state::KnownSite, current_prefix: &Option<String>) -> Element {
     let is_selected = current_prefix.as_deref() == Some(prefix);
-    let is_owner = site.role == SiteRole::Owner;
     let prefix_owned = prefix.to_string();
     let prefix_for_remove = prefix.to_string();
     let mut confirming_remove = use_signal(|| false);
@@ -98,27 +97,16 @@ fn site_row(prefix: &str, site: &state::KnownSite, current_prefix: &Option<Strin
         "hover:bg-surface-hover"
     };
 
-    let avatar_class = if is_owner {
-        "site-avatar site-avatar-owner"
-    } else {
-        "site-avatar site-avatar-visitor"
-    };
-
-    let initial = site.name.chars().next().unwrap_or('?');
-
     rsx! {
         div { class: "group relative flex items-center {row_class} transition-all-fast",
             button {
-                class: "w-full flex items-center gap-2.5 px-3 py-2 text-left",
+                class: "w-full px-3 py-2 text-left",
                 onclick: move |_| {
                     confirming_remove.set(false);
                     state::select_site(&prefix_owned);
                 },
-                span { class: "{avatar_class}", "{initial}" }
-                div { class: "min-w-0 flex-1",
-                    div { class: "text-sm text-text-light truncate font-medium", "{site.name}" }
-                    div { class: "text-[10px] text-text-muted font-mono truncate", "{site.prefix}" }
-                }
+                div { class: "text-sm text-text-light truncate font-medium", "{site.name}" }
+                div { class: "text-[10px] text-text-muted font-mono truncate", "{site.prefix}" }
             }
             // Remove: two-click confirm
             if *confirming_remove.read() {
