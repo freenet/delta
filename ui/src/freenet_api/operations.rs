@@ -199,7 +199,7 @@ pub fn get_site_by_id(id: &ContractInstanceId) {
         Box::pin(async move {
             let request = ClientRequest::ContractOp(ContractRequest::Get {
                 key,
-                return_contract_code: false,
+                return_contract_code: true,
                 subscribe: false,
                 blocking_subscribe: false,
             });
