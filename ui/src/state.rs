@@ -98,11 +98,18 @@ pub fn select_site(prefix: &str) {
     let sites = SITES.read();
     if let Some(site) = sites.get(prefix) {
         // Check if there's a pending page from hash route
-        let pending = PENDING_PAGE_ID.write().take();
+        let pending = *PENDING_PAGE_ID.read();
         let target_page = if let Some(pid) = pending {
             if site.state.pages.contains_key(&pid) {
+                // Found the pending page — consume it
+                *PENDING_PAGE_ID.write() = None;
                 Some(pid)
+            } else if site.state.pages.is_empty() {
+                // Site not loaded yet (placeholder) — keep pending for later
+                None
             } else {
+                // Site loaded but page doesn't exist — consume and fall back
+                *PENDING_PAGE_ID.write() = None;
                 site.state.pages.keys().next().copied()
             }
         } else {
