@@ -132,6 +132,18 @@ pub fn show_add_site_prompt() {
     *SHOW_ADD_SITE.write() = true;
 }
 
+/// Rename a site. Updates local state and saves to delegate.
+pub fn rename_site(prefix: &str, new_name: String) {
+    SITES.with_mut(|sites| {
+        if let Some(site) = sites.get_mut(prefix) {
+            site.name = new_name.clone();
+            site.state.config.config.name = new_name;
+            // TODO: sign the new config via delegate and UPDATE the contract
+        }
+    });
+    crate::freenet_api::delegate::save_known_sites();
+}
+
 /// Remove a site from the sidebar.
 pub fn remove_site(prefix: &str) {
     SITES.with_mut(|sites| {

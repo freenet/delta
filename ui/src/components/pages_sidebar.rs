@@ -23,14 +23,53 @@ pub fn PagesSidebar() -> Element {
 
     rsx! {
         aside { class: "w-52 flex flex-col h-full bg-bg-warm border-r border-border",
-            // Site name header with share button
-            div { class: "px-4 py-4 border-b border-border",
-                h2 { class: "text-sm font-semibold text-text-light truncate",
-                    "{site.name}"
-                }
-                if !site.state.config.config.description.is_empty() {
-                    p { class: "text-[11px] text-text-muted mt-0.5 truncate",
-                        "{site.state.config.config.description}"
+            // Site name header - click to edit (owner only)
+            {
+                let mut editing_name = use_signal(|| false);
+                let mut name_input = use_signal(|| site.name.clone());
+                let site_name = site.name.clone();
+                let prefix_for_rename = site.prefix.clone();
+                rsx! {
+                    div { class: "px-4 py-4 border-b border-border",
+                        if *editing_name.read() && is_owner {
+                            input {
+                                class: "text-sm font-semibold bg-transparent border-b border-accent text-text-light outline-none w-full",
+                                r#type: "text",
+                                value: "{name_input}",
+                                autofocus: true,
+                                oninput: move |evt| name_input.set(evt.value().to_string()),
+                                onkeypress: move |evt| {
+                                    if evt.key() == Key::Enter {
+                                        let new_name = name_input.read().clone();
+                                        if !new_name.trim().is_empty() {
+                                            state::rename_site(&prefix_for_rename, new_name);
+                                        }
+                                        editing_name.set(false);
+                                    } else if evt.key() == Key::Escape {
+                                        editing_name.set(false);
+                                    }
+                                },
+                            }
+                        } else {
+                            h2 {
+                                class: if is_owner { "text-sm font-semibold text-text-light truncate cursor-pointer hover:text-accent transition-colors" } else { "text-sm font-semibold text-text-light truncate" },
+                                onclick: move |_| {
+                                    if is_owner {
+                                        name_input.set(site_name.clone());
+                                        editing_name.set(true);
+                                    }
+                                },
+                                "{site.name}"
+                                if is_owner {
+                                    span { class: "text-text-muted text-[10px] ml-1 opacity-0 group-hover:opacity-100", "(edit)" }
+                                }
+                            }
+                        }
+                        if !site.state.config.config.description.is_empty() {
+                            p { class: "text-[11px] text-text-muted mt-0.5 truncate",
+                                "{site.state.config.config.description}"
+                            }
+                        }
                     }
                 }
             }
