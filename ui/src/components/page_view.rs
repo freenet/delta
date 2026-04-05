@@ -153,11 +153,21 @@ fn resolve_page_links(content: &str) -> String {
                     })
                 }
             } else {
-                // [[Page Title]] - look up by title, use title as display
-                find_page_by_title(pages, link_content.trim()).map(|(id, title)| {
-                    let hash = state::build_hash_route(&prefix, Some(id), Some(&title));
-                    format!("[{title}]({hash})")
-                })
+                // [[id]] or [[Page Title]] - no custom display text
+                let trimmed = link_content.trim();
+                if let Ok(id) = trimmed.parse::<PageId>() {
+                    // [[id]] - render as current page title (auto-updates on rename)
+                    pages.and_then(|p| p.get(&id)).map(|p| {
+                        let hash = state::build_hash_route(&prefix, Some(id), Some(&p.title));
+                        format!("[{}]({hash})", p.title)
+                    })
+                } else {
+                    // [[Page Title]] - look up by title
+                    find_page_by_title(pages, trimmed).map(|(id, title)| {
+                        let hash = state::build_hash_route(&prefix, Some(id), Some(&title));
+                        format!("[{title}]({hash})")
+                    })
+                }
             };
 
             result.push_str(&resolved.unwrap_or_else(|| format!("[[{link_content}]]")));

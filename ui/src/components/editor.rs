@@ -49,14 +49,15 @@ pub fn Editor() -> Element {
     let match_count = matches.len();
 
     // Insert a page link at the current cursor position
-    let mut insert_link = move |id: PageId, title: &str| {
+    let mut insert_link = move |id: PageId, _title: &str| {
         let content = state::EDITOR_CONTENT.read().clone();
         let pos = (*cursor_pos.read()).min(content.len());
         let before = &content[..pos];
         if let Some(open) = before.rfind("[[") {
             let after_cursor = &content[pos..];
             let mut new_content = content[..open].to_string();
-            new_content.push_str(&format!("[[{id}|{title}]]"));
+            // Insert [[id]] - renders as current page title, auto-updates on rename
+            new_content.push_str(&format!("[[{id}]]"));
             new_content.push_str(after_cursor);
             *state::EDITOR_CONTENT.write() = new_content;
         }
@@ -103,7 +104,7 @@ pub fn Editor() -> Element {
                             "Markdown"
                         }
                         span { class: "text-[9px] text-text-muted font-mono",
-                            "**bold**  *italic*  `code`  [[Page Title]]"
+                            "**bold**  *italic*  `code`  [[ page link  [[id|text]]  [label](url)"
                         }
                     }
                     div { class: "relative flex-1",
