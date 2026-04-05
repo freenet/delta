@@ -68,20 +68,7 @@ pub fn Editor() -> Element {
         ac_selected.set(0);
     };
 
-    // Dropdown position style
-    let dropdown_style = if *ac_open_upward.read() {
-        format!(
-            "position: absolute; left: {}px; bottom: calc(100% - {}px); max-height: 180px;",
-            *ac_left.read(),
-            *ac_top.read()
-        )
-    } else {
-        format!(
-            "position: absolute; left: {}px; top: {}px; max-height: 180px;",
-            *ac_left.read(),
-            *ac_top.read()
-        )
-    };
+    let _ = (ac_top, ac_left, ac_open_upward); // no longer used for positioning
 
     rsx! {
         div { class: "flex flex-col h-full bg-panel",
@@ -189,8 +176,10 @@ pub fn Editor() -> Element {
                         // Autocomplete dropdown positioned near cursor
                         if *ac_visible.read() && !matches.is_empty() {
                             div {
-                                class: "bg-panel border border-border-light rounded-lg shadow-lg z-10 overflow-y-auto",
-                                style: "{dropdown_style}",
+                                class: "absolute inset-0 flex items-center justify-center z-10 pointer-events-none",
+                                div {
+                                class: "bg-panel border border-border-light rounded-lg shadow-lg overflow-y-auto pointer-events-auto",
+                                style: "max-height: 200px; min-width: 200px; max-width: 300px;",
                                 div { class: "px-3 py-1 text-[9px] text-text-muted-light border-b border-border-light",
                                     "\u{2191}\u{2193} Enter/Tab to select, Esc cancel"
                                 }
@@ -218,6 +207,7 @@ pub fn Editor() -> Element {
                                     }
                                 }
                             }
+                            }
                         }
                     }
                 }
@@ -241,7 +231,7 @@ pub fn Editor() -> Element {
     }
 }
 
-/// Check if cursor is inside [[ and update autocomplete state + position.
+/// Check if cursor is inside [[ and update autocomplete state.
 #[allow(clippy::ptr_arg, clippy::too_many_arguments, unused_variables)]
 fn update_autocomplete(
     text: &str,
@@ -249,9 +239,9 @@ fn update_autocomplete(
     ac_visible: &mut Signal<bool>,
     ac_selected: &mut Signal<usize>,
     cursor_pos: &mut Signal<usize>,
-    ac_top: &mut Signal<i32>,
-    ac_left: &mut Signal<i32>,
-    ac_open_upward: &mut Signal<bool>,
+    _ac_top: &mut Signal<i32>,
+    _ac_left: &mut Signal<i32>,
+    _ac_open_upward: &mut Signal<bool>,
 ) {
     #[cfg(target_arch = "wasm32")]
     {
@@ -271,70 +261,6 @@ fn update_autocomplete(
                     ac_query.set(Some(between.to_string()));
                     ac_visible.set(true);
                     ac_selected.set(0);
-
-                    // Calculate cursor position using mirror div technique
-                    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-                        // Create a hidden div that mirrors the textarea
-                        if let Ok(mirror) = doc.create_element("div") {
-                            let style = [
-                                "position: absolute",
-                                "visibility: hidden",
-                                "white-space: pre-wrap",
-                                "word-wrap: break-word",
-                                &format!("width: {}px", el.client_width()),
-                                &format!(
-                                    "font: {}",
-                                    el.style().get_property_value("font").unwrap_or_default()
-                                ),
-                                "font-family: var(--font-family-mono)",
-                                "font-size: 0.875rem",
-                                "line-height: 1.7",
-                                "padding: 20px",
-                                "tab-size: 4",
-                            ]
-                            .join("; ");
-                            let _ = mirror.set_attribute("style", &style);
-
-                            // Text up to cursor, with a marker span
-                            let text_before = &text[..pos.min(text.len())];
-                            mirror.set_inner_html(&format!(
-                                "{}<span id='_ac_cursor'>|</span>",
-                                text_before.replace('<', "&lt;").replace('>', "&gt;")
-                            ));
-
-                            if let Some(body) = doc.body() {
-                                let _ = body.append_child(&mirror);
-
-                                if let Some(cursor_span) = doc.get_element_by_id("_ac_cursor") {
-                                    let cursor_top =
-                                        cursor_span.get_bounding_client_rect().top() as i32;
-                                    let cursor_left =
-                                        cursor_span.get_bounding_client_rect().left() as i32;
-                                    let textarea_rect = el.get_bounding_client_rect();
-                                    let ta_top = textarea_rect.top() as i32;
-                                    let ta_left = textarea_rect.left() as i32;
-                                    let ta_height = textarea_rect.height() as i32;
-
-                                    // Position relative to textarea
-                                    let rel_top = cursor_top - ta_top + 24; // below cursor line
-                                    let rel_left = (cursor_left - ta_left).max(8).min(200);
-
-                                    // Flip upward if cursor is in bottom half
-                                    let flip = rel_top > ta_height / 2;
-                                    ac_open_upward.set(flip);
-
-                                    if flip {
-                                        ac_top.set(ta_height - (cursor_top - ta_top) + 4);
-                                    } else {
-                                        ac_top.set(rel_top);
-                                    }
-                                    ac_left.set(rel_left);
-                                }
-
-                                let _ = body.remove_child(&mirror);
-                            }
-                        }
-                    }
                     return;
                 }
             }
