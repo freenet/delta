@@ -136,16 +136,17 @@ fn resolve_page_links(content: &str) -> String {
             let link_content = &after_open[..end];
             let resolved = if let Some((first, display)) = link_content.split_once('|') {
                 // [[first|display]] - first could be ID or title
+                // The display text is always used as the rendered link text
                 if let Ok(id) = first.trim().parse::<PageId>() {
                     // [[id|Display Text]] - canonical format
-                    let title = pages
+                    let slug = pages
                         .and_then(|p| p.get(&id))
                         .map(|p| p.title.clone())
                         .unwrap_or_else(|| display.to_string());
-                    let hash = state::build_hash_route(&prefix, Some(id), Some(&title));
-                    Some(format!("[{title}]({hash})"))
+                    let hash = state::build_hash_route(&prefix, Some(id), Some(&slug));
+                    Some(format!("[{display}]({hash})"))
                 } else {
-                    // [[Title|Label]] - look up by title
+                    // [[Title|Label]] - look up by title, show label
                     find_page_by_title(pages, first.trim()).map(|(id, _)| {
                         let hash = state::build_hash_route(&prefix, Some(id), Some(first.trim()));
                         format!("[{display}]({hash})")

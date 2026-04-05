@@ -221,7 +221,7 @@ pub fn Editor() -> Element {
 }
 
 /// Check if cursor is inside [[ and update autocomplete state.
-#[allow(clippy::ptr_arg)]
+#[allow(clippy::ptr_arg, unused_variables)]
 fn update_autocomplete(
     text: &str,
     ac_query: &mut Signal<Option<String>>,
