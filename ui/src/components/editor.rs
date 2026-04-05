@@ -54,14 +54,41 @@ pub fn Editor() -> Element {
     } else {
         Vec::new()
     };
-    let match_count = matches.len();
 
-    // Insert a page link
-    let mut insert_link = move |id: PageId, _title: &str| {
+    // Add "Create new page" option if query is non-empty and doesn't exactly match
+    let ac_query_val = ac_query.read().clone().unwrap_or_default();
+    let show_create = !ac_query_val.is_empty()
+        && !matches
+            .iter()
+            .any(|(_, t)| t.to_lowercase() == ac_query_val.to_lowercase());
+    // Total items: matches + optional create
+    let match_count = matches.len() + if show_create { 1 } else { 0 };
+
+    // Insert a page link (or create a new page)
+    let mut insert_link = move |id: PageId, title: &str| {
         let content = state::EDITOR_CONTENT.read().clone();
         let pos = (*cursor_pos.read()).min(content.len());
         let before = &content[..pos];
-        if let Some(open) = before.rfind("[[") {
+
+        if id == u64::MAX {
+            // Create a new page with this title, then insert link
+            let new_title = title.to_string();
+            state::create_page(new_title);
+            // The new page ID is the one just created
+            if let Some(site) = state::current_site() {
+                let new_id = site.state.next_page_id - 1;
+                if let Some(open) = before.rfind("[[") {
+                    let after_cursor = &content[pos..];
+                    let mut new_content = content[..open].to_string();
+                    new_content.push_str(&format!("[[{new_id}]]"));
+                    new_content.push_str(after_cursor);
+                    *state::EDITOR_CONTENT.write() = new_content;
+                }
+            }
+            // Switch back to the page we were editing
+            // (create_page switches to the new page and opens editor)
+            *state::EDITING.write() = false;
+        } else if let Some(open) = before.rfind("[[") {
             let after_cursor = &content[pos..];
             let mut new_content = content[..open].to_string();
             new_content.push_str(&format!("[[{id}]]"));
@@ -164,8 +191,16 @@ pub fn Editor() -> Element {
                                         } else {
                                             Vec::new()
                                         };
-                                        if let Some((id, title)) = matches.get(sel) {
-                                            insert_link(*id, title);
+                                        if sel < matches.len() {
+                                            if let Some((id, title)) = matches.get(sel) {
+                                                insert_link(*id, title);
+                                            }
+                                        } else {
+                                            // "Create" option selected
+                                            let q = ac_query.read().clone().unwrap_or_default();
+                                            if !q.is_empty() {
+                                                insert_link(u64::MAX, &q);
+                                            }
                                         }
                                     }
                                     Key::Escape => {
@@ -179,7 +214,7 @@ pub fn Editor() -> Element {
                         }
 
                         // Autocomplete dropdown - centered in editor
-                        if *ac_visible.read() && !matches.is_empty() {
+                        if *ac_visible.read() && match_count > 0 {
                             div {
                                 class: "bg-panel border border-border-light rounded-lg shadow-lg overflow-y-auto z-50",
                                 style: "position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); max-height: 200px; min-width: 220px; max-width: 320px;",
@@ -205,6 +240,28 @@ pub fn Editor() -> Element {
                                                     insert_link(id, &page_title_insert);
                                                 },
                                                 "{page_title_display}"
+                                            }
+                                        }
+                                    }
+                                }
+                                // "Create new page" option
+                                if show_create {
+                                    {
+                                        let create_title = ac_query_val.clone();
+                                        let is_highlighted = matches.len() == *ac_selected.read();
+                                        let item_class = if is_highlighted {
+                                            "w-full text-left px-3 py-1.5 text-sm bg-accent-soft text-accent border-t border-border-light"
+                                        } else {
+                                            "w-full text-left px-3 py-1.5 text-sm text-text-muted hover:bg-accent-glow hover:text-accent transition-colors border-t border-border-light"
+                                        };
+                                        rsx! {
+                                            button {
+                                                class: "{item_class}",
+                                                onmousedown: move |evt| {
+                                                    evt.prevent_default();
+                                                    insert_link(u64::MAX, &create_title);
+                                                },
+                                                "+ Create \"{ac_query_val}\""
                                             }
                                         }
                                     }
