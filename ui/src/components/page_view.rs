@@ -114,9 +114,16 @@ fn render_markdown(content: &str) -> String {
     markdown::to_html(&resolved)
 }
 
-/// Replace `[[id|Display Text]]` with hash-routed links.
+/// Replace page links with hash-routed markdown links.
+///
+/// Supported syntax:
+///   [[id|Display Text]]  - link by page ID (canonical, stored format)
+///   [[Page Title]]       - link by page title (user-friendly)
+///   [[Page Title|Label]] - link by title with custom display text
 fn resolve_page_links(content: &str) -> String {
     let prefix = state::CURRENT_SITE.read().clone().unwrap_or_default();
+    let sites = state::SITES.read();
+    let pages = sites.get(&prefix).map(|s| &s.state.pages);
 
     let mut result = String::with_capacity(content.len());
     let mut rest = content;
@@ -127,23 +134,32 @@ fn resolve_page_links(content: &str) -> String {
 
         if let Some(end) = after_open.find("]]") {
             let link_content = &after_open[..end];
-            if let Some((id_str, display)) = link_content.split_once('|') {
-                if let Ok(id) = id_str.trim().parse::<PageId>() {
-                    let title = state::SITES
-                        .read()
-                        .get(&prefix)
-                        .and_then(|s| s.state.pages.get(&id))
+            let resolved = if let Some((first, display)) = link_content.split_once('|') {
+                // [[first|display]] - first could be ID or title
+                if let Ok(id) = first.trim().parse::<PageId>() {
+                    // [[id|Display Text]] - canonical format
+                    let title = pages
+                        .and_then(|p| p.get(&id))
                         .map(|p| p.title.clone())
                         .unwrap_or_else(|| display.to_string());
-                    // Hash link so the hashchange listener picks it up
                     let hash = state::build_hash_route(&prefix, Some(id), Some(&title));
-                    result.push_str(&format!("[{title}]({hash})"));
+                    Some(format!("[{title}]({hash})"))
                 } else {
-                    result.push_str(&format!("[[{link_content}]]"));
+                    // [[Title|Label]] - look up by title
+                    find_page_by_title(pages, first.trim()).map(|(id, _)| {
+                        let hash = state::build_hash_route(&prefix, Some(id), Some(first.trim()));
+                        format!("[{display}]({hash})")
+                    })
                 }
             } else {
-                result.push_str(&format!("[[{link_content}]]"));
-            }
+                // [[Page Title]] - look up by title, use title as display
+                find_page_by_title(pages, link_content.trim()).map(|(id, title)| {
+                    let hash = state::build_hash_route(&prefix, Some(id), Some(&title));
+                    format!("[{title}]({hash})")
+                })
+            };
+
+            result.push_str(&resolved.unwrap_or_else(|| format!("[[{link_content}]]")));
             rest = &after_open[end + 2..];
         } else {
             result.push_str("[[");
@@ -152,6 +168,19 @@ fn resolve_page_links(content: &str) -> String {
     }
     result.push_str(rest);
     result
+}
+
+/// Find a page by title (case-insensitive).
+fn find_page_by_title(
+    pages: Option<&std::collections::BTreeMap<PageId, delta_core::Page>>,
+    title: &str,
+) -> Option<(PageId, String)> {
+    let pages = pages?;
+    let lower = title.to_lowercase();
+    pages
+        .iter()
+        .find(|(_, p)| p.title.to_lowercase() == lower)
+        .map(|(&id, p)| (id, p.title.clone()))
 }
 
 /// Copy the full URL for a specific page to clipboard.
