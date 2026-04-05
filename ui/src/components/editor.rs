@@ -34,6 +34,7 @@ pub fn Editor() -> Element {
     let mut ac_open_upward = use_signal(|| false);
 
     // Get matching pages
+    let current_page_id = *state::CURRENT_PAGE.read();
     let matches: Vec<(PageId, String)> = if let Some(query) = &*ac_query.read() {
         let lower = query.to_lowercase();
         state::current_site()
@@ -41,7 +42,11 @@ pub fn Editor() -> Element {
                 site.state
                     .pages
                     .iter()
-                    .filter(|(_, p)| lower.is_empty() || p.title.to_lowercase().contains(&lower))
+                    .filter(|(&id, p)| {
+                        // Exclude the current page
+                        Some(id) != current_page_id
+                            && (lower.is_empty() || p.title.to_lowercase().contains(&lower))
+                    })
                     .map(|(&id, p)| (id, p.title.clone()))
                     .collect()
             })
