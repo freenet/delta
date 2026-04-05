@@ -29,6 +29,9 @@ pub fn Editor() -> Element {
     let mut ac_visible = use_signal(|| false);
     let mut ac_selected = use_signal(|| 0usize);
     let mut cursor_pos = use_signal(|| 0usize);
+    let mut ac_top = use_signal(|| 0i32);
+    let mut ac_left = use_signal(|| 0i32);
+    let mut ac_open_upward = use_signal(|| false);
 
     // Get matching pages
     let matches: Vec<(PageId, String)> = if let Some(query) = &*ac_query.read() {
@@ -48,7 +51,7 @@ pub fn Editor() -> Element {
     };
     let match_count = matches.len();
 
-    // Insert a page link at the current cursor position
+    // Insert a page link
     let mut insert_link = move |id: PageId, _title: &str| {
         let content = state::EDITOR_CONTENT.read().clone();
         let pos = (*cursor_pos.read()).min(content.len());
@@ -56,7 +59,6 @@ pub fn Editor() -> Element {
         if let Some(open) = before.rfind("[[") {
             let after_cursor = &content[pos..];
             let mut new_content = content[..open].to_string();
-            // Insert [[id]] - renders as current page title, auto-updates on rename
             new_content.push_str(&format!("[[{id}]]"));
             new_content.push_str(after_cursor);
             *state::EDITOR_CONTENT.write() = new_content;
@@ -64,6 +66,21 @@ pub fn Editor() -> Element {
         ac_visible.set(false);
         ac_query.set(None);
         ac_selected.set(0);
+    };
+
+    // Dropdown position style
+    let dropdown_style = if *ac_open_upward.read() {
+        format!(
+            "position: absolute; left: {}px; bottom: calc(100% - {}px); max-height: 180px;",
+            *ac_left.read(),
+            *ac_top.read()
+        )
+    } else {
+        format!(
+            "position: absolute; left: {}px; top: {}px; max-height: 180px;",
+            *ac_left.read(),
+            *ac_top.read()
+        )
     };
 
     rsx! {
@@ -107,7 +124,7 @@ pub fn Editor() -> Element {
                             "**bold**  *italic*  `code`  [[ page link  [[id|text]]  [label](url)"
                         }
                     }
-                    div { class: "relative flex-1",
+                    div { class: "relative flex-1 overflow-hidden",
                         textarea {
                             id: "delta-editor",
                             class: "editor-textarea w-full h-full p-5 resize-none outline-none",
@@ -115,7 +132,11 @@ pub fn Editor() -> Element {
                             placeholder: "Write your page content in Markdown...",
                             oninput: move |evt| {
                                 let text = evt.value().to_string();
-                                update_autocomplete(&text, &mut ac_query, &mut ac_visible, &mut ac_selected, &mut cursor_pos);
+                                update_autocomplete(
+                                    &text,
+                                    &mut ac_query, &mut ac_visible, &mut ac_selected,
+                                    &mut cursor_pos, &mut ac_top, &mut ac_left, &mut ac_open_upward,
+                                );
                                 *state::EDITOR_CONTENT.write() = text;
                             },
                             onkeydown: move |evt| {
@@ -138,7 +159,6 @@ pub fn Editor() -> Element {
                                     }
                                     Key::Tab | Key::Enter => {
                                         evt.prevent_default();
-                                        // Insert the selected match
                                         let matches: Vec<(PageId, String)> = if let Some(query) = &*ac_query.read() {
                                             let lower = query.to_lowercase();
                                             state::current_site()
@@ -166,13 +186,13 @@ pub fn Editor() -> Element {
                             },
                         }
 
-                        // Autocomplete dropdown
+                        // Autocomplete dropdown positioned near cursor
                         if *ac_visible.read() && !matches.is_empty() {
                             div {
-                                class: "absolute left-4 right-4 bg-panel border border-border-light rounded-lg shadow-lg z-10 max-h-48 overflow-y-auto",
-                                style: "bottom: 12px;",
-                                div { class: "px-3 py-1.5 text-[10px] text-text-muted-light border-b border-border-light",
-                                    "Link to page - \u{2191}\u{2193} navigate, Enter/Tab select, Esc cancel"
+                                class: "bg-panel border border-border-light rounded-lg shadow-lg z-10 overflow-y-auto",
+                                style: "{dropdown_style}",
+                                div { class: "px-3 py-1 text-[9px] text-text-muted-light border-b border-border-light",
+                                    "\u{2191}\u{2193} Enter/Tab to select, Esc cancel"
                                 }
                                 for (idx, (id, page_title)) in matches.iter().enumerate() {
                                     {
@@ -181,9 +201,9 @@ pub fn Editor() -> Element {
                                         let page_title_insert = page_title.clone();
                                         let is_highlighted = idx == *ac_selected.read();
                                         let item_class = if is_highlighted {
-                                            "w-full text-left px-3 py-2 text-sm bg-accent-soft text-accent"
+                                            "w-full text-left px-3 py-1.5 text-sm bg-accent-soft text-accent"
                                         } else {
-                                            "w-full text-left px-3 py-2 text-sm text-text hover:bg-accent-glow hover:text-accent transition-colors"
+                                            "w-full text-left px-3 py-1.5 text-sm text-text hover:bg-accent-glow hover:text-accent transition-colors"
                                         };
                                         rsx! {
                                             button {
@@ -221,14 +241,17 @@ pub fn Editor() -> Element {
     }
 }
 
-/// Check if cursor is inside [[ and update autocomplete state.
-#[allow(clippy::ptr_arg, unused_variables)]
+/// Check if cursor is inside [[ and update autocomplete state + position.
+#[allow(clippy::ptr_arg, clippy::too_many_arguments, unused_variables)]
 fn update_autocomplete(
     text: &str,
     ac_query: &mut Signal<Option<String>>,
     ac_visible: &mut Signal<bool>,
     ac_selected: &mut Signal<usize>,
     cursor_pos: &mut Signal<usize>,
+    ac_top: &mut Signal<i32>,
+    ac_left: &mut Signal<i32>,
+    ac_open_upward: &mut Signal<bool>,
 ) {
     #[cfg(target_arch = "wasm32")]
     {
@@ -248,6 +271,70 @@ fn update_autocomplete(
                     ac_query.set(Some(between.to_string()));
                     ac_visible.set(true);
                     ac_selected.set(0);
+
+                    // Calculate cursor position using mirror div technique
+                    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                        // Create a hidden div that mirrors the textarea
+                        if let Ok(mirror) = doc.create_element("div") {
+                            let style = [
+                                "position: absolute",
+                                "visibility: hidden",
+                                "white-space: pre-wrap",
+                                "word-wrap: break-word",
+                                &format!("width: {}px", el.client_width()),
+                                &format!(
+                                    "font: {}",
+                                    el.style().get_property_value("font").unwrap_or_default()
+                                ),
+                                "font-family: var(--font-family-mono)",
+                                "font-size: 0.875rem",
+                                "line-height: 1.7",
+                                "padding: 20px",
+                                "tab-size: 4",
+                            ]
+                            .join("; ");
+                            let _ = mirror.set_attribute("style", &style);
+
+                            // Text up to cursor, with a marker span
+                            let text_before = &text[..pos.min(text.len())];
+                            mirror.set_inner_html(&format!(
+                                "{}<span id='_ac_cursor'>|</span>",
+                                text_before.replace('<', "&lt;").replace('>', "&gt;")
+                            ));
+
+                            if let Some(body) = doc.body() {
+                                let _ = body.append_child(&mirror);
+
+                                if let Some(cursor_span) = doc.get_element_by_id("_ac_cursor") {
+                                    let cursor_top =
+                                        cursor_span.get_bounding_client_rect().top() as i32;
+                                    let cursor_left =
+                                        cursor_span.get_bounding_client_rect().left() as i32;
+                                    let textarea_rect = el.get_bounding_client_rect();
+                                    let ta_top = textarea_rect.top() as i32;
+                                    let ta_left = textarea_rect.left() as i32;
+                                    let ta_height = textarea_rect.height() as i32;
+
+                                    // Position relative to textarea
+                                    let rel_top = cursor_top - ta_top + 24; // below cursor line
+                                    let rel_left = (cursor_left - ta_left).max(8).min(200);
+
+                                    // Flip upward if cursor is in bottom half
+                                    let flip = rel_top > ta_height / 2;
+                                    ac_open_upward.set(flip);
+
+                                    if flip {
+                                        ac_top.set(ta_height - (cursor_top - ta_top) + 4);
+                                    } else {
+                                        ac_top.set(rel_top);
+                                    }
+                                    ac_left.set(rel_left);
+                                }
+
+                                let _ = body.remove_child(&mirror);
+                            }
+                        }
+                    }
                     return;
                 }
             }
@@ -255,5 +342,4 @@ fn update_autocomplete(
     }
     ac_visible.set(false);
     ac_query.set(None);
-    let _ = (text, cursor_pos);
 }
