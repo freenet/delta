@@ -173,13 +173,11 @@ pub fn Editor() -> Element {
                             },
                         }
 
-                        // Autocomplete dropdown positioned near cursor
+                        // Autocomplete dropdown - centered in editor
                         if *ac_visible.read() && !matches.is_empty() {
                             div {
-                                class: "absolute inset-0 flex items-center justify-center z-10 pointer-events-none",
-                                div {
-                                class: "bg-panel border border-border-light rounded-lg shadow-lg overflow-y-auto pointer-events-auto",
-                                style: "max-height: 200px; min-width: 200px; max-width: 300px;",
+                                class: "bg-panel border border-border-light rounded-lg shadow-lg overflow-y-auto z-50",
+                                style: "position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); max-height: 200px; min-width: 220px; max-width: 320px;",
                                 div { class: "px-3 py-1 text-[9px] text-text-muted-light border-b border-border-light",
                                     "\u{2191}\u{2193} Enter/Tab to select, Esc cancel"
                                 }
@@ -206,7 +204,6 @@ pub fn Editor() -> Element {
                                         }
                                     }
                                 }
-                            }
                             }
                         }
                     }
