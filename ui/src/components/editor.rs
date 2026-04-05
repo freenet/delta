@@ -258,6 +258,13 @@ fn update_autocomplete(
             if let Some(open) = before_cursor.rfind("[[") {
                 let between = &before_cursor[open + 2..];
                 if !between.contains("]]") && !between.contains('\n') {
+                    web_sys::console::log_1(
+                        &format!(
+                            "Delta: autocomplete triggered, query='{}' pos={}",
+                            between, pos
+                        )
+                        .into(),
+                    );
                     ac_query.set(Some(between.to_string()));
                     ac_visible.set(true);
                     ac_selected.set(0);
