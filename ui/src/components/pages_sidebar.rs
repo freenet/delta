@@ -91,7 +91,7 @@ pub fn PagesSidebar() -> Element {
                             "text-text-light"
                         };
                         rsx! {
-                                div { class: "group/page flex items-center mb-0.5 transition-all-fast {item_class}",
+                                div { class: "page-row flex items-center mb-0.5 transition-all-fast {item_class}",
                                     button {
                                         class: "flex-1 text-left px-3 py-2 text-sm",
                                         onclick: move |_| state::select_page(id),
@@ -112,7 +112,7 @@ pub fn PagesSidebar() -> Element {
                                             let prev_id = pos.and_then(|p| if p > 0 { sorted_ids.get(p - 1).copied() } else { None });
                                             let next_id = pos.and_then(|p| sorted_ids.get(p + 1).copied());
                                             rsx! {
-                                                div { class: "flex flex-col mr-2 opacity-0 group-hover/page:opacity-100 transition-opacity",
+                                                div { class: "page-arrows flex flex-col mr-2",
                                                     if let Some(prev) = prev_id {
                                                         button {
                                                             class: "text-[10px] text-text-muted hover:text-accent px-1 leading-none",

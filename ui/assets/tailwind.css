@@ -367,6 +367,10 @@ html, body {
   transition: all 0.1s ease;
 }
 
+/* Page reorder arrows - show on hover */
+.page-arrows { opacity: 0; transition: opacity 0.15s ease; }
+.page-row:hover .page-arrows { opacity: 1; }
+
 /* Loading pulse */
 .loading-pulse {
   animation: gentle-pulse 2s ease-in-out infinite;
