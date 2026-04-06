@@ -12,6 +12,34 @@ use std::collections::BTreeMap;
 /// Site contract WASM (embedded at build time).
 const SITE_CONTRACT_WASM: &[u8] = include_bytes!("../../public/contracts/site_contract.wasm");
 
+/// Previous WASM BLAKE3 hash (commit 2e664c3, before deleted_pages tombstone).
+/// Only covers one-hop migration from pre-tombstone WASM to current.
+/// For future WASM changes, stored contract_key_b58 handles migration.
+const OLD_WASM_HASH: [u8; 32] =
+    hex_literal("1188d108180a4143e6e4107b193cb90d5c08644e3830499f46186f141f182e81");
+
+const fn hex_literal(s: &str) -> [u8; 32] {
+    let bytes = s.as_bytes();
+    let mut result = [0u8; 32];
+    let mut i = 0;
+    while i < 32 {
+        let hi = hex_nibble(bytes[i * 2]);
+        let lo = hex_nibble(bytes[i * 2 + 1]);
+        result[i] = (hi << 4) | lo;
+        i += 1;
+    }
+    result
+}
+
+const fn hex_nibble(b: u8) -> u8 {
+    match b {
+        b'0'..=b'9' => b - b'0',
+        b'a'..=b'f' => b - b'a' + 10,
+        b'A'..=b'F' => b - b'A' + 10,
+        _ => 0,
+    }
+}
+
 /// Pending migrations: maps old contract key (base58) -> site prefix.
 /// When a GET response arrives for an old key, we PUT the state to the new key.
 static PENDING_MIGRATIONS: GlobalSignal<BTreeMap<String, String>> =
@@ -43,24 +71,31 @@ fn handle_contract_response(response: ContractResponse) {
             let migration_prefix = PENDING_MIGRATIONS.write().remove(&key_b58);
 
             let state_bytes = state.to_vec();
-            if !state_bytes.is_empty() {
-                if let Some(prefix) = &migration_prefix {
+            if let Some(prefix) = &migration_prefix {
+                if !state_bytes.is_empty() {
                     // Migration: PUT state to new contract key
                     log(&format!(
                         "Delta: migrating state for site {prefix} from old key to new key"
                     ));
                     let new_key = state::contract_key_from_prefix(prefix);
                     handle_site_state(new_key, &state_bytes);
-                    // PUT to the new contract
+                    // PUT to new contract (subscribe: true in PUT handles subscription)
                     migrate_state_to_new_key(prefix, &state_bytes);
-                    // Subscribe to new key
-                    subscribe_to_site(&new_key);
+                    // Persist the new contract key so migration doesn't re-run
+                    super::delegate::save_known_sites();
                 } else {
-                    handle_site_state(key, &state_bytes);
-                    // Subscribe AFTER successful GET
-                    subscribe_to_site(&key);
+                    // Old state gone from network - fall back to normal GET on new key
+                    log(&format!(
+                        "Delta: migration GET returned empty for site {prefix}, trying new key"
+                    ));
+                    let new_key = state::contract_key_from_prefix(prefix);
+                    get_site(&new_key);
                 }
-            } else if migration_prefix.is_none() {
+            } else {
+                if !state_bytes.is_empty() {
+                    handle_site_state(key, &state_bytes);
+                }
+                // Subscribe AFTER successful GET
                 subscribe_to_site(&key);
             }
         }
@@ -232,6 +267,23 @@ pub fn get_site_by_id(id: &ContractInstanceId) {
             api.send(request).await
         })
     });
+}
+
+/// Compute a contract instance ID using the old WASM hash and a prefix.
+/// This lets us find state at the old contract key after a WASM upgrade.
+pub fn old_contract_id_for_prefix(prefix: &str) -> String {
+    let params = delta_core::SiteParameters {
+        prefix: prefix.to_string(),
+    };
+    let mut params_buf = Vec::new();
+    ciborium::ser::into_writer(&params, &mut params_buf).expect("CBOR params");
+
+    // ContractInstanceId = BLAKE3(BLAKE3(wasm) || params)
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(&OLD_WASM_HASH);
+    hasher.update(&params_buf);
+    let hash = hasher.finalize();
+    bs58::encode(hash.as_bytes()).into_string()
 }
 
 /// GET from an old contract key for migration purposes.

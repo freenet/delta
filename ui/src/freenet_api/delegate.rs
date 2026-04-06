@@ -397,12 +397,22 @@ fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
 
         if needs_migration {
             if let Some(old_b58) = old_key_b58 {
-                // GET from old contract key - the response handler will receive the
-                // state, and we'll PUT it to the new key in migrate_state_to_new_key
                 super::operations::get_for_migration(&old_b58, &prefix);
             }
+        } else if old_key_b58.is_none() {
+            // No stored key - this is either a fresh site or pre-upgrade.
+            // Try both the current key and the old WASM key (one-time migration).
+            let old_b58 = super::operations::old_contract_id_for_prefix(&prefix);
+            if old_b58 != new_key_b58 {
+                log(&format!(
+                    "Delta: trying one-time migration from old WASM for site {prefix}"
+                ));
+                super::operations::get_for_migration(&old_b58, &prefix);
+            }
+            // Also GET from current key in case it already has state
+            super::operations::get_site(&new_contract_key);
         } else {
-            // Normal GET from current key
+            // Stored key matches current - normal GET
             super::operations::get_site(&new_contract_key);
         }
     }
