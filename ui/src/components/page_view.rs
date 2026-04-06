@@ -66,12 +66,12 @@ pub fn PageView() -> Element {
                         if *link_copied.read() { "Copied!" } else { "Share" }
                     }
                     button {
-                        class: "px-3 py-1.5 text-xs text-text-muted hover:text-accent transition-colors rounded",
+                        class: if *show_source.read() { "px-3 py-1.5 text-xs text-accent transition-colors rounded" } else { "px-3 py-1.5 text-xs text-text-muted hover:text-accent transition-colors rounded" },
                         onclick: move |_| {
                             let current = *show_source.read();
                             show_source.set(!current);
                         },
-                        if *show_source.read() { "Preview" } else { "Source" }
+                        if *show_source.read() { "\u{2715} Source" } else { "Source" }
                     }
                     if is_owner {
                         button {
