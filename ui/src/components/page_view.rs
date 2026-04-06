@@ -28,6 +28,8 @@ pub fn PageView() -> Element {
         .unwrap_or(false);
 
     let rendered_html = render_markdown(&page.content);
+    let raw_markdown = page.content.clone();
+    let mut show_source = use_signal(|| false);
 
     let site_prefix = state::current_site()
         .map(|s| s.prefix.clone())
@@ -61,6 +63,14 @@ pub fn PageView() -> Element {
                         },
                         if *link_copied.read() { "Copied!" } else { "Share" }
                     }
+                    button {
+                        class: "px-3 py-1.5 text-xs text-text-muted hover:text-accent transition-colors rounded",
+                        onclick: move |_| {
+                            let current = *show_source.read();
+                            show_source.set(!current);
+                        },
+                        if *show_source.read() { "Rendered" } else { "Source" }
+                    }
                     if is_owner {
                         button {
                             class: "px-3 py-1.5 text-xs text-text-muted hover:text-accent transition-colors rounded",
@@ -92,10 +102,17 @@ pub fn PageView() -> Element {
                 }
             }
 
-            // Rendered markdown
-            div {
-                class: "prose",
-                dangerous_inner_html: "{rendered_html}",
+            // Content - rendered or source
+            if *show_source.read() {
+                pre {
+                    class: "editor-textarea p-5 text-sm rounded-lg bg-panel-warm border border-border-light overflow-x-auto whitespace-pre-wrap",
+                    "{raw_markdown}"
+                }
+            } else {
+                div {
+                    class: "prose",
+                    dangerous_inner_html: "{rendered_html}",
+                }
             }
 
             // Footer
