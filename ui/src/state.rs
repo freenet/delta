@@ -547,6 +547,7 @@ pub fn rename_page(page_id: PageId, new_title: String) {
 }
 
 /// Swap the order of two pages. Used for move up/down.
+/// Assigns explicit order values to all pages first if they're all 0.
 pub fn swap_page_order(page_a: PageId, page_b: PageId) {
     let Some(prefix) = (*CURRENT_SITE.read()).clone() else {
         return;
@@ -554,6 +555,18 @@ pub fn swap_page_order(page_a: PageId, page_b: PageId) {
 
     SITES.with_mut(|sites| {
         if let Some(site) = sites.get_mut(&prefix) {
+            // If all pages have order 0, assign sequential orders first
+            let all_zero = site.state.pages.values().all(|p| p.order == 0);
+            if all_zero {
+                let mut sorted: Vec<_> = site.state.pages.keys().copied().collect();
+                sorted.sort();
+                for (i, id) in sorted.iter().enumerate() {
+                    if let Some(p) = site.state.pages.get_mut(id) {
+                        p.order = (i as u32 + 1) * 10;
+                    }
+                }
+            }
+
             let order_a = site.state.pages.get(&page_a).map(|p| p.order).unwrap_or(0);
             let order_b = site.state.pages.get(&page_b).map(|p| p.order).unwrap_or(0);
             if let Some(pa) = site.state.pages.get_mut(&page_a) {
