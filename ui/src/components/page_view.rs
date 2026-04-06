@@ -71,7 +71,7 @@ pub fn PageView() -> Element {
                             let current = *show_source.read();
                             show_source.set(!current);
                         },
-                        if *show_source.read() { "Rendered" } else { "Source" }
+                        if *show_source.read() { "Preview" } else { "Source" }
                     }
                     if is_owner {
                         button {
@@ -115,7 +115,8 @@ pub fn PageView() -> Element {
             // Content - rendered or source
             if *show_source.read() {
                 pre {
-                    class: "editor-textarea p-5 text-sm rounded-lg bg-panel-warm border border-border-light overflow-x-auto whitespace-pre-wrap",
+                    class: "editor-textarea p-5 text-sm rounded-lg bg-panel-warm border border-border-light",
+                    style: "white-space: pre-wrap; word-break: break-word; overflow-wrap: break-word;",
                     "{raw_markdown}"
                 }
             } else {
