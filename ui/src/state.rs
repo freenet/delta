@@ -446,6 +446,46 @@ pub fn save_current_page() {
     *EDITING.write() = false;
 }
 
+/// Rename a page. Updates locally and signs via delegate.
+pub fn rename_page(page_id: PageId, new_title: String) {
+    let Some(prefix) = (*CURRENT_SITE.read()).clone() else {
+        return;
+    };
+
+    let sites = SITES.read();
+    let site = match sites.get(&prefix) {
+        Some(s) => s,
+        None => return,
+    };
+    let contract_key = site.contract_key;
+    let content = site
+        .state
+        .pages
+        .get(&page_id)
+        .map(|p| p.content.clone())
+        .unwrap_or_default();
+    drop(sites);
+
+    let now = now_secs();
+
+    // Update local state optimistically
+    SITES.with_mut(|sites| {
+        if let Some(site) = sites.get_mut(&prefix) {
+            if let Some(page) = site.state.pages.get_mut(&page_id) {
+                page.title = new_title.clone();
+                page.updated_at = now;
+            }
+        }
+    });
+
+    // Sign via delegate and UPDATE network
+    if let Some(ck) = contract_key {
+        crate::freenet_api::delegate::request_sign_page(
+            &prefix, ck, page_id, new_title, content, now,
+        );
+    }
+}
+
 pub fn delete_page(page_id: PageId) {
     let Some(prefix) = (*CURRENT_SITE.read()).clone() else {
         return;
