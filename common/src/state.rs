@@ -528,6 +528,10 @@ pub struct KnownSiteRecord {
     pub prefix: String,
     pub name: String,
     pub is_owner: bool,
+    /// Base58-encoded contract key from when this site was last accessed.
+    /// Used to detect contract WASM upgrades and migrate state.
+    #[serde(default)]
+    pub contract_key_b58: Option<String>,
 }
 
 /// Requests from the UI to the delegate.

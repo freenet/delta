@@ -82,6 +82,7 @@ pub fn save_known_sites() {
             prefix: s.prefix.clone(),
             name: s.name.clone(),
             is_owner: s.role == state::SiteRole::Owner,
+            contract_key_b58: s.contract_key.map(|ck| ck.encoded_contract_id()),
         })
         .collect();
     let request = delta_core::DelegateRequest::StoreKnownSites { sites: records };
@@ -368,7 +369,18 @@ fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
             state::SiteRole::Visitor
         };
 
-        let contract_key = state::contract_key_from_prefix(&prefix);
+        let new_contract_key = state::contract_key_from_prefix(&prefix);
+
+        // Check if WASM upgrade happened (stored key differs from computed key)
+        let old_key_b58 = record.contract_key_b58.clone();
+        let new_key_b58 = new_contract_key.encoded_contract_id();
+        let needs_migration = old_key_b58.as_ref().is_some_and(|old| *old != new_key_b58);
+
+        if needs_migration {
+            log(&format!(
+                "Delta: contract WASM upgrade detected for site {prefix}, migrating state"
+            ));
+        }
 
         let site = state::KnownSite {
             name: record.name,
@@ -376,15 +388,23 @@ fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
             role,
             state: delta_core::SiteState::default(),
             owner_pubkey: [0u8; 32],
-            contract_key: Some(contract_key),
+            contract_key: Some(new_contract_key),
         };
 
         state::SITES.with_mut(|sites| {
             sites.insert(prefix.clone(), site);
         });
 
-        // GET the site — SUBSCRIBE happens after GET succeeds
-        super::operations::get_site(&contract_key);
+        if needs_migration {
+            if let Some(old_b58) = old_key_b58 {
+                // GET from old contract key - the response handler will receive the
+                // state, and we'll PUT it to the new key in migrate_state_to_new_key
+                super::operations::get_for_migration(&old_b58, &prefix);
+            }
+        } else {
+            // Normal GET from current key
+            super::operations::get_site(&new_contract_key);
+        }
     }
 
     // Replay any pending hash navigation (from deep link)
