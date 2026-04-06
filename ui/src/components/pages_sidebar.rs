@@ -112,10 +112,10 @@ pub fn PagesSidebar() -> Element {
                                             let prev_id = pos.and_then(|p| if p > 0 { sorted_ids.get(p - 1).copied() } else { None });
                                             let next_id = pos.and_then(|p| sorted_ids.get(p + 1).copied());
                                             rsx! {
-                                                div { class: "flex flex-col opacity-0 group-hover/page:opacity-100 transition-opacity pr-1",
+                                                div { class: "flex flex-col pr-1",
                                                     if let Some(prev) = prev_id {
                                                         button {
-                                                            class: "text-[10px] text-text-muted hover:text-accent px-1 leading-none",
+                                                            class: "text-xs text-text-muted hover:text-accent px-1.5 py-0.5 leading-none rounded hover:bg-accent-glow transition-colors",
                                                             onclick: move |evt| {
                                                                 evt.stop_propagation();
                                                                 state::swap_page_order(id, prev);
@@ -125,7 +125,7 @@ pub fn PagesSidebar() -> Element {
                                                     }
                                                     if let Some(next) = next_id {
                                                         button {
-                                                            class: "text-[10px] text-text-muted hover:text-accent px-1 leading-none",
+                                                            class: "text-xs text-text-muted hover:text-accent px-1.5 py-0.5 leading-none rounded hover:bg-accent-glow transition-colors",
                                                             onclick: move |evt| {
                                                                 evt.stop_propagation();
                                                                 state::swap_page_order(id, next);
