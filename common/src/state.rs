@@ -444,6 +444,59 @@ fn deletion_signing_bytes(page_id: PageId, deleted_at: u64) -> Vec<u8> {
 // Delegate request/response types
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Site key export/import
+// ---------------------------------------------------------------------------
+
+/// Exportable site key - contains the signing key for portability.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SiteKeyExport {
+    /// Ed25519 signing key bytes (32 bytes).
+    pub signing_key: Vec<u8>,
+    /// Owner's public key bytes (for verification).
+    pub owner_pubkey: Vec<u8>,
+    /// Site prefix (10-char code).
+    pub prefix: String,
+    /// Site name (convenience).
+    pub name: String,
+}
+
+const ARMOR_BEGIN: &str = "-----BEGIN DELTA SITE KEY-----";
+const ARMOR_END: &str = "-----END DELTA SITE KEY-----";
+
+impl SiteKeyExport {
+    /// Serialize to armored text format.
+    pub fn to_armored(&self) -> String {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(self, &mut buf).expect("CBOR serialization");
+        let encoded = bs58::encode(&buf).into_string();
+        // Line-wrap at 64 characters
+        let lines: Vec<&str> = encoded
+            .as_bytes()
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        format!("{}\n{}\n{}", ARMOR_BEGIN, lines.join("\n"), ARMOR_END)
+    }
+
+    /// Parse from armored text format.
+    pub fn from_armored(text: &str) -> Result<Self, String> {
+        let text = text.trim();
+        if !text.starts_with(ARMOR_BEGIN) || !text.ends_with(ARMOR_END) {
+            return Err("Invalid format: missing armor markers".into());
+        }
+        let inner = text
+            .trim_start_matches(ARMOR_BEGIN)
+            .trim_end_matches(ARMOR_END)
+            .split_whitespace()
+            .collect::<String>();
+        let bytes = bs58::decode(&inner)
+            .into_vec()
+            .map_err(|e| format!("Base58 decode error: {e}"))?;
+        ciborium::de::from_reader(bytes.as_slice()).map_err(|e| format!("CBOR decode error: {e}"))
+    }
+}
+
 /// A lightweight record of a known site (stored in delegate for persistence).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KnownSiteRecord {
@@ -650,5 +703,39 @@ mod tests {
         let p5 = Page::new(5, "B".into(), "b".into(), 2000, &owner);
         site.upsert_page(5, p5, &owner.verifying_key()).unwrap();
         assert_eq!(site.next_page_id, 6);
+    }
+
+    #[test]
+    fn site_key_export_roundtrip() {
+        let export = SiteKeyExport {
+            signing_key: vec![1; 32],
+            owner_pubkey: vec![2; 32],
+            prefix: "abcdefghij".into(),
+            name: "Test Site".into(),
+        };
+        let armored = export.to_armored();
+        assert!(armored.starts_with(ARMOR_BEGIN));
+        assert!(armored.ends_with(ARMOR_END));
+
+        let parsed = SiteKeyExport::from_armored(&armored).unwrap();
+        assert_eq!(parsed.signing_key, export.signing_key);
+        assert_eq!(parsed.owner_pubkey, export.owner_pubkey);
+        assert_eq!(parsed.prefix, export.prefix);
+        assert_eq!(parsed.name, export.name);
+    }
+
+    #[test]
+    fn site_key_export_handles_whitespace() {
+        let export = SiteKeyExport {
+            signing_key: vec![3; 32],
+            owner_pubkey: vec![4; 32],
+            prefix: "1234567890".into(),
+            name: "My Site".into(),
+        };
+        let armored = export.to_armored();
+        // Add extra whitespace
+        let messy = format!("  \n{}\n  ", armored);
+        let parsed = SiteKeyExport::from_armored(&messy).unwrap();
+        assert_eq!(parsed.prefix, "1234567890");
     }
 }

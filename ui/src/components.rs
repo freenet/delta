@@ -1,5 +1,6 @@
 mod add_site_dialog;
 mod editor;
+pub(crate) mod export_key;
 mod page_view;
 mod pages_sidebar;
 mod sites_sidebar;
@@ -34,6 +35,7 @@ pub fn App() -> Element {
 
     rsx! {
         document::Link { rel: "icon", href: asset!("/assets/favicon.svg") }
+        export_key::ExportKeyModal {}
         div { class: "flex h-screen bg-bg text-text",
             sites_sidebar::SitesSidebar {}
             if show_add_site {

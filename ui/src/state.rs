@@ -242,6 +242,64 @@ pub fn create_new_site(name: String) {
     }
 }
 
+/// Import a site key from armored token. Makes this device the owner.
+pub fn import_site_key(token: String) -> Result<(), String> {
+    let export = delta_core::SiteKeyExport::from_armored(&token)?;
+
+    if export.signing_key.len() != 32 {
+        return Err("Invalid signing key length".into());
+    }
+    if export.owner_pubkey.len() != 32 {
+        return Err("Invalid public key length".into());
+    }
+
+    let prefix = export.prefix.clone();
+    let name = export.name.clone();
+
+    // Store signing key in delegate
+    let mut sk_bytes = [0u8; 32];
+    sk_bytes.copy_from_slice(&export.signing_key);
+    crate::freenet_api::delegate::store_signing_key(&sk_bytes);
+
+    // Compute contract key and add as owned site
+    let contract_key = contract_key_from_prefix(&prefix);
+
+    let mut owner_bytes = [0u8; 32];
+    owner_bytes.copy_from_slice(&export.owner_pubkey);
+
+    let site = KnownSite {
+        name,
+        prefix: prefix.clone(),
+        role: SiteRole::Owner,
+        state: SiteState::default(),
+        owner_pubkey: owner_bytes,
+        contract_key: Some(contract_key),
+    };
+    SITES.with_mut(|sites| {
+        sites.insert(prefix.clone(), site);
+    });
+    crate::freenet_api::delegate::save_known_sites();
+
+    // GET the site content from network
+    crate::freenet_api::get_site(&contract_key);
+
+    *SHOW_ADD_SITE.write() = false;
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        let prefix_clone = prefix.clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            select_site(&prefix_clone);
+        });
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        select_site(&prefix);
+    }
+
+    Ok(())
+}
+
 /// Site contract WASM (for computing contract keys from prefixes).
 const SITE_CONTRACT_WASM: &[u8] = include_bytes!("../public/contracts/site_contract.wasm");
 

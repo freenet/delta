@@ -131,15 +131,22 @@ pub fn PagesSidebar() -> Element {
                 }
             }
 
-            // New page (owner only)
+            // New page + export key (owner only)
             if is_owner {
-                div { class: "px-3 py-3 border-t border-border",
+                div { class: "px-3 py-3 border-t border-border space-y-2",
                     button {
                         class: "w-full px-3 py-2 text-xs text-text-muted hover:text-accent border border-border hover:border-accent rounded-lg transition-colors",
                         onclick: move |_| {
                             state::create_page("New Page".into());
                         },
                         "+ New Page"
+                    }
+                    button {
+                        class: "w-full px-3 py-1.5 text-[10px] text-text-muted hover:text-accent transition-colors",
+                        onclick: move |_| {
+                            *crate::components::export_key::SHOW_EXPORT.write() = true;
+                        },
+                        "Export Site Key"
                     }
                 }
             }
