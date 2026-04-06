@@ -90,44 +90,12 @@ pub fn PagesSidebar() -> Element {
                         } else {
                             "text-text-light"
                         };
-                        let page_title = page.title.clone();
-                        let mut editing_page = use_signal(|| false);
-                        let mut page_name_input = use_signal(String::new);
                         rsx! {
-                            if *editing_page.read() && is_owner {
-                                input {
-                                    class: "w-full text-left px-3 py-1.5 text-sm mb-0.5 bg-transparent border-b border-accent text-text outline-none {item_class}",
-                                    r#type: "text",
-                                    value: "{page_name_input}",
-                                    autofocus: true,
-                                    oninput: move |evt| page_name_input.set(evt.value().to_string()),
-                                    onkeypress: move |evt| {
-                                        if evt.key() == Key::Enter {
-                                            let new_name = page_name_input.read().clone();
-                                            if !new_name.trim().is_empty() {
-                                                state::rename_page(id, new_name);
-                                            }
-                                            editing_page.set(false);
-                                        } else if evt.key() == Key::Escape {
-                                            editing_page.set(false);
-                                        }
-                                    },
-                                }
-                            } else {
                                 div { class: "group/page flex items-center mb-0.5 transition-all-fast {item_class}",
                                     button {
                                         class: "flex-1 text-left px-3 py-2 text-sm",
                                         onclick: move |_| state::select_page(id),
-                                        ondoubleclick: move |_| {
-                                            if is_owner {
-                                                page_name_input.set(page_title.clone());
-                                                editing_page.set(true);
-                                            }
-                                        },
                                         span { class: "{text_class}", "{page.title}" }
-                                        if is_owner && is_selected {
-                                            span { class: "text-[9px] text-text-muted ml-1 opacity-0 group-hover/page:opacity-100 transition-opacity", "rename" }
-                                        }
                                     }
                                     // Move up/down arrows (owner only, on hover)
                                     if is_owner && is_selected {
@@ -174,7 +142,6 @@ pub fn PagesSidebar() -> Element {
                         }
                     }
                 }
-            }
 
             // New page + export key (owner only)
             if is_owner {

@@ -37,6 +37,8 @@ pub fn PageView() -> Element {
     let page_title_for_share = page.title.clone();
     let mut link_copied = use_signal(|| false);
     let mut confirming_delete = use_signal(|| false);
+    let mut renaming = use_signal(|| false);
+    let mut rename_input = use_signal(|| page.title.clone());
 
     rsx! {
         div { class: "max-w-4xl mx-auto px-10 py-12",
@@ -72,6 +74,35 @@ pub fn PageView() -> Element {
                         if *show_source.read() { "Rendered" } else { "Source" }
                     }
                     if is_owner {
+                        if *renaming.read() {
+                            input {
+                                class: "px-2 py-1 text-xs bg-transparent border-b border-accent text-text outline-none w-32",
+                                r#type: "text",
+                                value: "{rename_input}",
+                                autofocus: true,
+                                oninput: move |evt| rename_input.set(evt.value().to_string()),
+                                onkeypress: move |evt| {
+                                    if evt.key() == Key::Enter {
+                                        let new_name = rename_input.read().clone();
+                                        if !new_name.trim().is_empty() {
+                                            state::rename_page(page_id, new_name);
+                                        }
+                                        renaming.set(false);
+                                    } else if evt.key() == Key::Escape {
+                                        renaming.set(false);
+                                    }
+                                },
+                            }
+                        } else {
+                            button {
+                                class: "px-3 py-1.5 text-xs text-text-muted hover:text-accent transition-colors rounded",
+                                onclick: move |_| {
+                                    rename_input.set(page.title.clone());
+                                    renaming.set(true);
+                                },
+                                "Rename"
+                            }
+                        }
                         button {
                             class: "px-3 py-1.5 text-xs text-text-muted hover:text-accent transition-colors rounded",
                             onclick: move |_| state::start_editing(),
