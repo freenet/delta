@@ -63,6 +63,9 @@ pub struct SiteState {
     pub pages: BTreeMap<PageId, Page>,
     /// Next page ID to assign. Monotonically increasing.
     pub next_page_id: PageId,
+    /// Tombstones for deleted pages - prevents re-adding during merge.
+    #[serde(default)]
+    pub deleted_pages: BTreeMap<PageId, SignedPageDeletion>,
 }
 
 impl Default for SiteState {
@@ -82,6 +85,7 @@ impl Default for SiteState {
             config: SignedConfig::default(),
             pages: BTreeMap::new(),
             next_page_id: 1,
+            deleted_pages: BTreeMap::new(),
         }
     }
 }
@@ -94,6 +98,7 @@ impl SiteState {
             config: SignedConfig::new(config, owner_key),
             pages: BTreeMap::new(),
             next_page_id: 1,
+            deleted_pages: BTreeMap::new(),
         }
     }
 
@@ -140,6 +145,9 @@ impl SiteState {
     ) -> Result<(), String> {
         deletion.verify(owner)?;
         self.pages.remove(&deletion.page_id);
+        // Store tombstone so merge doesn't re-add the page
+        self.deleted_pages
+            .insert(deletion.page_id, deletion.clone());
         Ok(())
     }
 }
@@ -391,7 +399,20 @@ impl SiteState {
             self.config = other.config.clone();
         }
 
+        // Merge tombstones from other
+        for (&page_id, deletion) in &other.deleted_pages {
+            self.deleted_pages
+                .entry(page_id)
+                .or_insert_with(|| deletion.clone());
+            // Also remove from our pages if present
+            self.pages.remove(&page_id);
+        }
+
         for (&page_id, page) in &other.pages {
+            // Don't re-add deleted pages
+            if self.deleted_pages.contains_key(&page_id) {
+                continue;
+            }
             let dominated = self
                 .pages
                 .get(&page_id)
