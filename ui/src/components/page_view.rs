@@ -77,8 +77,6 @@ pub fn PageView() -> Element {
                         button {
                             class: "px-3 py-1.5 text-xs text-text-muted hover:text-accent transition-colors rounded",
                             onclick: move |_| {
-                                #[cfg(target_arch = "wasm32")]
-                                web_sys::console::log_1(&"Delta: Rename clicked".into());
                                 rename_input.set(page.title.clone());
                                 renaming.set(true);
                             },
@@ -148,7 +146,6 @@ pub fn PageView() -> Element {
                         class: "w-full px-3 py-2 bg-panel-warm border border-border-light rounded-lg text-text text-sm outline-none focus:border-accent",
                         r#type: "text",
                         value: "{rename_input}",
-                        autofocus: true,
                         oninput: move |evt| rename_input.set(evt.value().to_string()),
                         onkeypress: move |evt| {
                             if evt.key() == Key::Enter {
