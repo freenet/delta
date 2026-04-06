@@ -211,6 +211,9 @@ pub struct Page {
     pub updated_at: u64,
     /// Owner's signature over `(page_id, title, content, updated_at)`.
     pub signature: Signature,
+    /// Sort order (lower = earlier). Defaults to 0 for backwards compatibility.
+    #[serde(default)]
+    pub order: u32,
 }
 
 impl Page {
@@ -228,6 +231,7 @@ impl Page {
             content,
             updated_at,
             signature: sign_bytes(&bytes, owner_key),
+            order: 0,
         }
     }
 

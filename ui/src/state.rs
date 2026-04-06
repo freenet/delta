@@ -433,6 +433,7 @@ pub fn create_page(title: String) {
                     content: String::new(),
                     updated_at: now,
                     signature: Signature::from_bytes(&[0u8; 64]),
+                    order: 0,
                 };
                 site.state.pages.insert(id, page);
                 site.state.next_page_id = id + 1;
@@ -446,6 +447,7 @@ pub fn create_page(title: String) {
                     content: String::new(),
                     updated_at: now,
                     signature: Signature::from_bytes(&[0u8; 64]),
+                    order: 0,
                 };
                 site.state.pages.insert(id, page);
                 site.state.next_page_id = id + 1;
@@ -542,6 +544,28 @@ pub fn rename_page(page_id: PageId, new_title: String) {
             &prefix, ck, page_id, new_title, content, now,
         );
     }
+}
+
+/// Swap the order of two pages. Used for move up/down.
+pub fn swap_page_order(page_a: PageId, page_b: PageId) {
+    let Some(prefix) = (*CURRENT_SITE.read()).clone() else {
+        return;
+    };
+
+    SITES.with_mut(|sites| {
+        if let Some(site) = sites.get_mut(&prefix) {
+            let order_a = site.state.pages.get(&page_a).map(|p| p.order).unwrap_or(0);
+            let order_b = site.state.pages.get(&page_b).map(|p| p.order).unwrap_or(0);
+            if let Some(pa) = site.state.pages.get_mut(&page_a) {
+                pa.order = order_b;
+            }
+            if let Some(pb) = site.state.pages.get_mut(&page_b) {
+                pb.order = order_a;
+            }
+        }
+    });
+
+    // TODO: sign and UPDATE both pages to persist order change to network
 }
 
 pub fn delete_page(page_id: PageId) {

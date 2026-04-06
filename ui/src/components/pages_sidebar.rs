@@ -19,7 +19,7 @@ pub fn PagesSidebar() -> Element {
     let is_owner = site.role == SiteRole::Owner;
 
     let mut sorted_pages: Vec<_> = site.state.pages.iter().collect();
-    sorted_pages.sort_by_key(|(id, _)| *id);
+    sorted_pages.sort_by(|(id_a, a), (id_b, b)| a.order.cmp(&b.order).then(id_a.cmp(id_b)));
 
     rsx! {
         aside { class: "w-52 flex flex-col h-full bg-bg-warm border-r border-border",
@@ -114,16 +114,58 @@ pub fn PagesSidebar() -> Element {
                                     },
                                 }
                             } else {
-                                button {
-                                    class: "w-full text-left px-3 py-2 text-sm mb-0.5 transition-all-fast {item_class}",
-                                    onclick: move |_| state::select_page(id),
-                                    ondoubleclick: move |_| {
-                                        if is_owner {
-                                            page_name_input.set(page_title.clone());
-                                            editing_page.set(true);
+                                div { class: "group/page flex items-center mb-0.5 transition-all-fast {item_class}",
+                                    button {
+                                        class: "flex-1 text-left px-3 py-2 text-sm",
+                                        onclick: move |_| state::select_page(id),
+                                        ondoubleclick: move |_| {
+                                            if is_owner {
+                                                page_name_input.set(page_title.clone());
+                                                editing_page.set(true);
+                                            }
+                                        },
+                                        span { class: "{text_class}", "{page.title}" }
+                                    }
+                                    // Move up/down arrows (owner only, on hover)
+                                    if is_owner && is_selected {
+                                        {
+                                            // Get sorted page IDs to find neighbors
+                                            let sorted_ids: Vec<delta_core::PageId> = state::current_site()
+                                                .map(|s| {
+                                                    let mut pages: Vec<_> = s.state.pages.iter().collect();
+                                                    pages.sort_by(|(ia, a), (ib, b)| a.order.cmp(&b.order).then(ia.cmp(ib)));
+                                                    pages.into_iter().map(|(&pid, _)| pid).collect()
+                                                })
+                                                .unwrap_or_default();
+                                            let pos = sorted_ids.iter().position(|&pid| pid == id);
+                                            let prev_id = pos.and_then(|p| if p > 0 { sorted_ids.get(p - 1).copied() } else { None });
+                                            let next_id = pos.and_then(|p| sorted_ids.get(p + 1).copied());
+                                            rsx! {
+                                                div { class: "flex flex-col opacity-0 group-hover/page:opacity-100 transition-opacity pr-1",
+                                                    if let Some(prev) = prev_id {
+                                                        button {
+                                                            class: "text-[10px] text-text-muted hover:text-accent px-1 leading-none",
+                                                            onclick: move |evt| {
+                                                                evt.stop_propagation();
+                                                                state::swap_page_order(id, prev);
+                                                            },
+                                                            "\u{25B2}" // up triangle
+                                                        }
+                                                    }
+                                                    if let Some(next) = next_id {
+                                                        button {
+                                                            class: "text-[10px] text-text-muted hover:text-accent px-1 leading-none",
+                                                            onclick: move |evt| {
+                                                                evt.stop_propagation();
+                                                                state::swap_page_order(id, next);
+                                                            },
+                                                            "\u{25BC}" // down triangle
+                                                        }
+                                                    }
+                                                }
+                                            }
                                         }
-                                    },
-                                    span { class: "{text_class}", "{page.title}" }
+                                    }
                                 }
                             }
                         }
