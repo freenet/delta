@@ -74,34 +74,13 @@ pub fn PageView() -> Element {
                         if *show_source.read() { "Rendered" } else { "Source" }
                     }
                     if is_owner {
-                        if *renaming.read() {
-                            input {
-                                class: "px-2 py-1 text-xs bg-transparent border-b border-accent text-text outline-none w-32",
-                                r#type: "text",
-                                value: "{rename_input}",
-                                autofocus: true,
-                                oninput: move |evt| rename_input.set(evt.value().to_string()),
-                                onkeypress: move |evt| {
-                                    if evt.key() == Key::Enter {
-                                        let new_name = rename_input.read().clone();
-                                        if !new_name.trim().is_empty() {
-                                            state::rename_page(page_id, new_name);
-                                        }
-                                        renaming.set(false);
-                                    } else if evt.key() == Key::Escape {
-                                        renaming.set(false);
-                                    }
-                                },
-                            }
-                        } else {
-                            button {
-                                class: "px-3 py-1.5 text-xs text-text-muted hover:text-accent transition-colors rounded",
-                                onclick: move |_| {
-                                    rename_input.set(page.title.clone());
-                                    renaming.set(true);
-                                },
-                                "Rename"
-                            }
+                        button {
+                            class: "px-3 py-1.5 text-xs text-text-muted hover:text-accent transition-colors rounded",
+                            onclick: move |_| {
+                                rename_input.set(page.title.clone());
+                                renaming.set(true);
+                            },
+                            "Rename"
                         }
                         button {
                             class: "px-3 py-1.5 text-xs text-text-muted hover:text-accent transition-colors rounded",
@@ -150,6 +129,55 @@ pub fn PageView() -> Element {
             div { class: "mt-16 pt-4 border-t border-border-light",
                 p { class: "text-[11px] text-text-muted-light tracking-wide",
                     "Page {page_id} · Updated {format_timestamp(page.updated_at)}"
+                }
+            }
+        }
+
+        // Rename modal
+        if *renaming.read() {
+            div {
+                class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
+                onclick: move |_| renaming.set(false),
+                div {
+                    class: "bg-panel rounded-xl shadow-lg w-80 p-5",
+                    onclick: move |evt| evt.stop_propagation(),
+                    h3 { class: "text-sm font-semibold text-text mb-3", "Rename Page" }
+                    input {
+                        class: "w-full px-3 py-2 bg-panel-warm border border-border-light rounded-lg text-text text-sm outline-none focus:border-accent",
+                        r#type: "text",
+                        value: "{rename_input}",
+                        autofocus: true,
+                        oninput: move |evt| rename_input.set(evt.value().to_string()),
+                        onkeypress: move |evt| {
+                            if evt.key() == Key::Enter {
+                                let new_name = rename_input.read().clone();
+                                if !new_name.trim().is_empty() {
+                                    state::rename_page(page_id, new_name);
+                                }
+                                renaming.set(false);
+                            } else if evt.key() == Key::Escape {
+                                renaming.set(false);
+                            }
+                        },
+                    }
+                    div { class: "flex gap-3 mt-4 justify-end",
+                        button {
+                            class: "px-4 py-2 text-sm text-accent border border-accent hover:bg-accent hover:text-text-inverse rounded-lg transition-colors font-medium",
+                            onclick: move |_| {
+                                let new_name = rename_input.read().clone();
+                                if !new_name.trim().is_empty() {
+                                    state::rename_page(page_id, new_name);
+                                }
+                                renaming.set(false);
+                            },
+                            "OK"
+                        }
+                        button {
+                            class: "px-4 py-2 text-sm text-text-muted hover:text-text transition-colors rounded",
+                            onclick: move |_| renaming.set(false),
+                            "Cancel"
+                        }
+                    }
                 }
             }
         }
