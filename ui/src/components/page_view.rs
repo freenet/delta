@@ -77,6 +77,8 @@ pub fn PageView() -> Element {
                         button {
                             class: "px-3 py-1.5 text-xs text-text-muted hover:text-accent transition-colors rounded",
                             onclick: move |_| {
+                                #[cfg(target_arch = "wasm32")]
+                                web_sys::console::log_1(&"Delta: Rename clicked".into());
                                 rename_input.set(page.title.clone());
                                 renaming.set(true);
                             },
@@ -133,10 +135,10 @@ pub fn PageView() -> Element {
             }
         }
 
-        // Rename modal
+        // Rename modal - uses absolute positioning (fixed doesn't work in sandboxed iframes)
         if *renaming.read() {
             div {
-                class: "fixed inset-0 bg-black/50 flex items-center justify-center z-50",
+                style: "position: absolute; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 50;",
                 onclick: move |_| renaming.set(false),
                 div {
                     class: "bg-panel rounded-xl shadow-lg w-80 p-5",
