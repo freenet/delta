@@ -246,7 +246,10 @@ fn resolve_page_links(content: &str) -> String {
                 }
             };
 
-            result.push_str(&resolved.unwrap_or_else(|| format!("[[{link_content}]]")));
+            result.push_str(&resolved.unwrap_or_else(|| {
+                // Broken link - render as styled warning text
+                format!("<span style=\"color: var(--color-text-muted); text-decoration: line-through;\" title=\"Page not found\">[[{link_content}]]</span>")
+            }));
             rest = &after_open[end + 2..];
         } else {
             result.push_str("[[");

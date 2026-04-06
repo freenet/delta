@@ -280,6 +280,9 @@ fn handle_signed_config(signed_config: delta_core::SignedConfig) {
 /// After receiving a signed deletion, update local state and send to network.
 fn handle_signed_deletion(deletion: delta_core::SignedPageDeletion) {
     let page_id = deletion.page_id;
+    log(&format!(
+        "Delta: handling signed deletion for page {page_id}"
+    ));
     let pending = PENDING_UPDATES.write().remove(&find_pending_key(page_id));
 
     let prefix = state::CURRENT_SITE.read().clone();
@@ -291,12 +294,19 @@ fn handle_signed_deletion(deletion: delta_core::SignedPageDeletion) {
     }
 
     if let Some(contract_key) = pending {
+        log(&format!(
+            "Delta: sending deletion UPDATE to network for page {page_id}"
+        ));
         let delta = delta_core::SiteStateDelta {
             config: None,
             page_updates: BTreeMap::new(),
             page_deletions: vec![deletion],
         };
         super::operations::update_site(&contract_key, &delta);
+    } else {
+        log(&format!(
+            "Delta: no pending contract key for deletion of page {page_id} - not sent to network"
+        ));
     }
 }
 
