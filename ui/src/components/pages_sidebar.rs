@@ -125,6 +125,9 @@ pub fn PagesSidebar() -> Element {
                                             }
                                         },
                                         span { class: "{text_class}", "{page.title}" }
+                                        if is_owner && is_selected {
+                                            span { class: "text-[9px] text-text-muted ml-1 opacity-0 group-hover/page:opacity-100 transition-opacity", "rename" }
+                                        }
                                     }
                                     // Move up/down arrows (owner only, on hover)
                                     if is_owner && is_selected {
