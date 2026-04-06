@@ -36,7 +36,7 @@ const fn hex_nibble(b: u8) -> u8 {
         b'0'..=b'9' => b - b'0',
         b'a'..=b'f' => b - b'a' + 10,
         b'A'..=b'F' => b - b'A' + 10,
-        _ => 0,
+        _ => panic!("invalid hex character in OLD_WASM_HASH"),
     }
 }
 
@@ -119,6 +119,18 @@ fn handle_contract_response(response: ContractResponse) {
         }
         ContractResponse::UpdateResponse { key, .. } => {
             log(&format!("Delta: UPDATE succeeded for {key}"));
+        }
+        ContractResponse::NotFound { instance_id } => {
+            let key_b58 = instance_id.encode();
+            log(&format!("Delta: contract not found: {key_b58}"));
+            // Clean up any pending migration for this key
+            if let Some(prefix) = PENDING_MIGRATIONS.write().remove(&key_b58) {
+                log(&format!(
+                    "Delta: old contract gone for site {prefix}, falling back to new key"
+                ));
+                let new_key = state::contract_key_from_prefix(&prefix);
+                get_site(&new_key);
+            }
         }
         other => {
             log(&format!("Delta: unhandled contract response: {other:?}"));
