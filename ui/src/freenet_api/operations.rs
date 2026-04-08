@@ -51,8 +51,8 @@ pub fn handle_response(response: HostResponse) {
         HostResponse::ContractResponse(contract_response) => {
             handle_contract_response(contract_response);
         }
-        HostResponse::DelegateResponse { key: _, values } => {
-            super::delegate::handle_delegate_response(values);
+        HostResponse::DelegateResponse { key, values } => {
+            super::delegate::handle_delegate_response(key, values);
         }
         HostResponse::Ok => {}
         other => {

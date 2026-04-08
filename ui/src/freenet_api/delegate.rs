@@ -30,6 +30,14 @@ pub static PENDING_UPDATES: GlobalSignal<BTreeMap<(String, PageId), ContractKey>
 /// Pending config update waiting for delegate signature.
 static PENDING_CONFIG: GlobalSignal<Option<ContractKey>> = GlobalSignal::new(|| None);
 
+/// Legacy delegate that holds the signing key (when current delegate has none).
+/// Stores (delegate_key_bytes, code_hash_bytes) so we can reconstruct the DelegateKey.
+static LEGACY_SIGNING_DELEGATE: GlobalSignal<Option<([u8; 32], [u8; 32])>> =
+    GlobalSignal::new(|| None);
+
+/// Whether the current delegate has a signing key.
+static HAS_CURRENT_KEY: GlobalSignal<bool> = GlobalSignal::new(|| false);
+
 /// Register the site delegate with the Freenet node.
 pub fn register_delegate() {
     #[cfg(target_arch = "wasm32")]
@@ -116,7 +124,7 @@ pub fn request_sign_page(
         content,
         updated_at,
     };
-    send_delegate_request(&request);
+    send_signing_request(&request);
 }
 
 /// Ask the delegate to sign a page deletion.
@@ -134,7 +142,7 @@ pub fn request_sign_deletion(
         page_id,
         deleted_at,
     };
-    send_delegate_request(&request);
+    send_signing_request(&request);
 }
 
 /// Ask the delegate to sign a config update (e.g. rename).
@@ -150,7 +158,7 @@ pub fn request_sign_config(site_prefix: &str, contract_key: ContractKey, new_nam
     drop(sites);
 
     let request = delta_core::DelegateRequest::SignConfig { config };
-    send_delegate_request(&request);
+    send_signing_request(&request);
     let _ = new_name; // name already set in config
 }
 
@@ -160,8 +168,17 @@ fn request_public_key() {
     send_delegate_request(&request);
 }
 
+/// Compute the current delegate key.
+fn current_delegate_key() -> DelegateKey {
+    let delegate_code = DelegateCode::from(SITE_DELEGATE_WASM.to_vec());
+    let params = Parameters::from(Vec::<u8>::new());
+    let delegate = Delegate::from((&delegate_code, &params));
+    delegate.key().clone()
+}
+
 /// Handle a delegate response — route signed objects to the network.
-pub fn handle_delegate_response(values: Vec<OutboundDelegateMsg>) {
+pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<OutboundDelegateMsg>) {
+    let is_legacy = responding_key != current_delegate_key();
     for msg in values {
         if let OutboundDelegateMsg::ApplicationMessage(app_msg) = msg {
             let response: DelegateResponse = match from_reader(app_msg.payload.as_slice()) {
@@ -176,10 +193,13 @@ pub fn handle_delegate_response(values: Vec<OutboundDelegateMsg>) {
             match response {
                 DelegateResponse::KeyStored => {
                     log("Delta: signing key stored in delegate");
+                    if !is_legacy {
+                        *HAS_CURRENT_KEY.write() = true;
+                    }
                 }
                 DelegateResponse::SigningKey(key_bytes) => {
                     log("Delta: received signing key from delegate");
-                    // Always store key in current delegate (idempotent; handles migration case)
+                    // Store key in current delegate (migrates it from legacy)
                     if let Ok(key_arr) = <[u8; 32]>::try_from(key_bytes.as_slice()) {
                         store_signing_key(&key_arr);
                     }
@@ -188,7 +208,18 @@ pub fn handle_delegate_response(values: Vec<OutboundDelegateMsg>) {
                 }
                 DelegateResponse::PublicKey(vk) => {
                     let prefix = delta_core::pubkey_to_prefix(&vk);
-                    log(&format!("Delta: delegate has key for site prefix {prefix}"));
+                    if is_legacy {
+                        log(&format!(
+                            "Delta: legacy delegate has signing key for site {prefix}"
+                        ));
+                        // Store the legacy delegate key for routing signing requests
+                        let key_bytes: [u8; 32] = responding_key.bytes().try_into().unwrap();
+                        let code_hash: [u8; 32] = **responding_key.code_hash();
+                        *LEGACY_SIGNING_DELEGATE.write() = Some((key_bytes, code_hash));
+                    } else {
+                        log(&format!("Delta: delegate has key for site prefix {prefix}"));
+                        *HAS_CURRENT_KEY.write() = true;
+                    }
                     // Mark the site as owner if we have it
                     let mut sites = state::SITES.write();
                     if let Some(site) = sites.get_mut(&prefix) {
@@ -326,21 +357,35 @@ fn find_pending_key(page_id: PageId) -> (String, PageId) {
     (prefix, page_id)
 }
 
-/// Public wrapper so export_key module can send delegate requests.
+/// Public wrapper so export_key module can send signing-related delegate requests.
 pub fn send_delegate_request_pub(request: &delta_core::DelegateRequest) {
-    send_delegate_request(request);
+    send_signing_request(request);
 }
 
+/// Send a request to the current delegate.
 fn send_delegate_request(request: &delta_core::DelegateRequest) {
+    send_to_delegate_key(request, current_delegate_key());
+}
+
+/// Send a signing request. Uses the legacy delegate if the current one has no key.
+fn send_signing_request(request: &delta_core::DelegateRequest) {
+    let key = if *HAS_CURRENT_KEY.read() {
+        current_delegate_key()
+    } else if let Some((key_bytes, code_hash_bytes)) = *LEGACY_SIGNING_DELEGATE.read() {
+        log("Delta: routing signing request through legacy delegate");
+        DelegateKey::new(key_bytes, CodeHash::new(code_hash_bytes))
+    } else {
+        // No key anywhere -- send to current delegate (will return error)
+        current_delegate_key()
+    };
+    send_to_delegate_key(request, key);
+}
+
+fn send_to_delegate_key(request: &delta_core::DelegateRequest, delegate_key: DelegateKey) {
     #[cfg(target_arch = "wasm32")]
     {
         let mut payload = Vec::new();
         into_writer(request, &mut payload).expect("CBOR serialization");
-
-        let delegate_code = DelegateCode::from(SITE_DELEGATE_WASM.to_vec());
-        let params = Parameters::from(Vec::<u8>::new());
-        let delegate = Delegate::from((&delegate_code, &params));
-        let delegate_key = delegate.key().clone();
 
         let app_msg = ApplicationMessage::new(payload).processed(false);
 
@@ -362,7 +407,7 @@ fn send_delegate_request(request: &delta_core::DelegateRequest) {
     }
     #[cfg(not(target_arch = "wasm32"))]
     {
-        let _ = request;
+        let _ = (request, delegate_key);
     }
 }
 
