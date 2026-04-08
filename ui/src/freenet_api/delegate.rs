@@ -177,6 +177,10 @@ pub fn handle_delegate_response(values: Vec<OutboundDelegateMsg>) {
                 DelegateResponse::KeyStored => {
                     log("Delta: signing key stored in delegate");
                 }
+                DelegateResponse::SigningKey(key_bytes) => {
+                    log("Delta: received signing key from delegate for export");
+                    crate::components::export_key::handle_signing_key_response(key_bytes);
+                }
                 DelegateResponse::PublicKey(vk) => {
                     let prefix = delta_core::pubkey_to_prefix(&vk);
                     log(&format!("Delta: delegate has key for site prefix {prefix}"));
@@ -315,6 +319,11 @@ fn handle_signed_deletion(deletion: delta_core::SignedPageDeletion) {
 fn find_pending_key(page_id: PageId) -> (String, PageId) {
     let prefix = state::CURRENT_SITE.read().clone().unwrap_or_default();
     (prefix, page_id)
+}
+
+/// Public wrapper so export_key module can send delegate requests.
+pub fn send_delegate_request_pub(request: &delta_core::DelegateRequest) {
+    send_delegate_request(request);
 }
 
 fn send_delegate_request(request: &delta_core::DelegateRequest) {

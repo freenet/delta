@@ -156,7 +156,7 @@ pub fn PagesSidebar() -> Element {
                     button {
                         class: "w-full px-3 py-1.5 text-[10px] text-text-muted hover:text-accent transition-colors",
                         onclick: move |_| {
-                            *crate::components::export_key::SHOW_EXPORT.write() = true;
+                            crate::components::export_key::request_export();
                         },
                         "Export Site Key"
                     }

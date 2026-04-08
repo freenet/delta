@@ -552,6 +552,8 @@ pub enum DelegateRequest {
     SignConfig { config: SiteConfig },
     /// Get the owner's public key.
     GetPublicKey,
+    /// Get the owner's signing key (for export). Returns the raw private key bytes.
+    GetSigningKey,
     /// Store the list of known sites (for persistence across refreshes).
     StoreKnownSites { sites: Vec<KnownSiteRecord> },
     /// Retrieve the list of known sites.
@@ -571,6 +573,8 @@ pub enum DelegateResponse {
     SignedConfig(SignedConfig),
     /// The owner's public key.
     PublicKey(VerifyingKey),
+    /// The owner's signing key (for export).
+    SigningKey(Vec<u8>),
     /// Stored known sites.
     SitesStored,
     /// Retrieved known sites.

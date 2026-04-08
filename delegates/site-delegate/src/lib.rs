@@ -99,6 +99,11 @@ fn handle_app_message(
             Err(e) => DelegateResponse::Error(e),
         },
 
+        DelegateRequest::GetSigningKey => match load_signing_key(ctx) {
+            Ok(key) => DelegateResponse::SigningKey(key.to_bytes().to_vec()),
+            Err(e) => DelegateResponse::Error(e),
+        },
+
         DelegateRequest::StoreKnownSites { sites } => {
             let mut buf = Vec::new();
             into_writer(&sites, &mut buf)
