@@ -68,8 +68,8 @@ cd ..
 cp ui/assets/styles.css target/dx/delta-ui/release/web/public/
 cp ui/assets/main.css target/dx/delta-ui/release/web/public/
 cd target/dx/delta-ui/release/web/public
-tar -cJf ../../../webapp/webapp.tar.xz *
-cd ../../../../..
+tar -cJf ../../../../../../target/webapp/webapp.tar.xz *
+cd ../../../../../..
 WCT=$(which web-container-tool 2>/dev/null || echo "/home/ian/code/freenet/river/main/target/native/x86_64-unknown-linux-gnu/release/web-container-tool")
 VERSION=$(($(date +%s) / 60))
 $WCT sign \

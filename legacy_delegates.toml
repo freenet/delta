@@ -13,5 +13,23 @@
 # To validate entries: cargo test -p delta-core --test migration_test
 # To sync WASMs:       ./scripts/sync-wasm.sh
 
-# No entries yet — this is the initial release.
-# When site_delegate.wasm changes, run add-migration.sh BEFORE rebuilding.
+[[entry]]
+version = "V1"
+description = "Initial release (ccb0b9f)"
+date = "2026-03-28"
+code_hash = "2e590420a9718a6c2b358e3695ff9767726828763e781f3fbad45203952eab72"
+delegate_key = "168c48aba270cf20552e02265ab5801bdf5646c55c839531e21494a634d3597f"
+
+[[entry]]
+version = "V2"
+description = "Parameters changed to 10-char prefix (2e664c3)"
+date = "2026-03-29"
+code_hash = "5c0ee5d24a91122b9f17217f01ef2cb12b72d516953b081ecbe4aea71324a9f5"
+delegate_key = "1dd5fe7c8abd3641fb1aa6075f44c4ca1cb0f94d7bc6f4577d3230baa68cb8af"
+
+[[entry]]
+version = "V3"
+description = "Added known sites persistence (b82d3bc)"
+date = "2026-03-30"
+code_hash = "1224d52d5175a937e512d8bd8c6c8a08c48f5b7c4bc7aa4e5cc1305bceb170d6"
+delegate_key = "b0cf1eb48f7437e2116016b4d0fd71af19afb8c44f147da65da2958e144e4cbf"
