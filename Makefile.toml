@@ -57,9 +57,53 @@ fi
 description = "Rebuild and copy contract/delegate WASMs to committed locations"
 script = "./scripts/sync-wasm.sh"
 
+[tasks.check-migration]
+description = "Verify delegate WASM is up-to-date and migration entries exist"
+script = '''
+#!/bin/bash
+set -euo pipefail
+
+echo "=== Pre-publish delegate WASM check ==="
+
+# 1. Rebuild delegate from source
+cargo build --release --target wasm32-unknown-unknown -p site-delegate 2>/dev/null
+
+COMMITTED="ui/public/contracts/site_delegate.wasm"
+BUILT="target/wasm32-unknown-unknown/release/site_delegate.wasm"
+TOML="legacy_delegates.toml"
+
+COMMITTED_HASH=$(b3sum "$COMMITTED" | cut -d' ' -f1)
+BUILT_HASH=$(b3sum "$BUILT" | cut -d' ' -f1)
+
+if [ "$COMMITTED_HASH" = "$BUILT_HASH" ]; then
+    echo "Delegate WASM is up-to-date (hash: ${COMMITTED_HASH:0:16}...)."
+    exit 0
+fi
+
+echo ""
+echo "!!! DELEGATE WASM HAS CHANGED !!!"
+echo "  committed: $COMMITTED_HASH"
+echo "  built:     $BUILT_HASH"
+echo ""
+
+# Check if the OLD (committed) hash is in legacy_delegates.toml
+if grep -qF "$COMMITTED_HASH" "$TOML"; then
+    echo "Old hash is already in $TOML. Run ./scripts/sync-wasm.sh to update."
+    exit 1
+fi
+
+echo "Old hash is NOT in $TOML. You must add a migration entry first!"
+echo ""
+echo "Run these commands:"
+echo "  ./scripts/add-migration.sh VERSION \"DESCRIPTION\""
+echo "  ./scripts/sync-wasm.sh"
+echo ""
+exit 1
+'''
+
 [tasks.publish-delta]
 description = "Build, sign, and publish Delta to Freenet"
-dependencies = ["build-tailwind"]
+dependencies = ["build-tailwind", "check-migration"]
 script = '''
 #!/bin/bash
 set -e
