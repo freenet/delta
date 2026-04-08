@@ -22,7 +22,8 @@ pub fn Editor() -> Element {
 
     let title = state::EDITOR_TITLE.read().clone();
     let content = state::EDITOR_CONTENT.read().clone();
-    let preview_html = markdown::to_html(&content);
+    let preview_html = markdown::to_html_with_options(&content, &markdown::Options::gfm())
+        .unwrap_or_else(|_| markdown::to_html(&content));
 
     // Autocomplete state
     let mut ac_query = use_signal(|| None::<String>);

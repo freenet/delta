@@ -187,7 +187,8 @@ pub fn PageView() -> Element {
 /// Render markdown to HTML, resolving `[[id|text]]` page links as hash links.
 fn render_markdown(content: &str) -> String {
     let resolved = resolve_page_links(content);
-    markdown::to_html(&resolved)
+    markdown::to_html_with_options(&resolved, &markdown::Options::gfm())
+        .unwrap_or_else(|_| markdown::to_html(&resolved))
 }
 
 /// Replace page links with hash-routed markdown links.
