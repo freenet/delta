@@ -514,6 +514,11 @@ fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
     for record in records {
         let prefix = record.prefix.clone();
 
+        // Don't restore sites the user explicitly removed
+        if state::REMOVED_PREFIXES.read().contains(&prefix) {
+            continue;
+        }
+
         // Skip if already loaded (e.g. from hash route), but still fix owner role
         if state::SITES.read().contains_key(&prefix) {
             if delta_core::is_site_owned(record.is_owner, &prefix, &OWNER_PREFIXES.read()) {

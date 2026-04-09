@@ -38,6 +38,10 @@ pub static SHOW_ADD_SITE: GlobalSignal<bool> = GlobalSignal::new(|| false);
 pub static EDITOR_TITLE: GlobalSignal<String> = GlobalSignal::new(String::new);
 pub static EDITOR_CONTENT: GlobalSignal<String> = GlobalSignal::new(String::new);
 
+/// Prefixes that the user has explicitly removed this session.
+/// Prevents network responses from re-adding them.
+pub static REMOVED_PREFIXES: GlobalSignal<Vec<String>> = GlobalSignal::new(Vec::new);
+
 // ---------------------------------------------------------------------------
 // Initialization
 // ---------------------------------------------------------------------------
@@ -162,6 +166,11 @@ pub fn rename_site(prefix: &str, new_name: String) {
 
 /// Remove a site from the sidebar.
 pub fn remove_site(prefix: &str) {
+    REMOVED_PREFIXES.with_mut(|removed| {
+        if !removed.contains(&prefix.to_string()) {
+            removed.push(prefix.to_string());
+        }
+    });
     SITES.with_mut(|sites| {
         sites.remove(prefix);
     });

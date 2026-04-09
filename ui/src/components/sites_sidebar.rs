@@ -42,7 +42,7 @@ pub fn SitesSidebar() -> Element {
                         for (prefix, site) in owned.iter() {
                             SiteRow {
                                 key: "{prefix}",
-                                prefix: prefix.clone(),
+                                prefix: prefix.to_string(),
                                 name: site.name.clone(),
                                 site_prefix: site.prefix.clone(),
                                 is_selected: current_prefix.as_deref() == Some(prefix.as_str()),
@@ -57,7 +57,7 @@ pub fn SitesSidebar() -> Element {
                         for (prefix, site) in visited.iter() {
                             SiteRow {
                                 key: "{prefix}",
-                                prefix: prefix.clone(),
+                                prefix: prefix.to_string(),
                                 name: site.name.clone(),
                                 site_prefix: site.prefix.clone(),
                                 is_selected: current_prefix.as_deref() == Some(prefix.as_str()),

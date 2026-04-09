@@ -174,6 +174,11 @@ fn handle_site_state(key: ContractKey, state_bytes: &[u8]) {
         prefix_from_pubkey
     };
 
+    // Don't re-add sites the user explicitly removed
+    if state::REMOVED_PREFIXES.read().contains(&prefix) {
+        return;
+    }
+
     let mut sites = state::SITES.write();
     if let Some(existing) = sites.get_mut(&prefix) {
         existing.state = site_state;

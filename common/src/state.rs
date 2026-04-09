@@ -712,7 +712,7 @@ mod tests {
     fn reject_page_with_wrong_signer() {
         let owner = gen_key();
         let attacker = gen_key();
-        let params = make_params(&owner);
+        let _params = make_params(&owner);
 
         let mut site = SiteState::new(SiteConfig::default(), &owner);
 
@@ -724,7 +724,7 @@ mod tests {
     #[test]
     fn page_update_replaces_content() {
         let owner = gen_key();
-        let params = make_params(&owner);
+        let _params = make_params(&owner);
         let mut site = SiteState::new(SiteConfig::default(), &owner);
 
         let page_v1 = Page::new(1, "Home".into(), "# V1".into(), 1000, &owner);
@@ -741,7 +741,7 @@ mod tests {
     #[test]
     fn rename_preserves_id() {
         let owner = gen_key();
-        let params = make_params(&owner);
+        let _params = make_params(&owner);
         let mut site = SiteState::new(SiteConfig::default(), &owner);
 
         let page = Page::new(1, "Old Title".into(), "content".into(), 1000, &owner);
@@ -758,7 +758,7 @@ mod tests {
     #[test]
     fn delete_page() {
         let owner = gen_key();
-        let params = make_params(&owner);
+        let _params = make_params(&owner);
         let mut site = SiteState::new(SiteConfig::default(), &owner);
 
         let page = Page::new(1, "Home".into(), "content".into(), 1000, &owner);
@@ -813,7 +813,7 @@ mod tests {
     #[test]
     fn next_page_id_advances() {
         let owner = gen_key();
-        let params = make_params(&owner);
+        let _params = make_params(&owner);
         let mut site = SiteState::new(SiteConfig::default(), &owner);
 
         let p1 = Page::new(1, "A".into(), "a".into(), 1000, &owner);

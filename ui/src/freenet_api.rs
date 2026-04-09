@@ -6,4 +6,4 @@ pub(crate) mod delegate;
 mod operations;
 
 pub use connection::{connect_to_freenet, ConnectionStatus, CONNECTION_STATUS};
-pub use operations::{get_site, put_site, update_site};
+pub use operations::{get_site, put_site};
