@@ -424,6 +424,7 @@ pub fn create_page(title: String) {
                 title.clone(),
                 String::new(),
                 now,
+                0,
             );
             // Optimistically add to local state with placeholder sig
             let mut sites = SITES.write();
@@ -477,6 +478,11 @@ pub fn save_current_page() {
         .get(&prefix)
         .map(|s| s.role == SiteRole::Owner)
         .unwrap_or(false);
+    let order = sites
+        .get(&prefix)
+        .and_then(|s| s.state.pages.get(&page_id))
+        .map(|p| p.order)
+        .unwrap_or(0);
     drop(sites);
 
     if is_owner {
@@ -489,6 +495,7 @@ pub fn save_current_page() {
                 title.clone(),
                 content.clone(),
                 now,
+                order,
             );
         }
     }
@@ -540,8 +547,14 @@ pub fn rename_page(page_id: PageId, new_title: String) {
 
     // Sign via delegate and UPDATE network
     if let Some(ck) = contract_key {
+        let order = SITES
+            .read()
+            .get(&prefix)
+            .and_then(|s| s.state.pages.get(&page_id))
+            .map(|p| p.order)
+            .unwrap_or(0);
         crate::freenet_api::delegate::request_sign_page(
-            &prefix, ck, page_id, new_title, content, now,
+            &prefix, ck, page_id, new_title, content, now, order,
         );
     }
 }
@@ -578,8 +591,7 @@ pub fn swap_page_order(page_a: PageId, page_b: PageId) {
         }
     });
 
-    // Order is not part of the page signature, so we can send the existing
-    // signed pages with updated order directly as an UPDATE delta.
+    // Order is part of the v2 signature, so we need to re-sign both pages.
     let sites = SITES.read();
     let site = match sites.get(&prefix) {
         Some(s) => s,
@@ -589,19 +601,19 @@ pub fn swap_page_order(page_a: PageId, page_b: PageId) {
         Some(ck) => ck,
         None => return,
     };
-    let mut page_updates = std::collections::BTreeMap::new();
     for &pid in &[page_a, page_b] {
         if let Some(page) = site.state.pages.get(&pid) {
-            page_updates.insert(pid, page.clone());
+            crate::freenet_api::delegate::request_sign_page(
+                &prefix,
+                contract_key,
+                pid,
+                page.title.clone(),
+                page.content.clone(),
+                now_secs(),
+                page.order,
+            );
         }
     }
-    drop(sites);
-    let delta = delta_core::SiteStateDelta {
-        config: None,
-        page_updates,
-        page_deletions: Vec::new(),
-    };
-    crate::freenet_api::update_site(&contract_key, &delta);
 }
 
 pub fn delete_page(page_id: PageId) {

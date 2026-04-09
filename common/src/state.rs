@@ -225,7 +225,7 @@ pub struct Page {
 }
 
 impl Page {
-    /// Create a new signed page.
+    /// Create a new signed page (v2 signature includes order).
     pub fn new(
         page_id: PageId,
         title: String,
@@ -233,21 +233,46 @@ impl Page {
         updated_at: u64,
         owner_key: &SigningKey,
     ) -> Self {
-        let bytes = page_signing_bytes(page_id, &title, &content, updated_at);
+        Self::new_with_order(page_id, title, content, updated_at, 0, owner_key)
+    }
+
+    /// Create a signed page with a specific order.
+    pub fn new_with_order(
+        page_id: PageId,
+        title: String,
+        content: String,
+        updated_at: u64,
+        order: u32,
+        owner_key: &SigningKey,
+    ) -> Self {
+        let bytes = page_signing_bytes_v2(page_id, &title, &content, updated_at, order);
         Self {
             title,
             content,
             updated_at,
             signature: sign_bytes(&bytes, owner_key),
-            order: 0,
+            order,
         }
     }
 
-    /// Verify the page signature.
+    /// Verify the page signature. Tries v2 (with order) first, then falls
+    /// back to v1 (without order) for pages signed before order was added.
     pub fn verify(&self, page_id: PageId, owner: &VerifyingKey) -> Result<(), String> {
-        let bytes = page_signing_bytes(page_id, &self.title, &self.content, self.updated_at);
+        // Try v2 first (includes order)
+        let v2_bytes = page_signing_bytes_v2(
+            page_id,
+            &self.title,
+            &self.content,
+            self.updated_at,
+            self.order,
+        );
+        if owner.verify(&v2_bytes, &self.signature).is_ok() {
+            return Ok(());
+        }
+        // Fall back to v1 (no order) for backwards compatibility
+        let v1_bytes = page_signing_bytes_v1(page_id, &self.title, &self.content, self.updated_at);
         owner
-            .verify(&bytes, &self.signature)
+            .verify(&v1_bytes, &self.signature)
             .map_err(|e| format!("invalid page signature for page {page_id}: {e}"))
     }
 }
@@ -447,13 +472,32 @@ fn config_signing_bytes(config: &SiteConfig) -> Vec<u8> {
     buf
 }
 
-fn page_signing_bytes(page_id: PageId, title: &str, content: &str, updated_at: u64) -> Vec<u8> {
+/// V1 signing bytes: does NOT include order (for backwards compatibility).
+fn page_signing_bytes_v1(page_id: PageId, title: &str, content: &str, updated_at: u64) -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(b"delta:page:");
     buf.extend_from_slice(&page_id.to_le_bytes());
     buf.extend_from_slice(title.as_bytes());
     buf.extend_from_slice(content.as_bytes());
     buf.extend_from_slice(&updated_at.to_le_bytes());
+    buf
+}
+
+/// V2 signing bytes: includes order to prevent unauthorized reordering.
+fn page_signing_bytes_v2(
+    page_id: PageId,
+    title: &str,
+    content: &str,
+    updated_at: u64,
+    order: u32,
+) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(b"delta:page:v2:");
+    buf.extend_from_slice(&page_id.to_le_bytes());
+    buf.extend_from_slice(title.as_bytes());
+    buf.extend_from_slice(content.as_bytes());
+    buf.extend_from_slice(&updated_at.to_le_bytes());
+    buf.extend_from_slice(&order.to_le_bytes());
     buf
 }
 
@@ -561,6 +605,8 @@ pub enum DelegateRequest {
         title: String,
         content: String,
         updated_at: u64,
+        #[serde(default)]
+        order: u32,
         #[serde(default)]
         prefix: Option<String>,
     },

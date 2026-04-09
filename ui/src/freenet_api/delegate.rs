@@ -133,6 +133,7 @@ pub fn request_sign_page(
     title: String,
     content: String,
     updated_at: u64,
+    order: u32,
 ) {
     // Register pending update so the response handler knows where to send it
     PENDING_UPDATES
@@ -144,6 +145,7 @@ pub fn request_sign_page(
         title,
         content,
         updated_at,
+        order,
         prefix: Some(site_prefix.to_string()),
     };
     send_signing_request(&request);

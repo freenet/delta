@@ -74,10 +74,11 @@ fn handle_app_message(
             title,
             content,
             updated_at,
+            order,
             prefix,
         } => match load_signing_key(ctx, prefix.as_deref()) {
             Ok(key) => {
-                let page = Page::new(page_id, title, content, updated_at, &key);
+                let page = Page::new_with_order(page_id, title, content, updated_at, order, &key);
                 DelegateResponse::SignedPage { page_id, page }
             }
             Err(e) => DelegateResponse::Error(e),

@@ -47,3 +47,10 @@ description = "Before per-site signing key storage"
 date = "2026-04-09"
 delegate_key = "16456f8a8eabb50072659ffc441fcfc798534a9b0a924048d3419aade256dea7"
 code_hash = "9694b6c553a83696932b479f0662a7181de7008a430f831d6773c4ce70575c0f"
+
+[[entry]]
+version = "V6"
+description = "Before signed page order"
+date = "2026-04-09"
+delegate_key = "67e5be4df8bbb06addbee8993ca4b3fbe5d3c10b1cd98e01a2e752a558fad420"
+code_hash = "5cac3e5ba33c3995536456dde35d027e23ed9cd5969e0b43b5d904843dddd0e4"
