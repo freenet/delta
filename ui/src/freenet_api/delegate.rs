@@ -446,8 +446,7 @@ fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
 
         // Skip if already loaded (e.g. from hash route), but still fix owner role
         if state::SITES.read().contains_key(&prefix) {
-            let is_owner = record.is_owner || OWNER_PREFIXES.read().contains(&prefix);
-            if is_owner {
+            if delta_core::is_site_owned(record.is_owner, &prefix, &OWNER_PREFIXES.read()) {
                 let mut sites = state::SITES.write();
                 if let Some(site) = sites.get_mut(&prefix) {
                     site.role = state::SiteRole::Owner;
@@ -457,7 +456,7 @@ fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
         }
 
         // Check if PublicKey already confirmed ownership (may arrive before KnownSites)
-        let role = if record.is_owner || OWNER_PREFIXES.read().contains(&prefix) {
+        let role = if delta_core::is_site_owned(record.is_owner, &prefix, &OWNER_PREFIXES.read()) {
             state::SiteRole::Owner
         } else {
             state::SiteRole::Visitor

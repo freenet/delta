@@ -9,19 +9,28 @@ pub static SHOW_EXPORT: GlobalSignal<bool> = GlobalSignal::new(|| false);
 /// The armored export token (set by delegate response handler).
 pub static EXPORT_TOKEN: GlobalSignal<Option<String>> = GlobalSignal::new(|| None);
 
+/// Error message when export is not possible.
+pub static EXPORT_ERROR: GlobalSignal<Option<String>> = GlobalSignal::new(|| None);
+
 /// Request the signing key from the delegate for export.
 pub fn request_export() {
-    // Clear any previous token
+    // Clear previous state
     *EXPORT_TOKEN.write() = None;
-    *SHOW_EXPORT.write() = true;
+    *EXPORT_ERROR.write() = None;
 
     // GetSigningKey only works on the current delegate (V5+).
     // If the key is in a legacy delegate, we can't extract raw bytes.
     if !crate::freenet_api::delegate::has_current_key() {
-        *EXPORT_TOKEN.write() = Some("ERROR: Signing key is stored in a previous delegate version and cannot be exported. Create a new site to get an exportable key.".to_string());
+        *EXPORT_ERROR.write() = Some(
+            "Signing key is stored in a previous delegate version and cannot be exported. \
+             Create a new site to get an exportable key."
+                .to_string(),
+        );
+        *SHOW_EXPORT.write() = true;
         return;
     }
 
+    *SHOW_EXPORT.write() = true;
     let request = delta_core::DelegateRequest::GetSigningKey;
     crate::freenet_api::delegate::send_delegate_request_pub(&request);
 }
@@ -46,6 +55,7 @@ pub fn ExportKeyModal() -> Element {
     }
 
     let token = EXPORT_TOKEN.read().clone();
+    let error = EXPORT_ERROR.read().clone();
     let mut copied = use_signal(|| false);
 
     rsx! {
@@ -58,10 +68,20 @@ pub fn ExportKeyModal() -> Element {
                 class: "bg-panel rounded-xl shadow-lg w-96 p-6",
                 onclick: move |evt| evt.stop_propagation(),
                 h2 { class: "text-lg font-semibold text-text mb-1", "Export Site Key" }
-                p { class: "text-xs text-text-muted-light mb-4",
-                    "This token contains your private signing key. Treat it like a password - do not share it publicly. Use it to import this site's ownership on another device."
-                }
-                if let Some(armored) = &token {
+                if let Some(err) = &error {
+                    // Error state -- show message with only a Close button
+                    p { class: "text-sm text-red-400 py-6 text-center", "{err}" }
+                    div { class: "flex justify-end",
+                        button {
+                            class: "px-4 py-2 text-sm text-text-muted hover:text-text transition-colors rounded",
+                            onclick: move |_| *SHOW_EXPORT.write() = false,
+                            "Close"
+                        }
+                    }
+                } else if let Some(armored) = &token {
+                    p { class: "text-xs text-text-muted-light mb-4",
+                        "This token contains your private signing key. Treat it like a password - do not share it publicly. Use it to import this site's ownership on another device."
+                    }
                     textarea {
                         class: "w-full h-40 p-3 text-xs font-mono bg-panel-warm border border-border-light rounded-lg text-text resize-none outline-none",
                         readonly: true,
@@ -93,6 +113,9 @@ pub fn ExportKeyModal() -> Element {
                         }
                     }
                 } else {
+                    p { class: "text-xs text-text-muted-light mb-4",
+                        "This token contains your private signing key. Treat it like a password - do not share it publicly. Use it to import this site's ownership on another device."
+                    }
                     p { class: "text-sm text-text-muted-light py-8 text-center",
                         "Retrieving signing key..."
                     }

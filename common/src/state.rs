@@ -522,6 +522,18 @@ impl SiteKeyExport {
     }
 }
 
+/// Determine whether a site should be treated as owned by the current user.
+///
+/// A site is owned if EITHER the stored record says so OR a PublicKey response
+/// has confirmed ownership at runtime (which may arrive before the record is loaded).
+pub fn is_site_owned(
+    record_is_owner: bool,
+    prefix: &str,
+    confirmed_owner_prefixes: &[String],
+) -> bool {
+    record_is_owner || confirmed_owner_prefixes.contains(&prefix.to_string())
+}
+
 /// A lightweight record of a known site (stored in delegate for persistence).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KnownSiteRecord {
@@ -784,5 +796,28 @@ mod tests {
         let messy = format!("  \n{}\n  ", armored);
         let parsed = SiteKeyExport::from_armored(&messy).unwrap();
         assert_eq!(parsed.prefix, "1234567890");
+    }
+
+    #[test]
+    fn is_site_owned_record_says_owner() {
+        assert!(is_site_owned(true, "ABC", &[]));
+    }
+
+    #[test]
+    fn is_site_owned_confirmed_by_public_key() {
+        let confirmed = vec!["ABC".to_string(), "DEF".to_string()];
+        assert!(is_site_owned(false, "ABC", &confirmed));
+    }
+
+    #[test]
+    fn is_site_owned_neither() {
+        let confirmed = vec!["DEF".to_string()];
+        assert!(!is_site_owned(false, "ABC", &confirmed));
+    }
+
+    #[test]
+    fn is_site_owned_both() {
+        let confirmed = vec!["ABC".to_string()];
+        assert!(is_site_owned(true, "ABC", &confirmed));
     }
 }
