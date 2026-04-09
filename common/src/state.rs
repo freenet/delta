@@ -881,4 +881,33 @@ mod tests {
         let confirmed = vec!["ABC".to_string()];
         assert!(is_site_owned(true, "ABC", &confirmed));
     }
+
+    #[test]
+    fn page_order_is_signed() {
+        let owner = gen_key();
+        let page = Page::new_with_order(1, "Title".into(), "Content".into(), 100, 5, &owner);
+        // Verify with correct order succeeds
+        assert!(page.verify(1, &owner.verifying_key()).is_ok());
+        // Tamper with order -- verification must fail
+        let mut tampered = page.clone();
+        tampered.order = 10;
+        assert!(tampered.verify(1, &owner.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn old_pages_without_order_still_verify() {
+        let owner = gen_key();
+        // Simulate a v1 page (signed without order)
+        let bytes = page_signing_bytes_v1(1, "Title", "Content", 100);
+        let sig = sign_bytes(&bytes, &owner);
+        let page = Page {
+            title: "Title".into(),
+            content: "Content".into(),
+            updated_at: 100,
+            signature: sig,
+            order: 0,
+        };
+        // Should pass via v1 fallback
+        assert!(page.verify(1, &owner.verifying_key()).is_ok());
+    }
 }

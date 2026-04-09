@@ -38,6 +38,17 @@ SiteState {
 
 All content is signed by the owner. Pages have stable IDs that don't change on rename.
 
+### CRITICAL: All State Fields Must Be Authenticated
+
+**Every field in the contract state MUST be covered by a cryptographic signature.** Freenet contracts run on untrusted peers who can modify state. The contract validates signatures, but only for fields included in the signing bytes. An unsigned field is world-writable.
+
+When adding a new field to any signed struct (Page, SignedConfig, SignedPageDeletion):
+1. Include it in the signing bytes immediately
+2. If backwards compatibility is needed, use a versioned signature (try v2 first, fall back to v1)
+3. Add a test verifying the new field is covered by the signature
+
+Page signatures use v2 format (`delta:page:v2:`) which covers: page_id, title, content, updated_at, order. V1 fallback (without order) exists for pre-existing pages.
+
 ### Page Links
 
 - `[[2]]` - renders as current page title, auto-updates on rename
@@ -49,8 +60,9 @@ Autocomplete inserts `[[id]]` format.
 ### Delegate Storage
 
 The delegate stores:
-- **Signing key**: `delta:signing_key` - the Ed25519 private key
+- **Signing keys**: `delta:signing_key:{prefix}` - per-site Ed25519 private keys (legacy: `delta:signing_key`)
 - **Known sites**: `delta:known_sites` - list of sites with prefix, name, role, contract key
+- **Site state backups**: `delta:site_state:{prefix}` - full state backup for network resilience
 
 ## Contract Upgrade / State Migration
 

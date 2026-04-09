@@ -101,9 +101,29 @@ echo ""
 exit 1
 '''
 
+[tasks.preflight]
+description = "Run all checks before publishing"
+dependencies = ["check-migration"]
+script = '''
+#!/bin/bash
+set -euo pipefail
+echo "=== Pre-publish checks ==="
+
+echo "Running cargo fmt --check..."
+cargo fmt --check || { echo "FAILED: Run cargo fmt first"; exit 1; }
+
+echo "Running cargo clippy..."
+cargo clippy --all-targets -- -D warnings 2>&1 || { echo "FAILED: Fix clippy warnings"; exit 1; }
+
+echo "Running tests..."
+cargo test 2>&1 || { echo "FAILED: Tests must pass before publish"; exit 1; }
+
+echo "All pre-publish checks passed."
+'''
+
 [tasks.publish-delta]
 description = "Build, sign, and publish Delta to Freenet"
-dependencies = ["build-tailwind", "check-migration"]
+dependencies = ["build-tailwind", "preflight"]
 script = '''
 #!/bin/bash
 set -e
