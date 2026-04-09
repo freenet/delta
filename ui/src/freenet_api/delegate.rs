@@ -314,9 +314,11 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                         let has_records = !records.is_empty();
                         restore_known_sites(records);
                         // If legacy sites were imported, persist to current delegate
-                        // so they're authoritative on next refresh
+                        // and mark as authoritative so subsequent legacy responses
+                        // are blocked (prevents re-adding removed sites)
                         if is_legacy && has_records {
                             save_known_sites();
+                            *CURRENT_SITES_LOADED.write() = true;
                         }
                     }
                 }
