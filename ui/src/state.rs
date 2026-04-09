@@ -578,7 +578,30 @@ pub fn swap_page_order(page_a: PageId, page_b: PageId) {
         }
     });
 
-    // TODO: sign and UPDATE both pages to persist order change to network
+    // Order is not part of the page signature, so we can send the existing
+    // signed pages with updated order directly as an UPDATE delta.
+    let sites = SITES.read();
+    let site = match sites.get(&prefix) {
+        Some(s) => s,
+        None => return,
+    };
+    let contract_key = match site.contract_key {
+        Some(ck) => ck,
+        None => return,
+    };
+    let mut page_updates = std::collections::BTreeMap::new();
+    for &pid in &[page_a, page_b] {
+        if let Some(page) = site.state.pages.get(&pid) {
+            page_updates.insert(pid, page.clone());
+        }
+    }
+    drop(sites);
+    let delta = delta_core::SiteStateDelta {
+        config: None,
+        page_updates,
+        page_deletions: Vec::new(),
+    };
+    crate::freenet_api::update_site(&contract_key, &delta);
 }
 
 pub fn delete_page(page_id: PageId) {
