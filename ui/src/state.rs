@@ -206,9 +206,9 @@ pub fn create_new_site(name: String) {
         .upsert_page(1, home_page, &verifying_key)
         .expect("valid signed page");
 
-    // Store signing key in delegate for persistence
+    // Store signing key in delegate for persistence (per-prefix)
     let sk_bytes = signing_key.to_bytes();
-    crate::freenet_api::delegate::store_signing_key(&sk_bytes);
+    crate::freenet_api::delegate::store_signing_key(&sk_bytes, Some(&prefix));
 
     let site = KnownSite {
         name: name.clone(),
@@ -256,10 +256,10 @@ pub fn import_site_key(token: String) -> Result<(), String> {
     let prefix = export.prefix.clone();
     let name = export.name.clone();
 
-    // Store signing key in delegate
+    // Store signing key in delegate (per-prefix)
     let mut sk_bytes = [0u8; 32];
     sk_bytes.copy_from_slice(&export.signing_key);
-    crate::freenet_api::delegate::store_signing_key(&sk_bytes);
+    crate::freenet_api::delegate::store_signing_key(&sk_bytes, Some(&prefix));
 
     // Compute contract key and add as owned site
     let contract_key = contract_key_from_prefix(&prefix);

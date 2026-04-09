@@ -77,10 +77,11 @@ pub fn register_delegate() {
     }
 }
 
-/// Store a signing key in the delegate's secret storage.
-pub fn store_signing_key(key_bytes: &[u8; 32]) {
+/// Store a signing key in the delegate's secret storage, keyed by site prefix.
+pub fn store_signing_key(key_bytes: &[u8; 32], prefix: Option<&str>) {
     let request = delta_core::DelegateRequest::StoreSigningKey {
         key_bytes: key_bytes.to_vec(),
+        prefix: prefix.map(|s| s.to_string()),
     };
     send_delegate_request(&request);
 }
@@ -127,6 +128,7 @@ pub fn request_sign_page(
         title,
         content,
         updated_at,
+        prefix: Some(site_prefix.to_string()),
     };
     send_signing_request(&request);
 }
@@ -145,6 +147,7 @@ pub fn request_sign_deletion(
     let request = delta_core::DelegateRequest::SignPageDeletion {
         page_id,
         deleted_at,
+        prefix: Some(site_prefix.to_string()),
     };
     send_signing_request(&request);
 }
@@ -161,7 +164,10 @@ pub fn request_sign_config(site_prefix: &str, contract_key: ContractKey, new_nam
     };
     drop(sites);
 
-    let request = delta_core::DelegateRequest::SignConfig { config };
+    let request = delta_core::DelegateRequest::SignConfig {
+        config,
+        prefix: Some(site_prefix.to_string()),
+    };
     send_signing_request(&request);
     let _ = new_name; // name already set in config
 }
@@ -203,9 +209,11 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                 }
                 DelegateResponse::SigningKey(key_bytes) => {
                     log("Delta: received signing key from delegate");
-                    // Store key in current delegate (migrates it from legacy)
+                    // Store key in current delegate with its prefix (migrates from legacy)
                     if let Ok(key_arr) = <[u8; 32]>::try_from(key_bytes.as_slice()) {
-                        store_signing_key(&key_arr);
+                        let sk = ed25519_dalek::SigningKey::from_bytes(&key_arr);
+                        let prefix = delta_core::pubkey_to_prefix(&sk.verifying_key());
+                        store_signing_key(&key_arr, Some(&prefix));
                     }
                     // Also handle export if the export modal is showing
                     crate::components::export_key::handle_signing_key_response(key_bytes);

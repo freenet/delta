@@ -40,3 +40,10 @@ description = "Before adding StoreSiteState/GetSiteState"
 date = "2026-04-08"
 delegate_key = "a25dbe6da3e6651e58a8f42f3ff1a7ded437cebcc15d50752722e02ab78f816b"
 code_hash = "c33f9f25daf4b62927f0100081fa057999de7dae62e6a017b8ea36d05292f8ad"
+
+[[entry]]
+version = "V5"
+description = "Before per-site signing key storage"
+date = "2026-04-09"
+delegate_key = "16456f8a8eabb50072659ffc441fcfc798534a9b0a924048d3419aade256dea7"
+code_hash = "9694b6c553a83696932b479f0662a7181de7008a430f831d6773c4ce70575c0f"

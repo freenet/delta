@@ -8,8 +8,12 @@ use freenet_stdlib::prelude::{
     InboundDelegateMsg, MessageOrigin, OutboundDelegateMsg, Parameters,
 };
 
-const SIGNING_KEY_STORAGE_KEY: &str = "delta:signing_key";
+const LEGACY_SIGNING_KEY: &str = "delta:signing_key";
 const KNOWN_SITES_STORAGE_KEY: &str = "delta:known_sites";
+
+fn signing_key_for_prefix(prefix: &str) -> String {
+    format!("delta:signing_key:{prefix}")
+}
 
 pub struct SiteDelegate;
 
@@ -21,7 +25,6 @@ impl DelegateInterface for SiteDelegate {
         origin: Option<MessageOrigin>,
         message: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
-        // Verify origin
         match origin {
             Some(MessageOrigin::WebApp(_)) => {}
             None => {
@@ -53,11 +56,15 @@ fn handle_app_message(
         .map_err(|e| DelegateError::Other(format!("failed to deserialize request: {e}")))?;
 
     let response = match request {
-        DelegateRequest::StoreSigningKey { key_bytes } => {
+        DelegateRequest::StoreSigningKey { key_bytes, prefix } => {
             if key_bytes.len() != 32 {
                 DelegateResponse::Error("signing key must be 32 bytes".into())
             } else {
-                ctx.set_secret(SIGNING_KEY_STORAGE_KEY.as_bytes(), &key_bytes);
+                let storage_key = match &prefix {
+                    Some(p) => signing_key_for_prefix(p),
+                    None => LEGACY_SIGNING_KEY.to_string(),
+                };
+                ctx.set_secret(storage_key.as_bytes(), &key_bytes);
                 DelegateResponse::KeyStored
             }
         }
@@ -67,7 +74,8 @@ fn handle_app_message(
             title,
             content,
             updated_at,
-        } => match load_signing_key(ctx) {
+            prefix,
+        } => match load_signing_key(ctx, prefix.as_deref()) {
             Ok(key) => {
                 let page = Page::new(page_id, title, content, updated_at, &key);
                 DelegateResponse::SignedPage { page_id, page }
@@ -78,7 +86,8 @@ fn handle_app_message(
         DelegateRequest::SignPageDeletion {
             page_id,
             deleted_at,
-        } => match load_signing_key(ctx) {
+            prefix,
+        } => match load_signing_key(ctx, prefix.as_deref()) {
             Ok(key) => {
                 let deletion = SignedPageDeletion::new(page_id, deleted_at, &key);
                 DelegateResponse::SignedDeletion(deletion)
@@ -86,20 +95,22 @@ fn handle_app_message(
             Err(e) => DelegateResponse::Error(e),
         },
 
-        DelegateRequest::SignConfig { config } => match load_signing_key(ctx) {
-            Ok(key) => {
-                let signed = SignedConfig::new(config, &key);
-                DelegateResponse::SignedConfig(signed)
+        DelegateRequest::SignConfig { config, prefix } => {
+            match load_signing_key(ctx, prefix.as_deref()) {
+                Ok(key) => {
+                    let signed = SignedConfig::new(config, &key);
+                    DelegateResponse::SignedConfig(signed)
+                }
+                Err(e) => DelegateResponse::Error(e),
             }
-            Err(e) => DelegateResponse::Error(e),
-        },
+        }
 
-        DelegateRequest::GetPublicKey => match load_signing_key(ctx) {
+        DelegateRequest::GetPublicKey => match load_signing_key(ctx, None) {
             Ok(key) => DelegateResponse::PublicKey(key.verifying_key()),
             Err(e) => DelegateResponse::Error(e),
         },
 
-        DelegateRequest::GetSigningKey => match load_signing_key(ctx) {
+        DelegateRequest::GetSigningKey => match load_signing_key(ctx, None) {
             Ok(key) => DelegateResponse::SigningKey(key.to_bytes().to_vec()),
             Err(e) => DelegateResponse::Error(e),
         },
@@ -154,15 +165,26 @@ fn handle_app_message(
     )])
 }
 
-fn load_signing_key(ctx: &mut DelegateCtx) -> Result<SigningKey, String> {
-    let Some(key_bytes) = ctx.get_secret(SIGNING_KEY_STORAGE_KEY.as_bytes()) else {
-        return Err("no signing key stored — store key first".into());
-    };
+/// Load a signing key. Tries per-prefix first, then falls back to legacy single-key storage.
+fn load_signing_key(ctx: &mut DelegateCtx, prefix: Option<&str>) -> Result<SigningKey, String> {
+    // Try per-prefix key first
+    if let Some(p) = prefix {
+        let per_prefix_key = signing_key_for_prefix(p);
+        if let Some(key_bytes) = ctx.get_secret(per_prefix_key.as_bytes()) {
+            return parse_signing_key(&key_bytes);
+        }
+    }
 
+    // Fall back to legacy single-key storage
+    let Some(key_bytes) = ctx.get_secret(LEGACY_SIGNING_KEY.as_bytes()) else {
+        return Err("no signing key stored -- store key first".into());
+    };
+    parse_signing_key(&key_bytes)
+}
+
+fn parse_signing_key(key_bytes: &[u8]) -> Result<SigningKey, String> {
     let key_array: [u8; 32] = key_bytes
-        .as_slice()
         .try_into()
         .map_err(|_| "stored key is not 32 bytes".to_string())?;
-
     Ok(SigningKey::from_bytes(&key_array))
 }

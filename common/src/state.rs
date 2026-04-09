@@ -549,22 +549,37 @@ pub struct KnownSiteRecord {
 /// Requests from the UI to the delegate.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum DelegateRequest {
-    /// Store the owner signing key.
-    StoreSigningKey { key_bytes: Vec<u8> },
+    /// Store the owner signing key. If prefix is set, stored per-site.
+    StoreSigningKey {
+        key_bytes: Vec<u8>,
+        #[serde(default)]
+        prefix: Option<String>,
+    },
     /// Sign a page update.
     SignPage {
         page_id: PageId,
         title: String,
         content: String,
         updated_at: u64,
+        #[serde(default)]
+        prefix: Option<String>,
     },
     /// Sign a page deletion.
-    SignPageDeletion { page_id: PageId, deleted_at: u64 },
+    SignPageDeletion {
+        page_id: PageId,
+        deleted_at: u64,
+        #[serde(default)]
+        prefix: Option<String>,
+    },
     /// Sign a config update.
-    SignConfig { config: SiteConfig },
-    /// Get the owner's public key.
+    SignConfig {
+        config: SiteConfig,
+        #[serde(default)]
+        prefix: Option<String>,
+    },
+    /// Get the owner's public key. If prefix is set, returns per-site key.
     GetPublicKey,
-    /// Get the owner's signing key (for export). Returns the raw private key bytes.
+    /// Get the owner's signing key (for export).
     GetSigningKey,
     /// Store the list of known sites (for persistence across refreshes).
     StoreKnownSites { sites: Vec<KnownSiteRecord> },
