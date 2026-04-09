@@ -35,8 +35,12 @@ static PENDING_CONFIG: GlobalSignal<Option<ContractKey>> = GlobalSignal::new(|| 
 static LEGACY_SIGNING_DELEGATE: GlobalSignal<Option<([u8; 32], [u8; 32])>> =
     GlobalSignal::new(|| None);
 
-/// Whether the current delegate has a signing key.
-static HAS_CURRENT_KEY: GlobalSignal<bool> = GlobalSignal::new(|| false);
+/// Prefixes for which the CURRENT delegate has a signing key.
+/// Used to decide whether to route signing through current vs legacy delegate.
+static CURRENT_KEY_PREFIXES: GlobalSignal<Vec<String>> = GlobalSignal::new(Vec::new);
+
+/// Whether the current delegate has ANY signing key (legacy single-key format).
+static HAS_CURRENT_LEGACY_KEY: GlobalSignal<bool> = GlobalSignal::new(|| false);
 
 /// Prefixes for which we've received PublicKey from any delegate (legacy or current).
 /// Used to resolve race: PublicKey may arrive before KnownSites creates the site entry.
@@ -79,6 +83,14 @@ pub fn register_delegate() {
 
 /// Store a signing key in the delegate's secret storage, keyed by site prefix.
 pub fn store_signing_key(key_bytes: &[u8; 32], prefix: Option<&str>) {
+    // Track that this prefix has a key in the current delegate
+    if let Some(p) = prefix {
+        CURRENT_KEY_PREFIXES.with_mut(|prefixes| {
+            if !prefixes.contains(&p.to_string()) {
+                prefixes.push(p.to_string());
+            }
+        });
+    }
     let request = delta_core::DelegateRequest::StoreSigningKey {
         key_bytes: key_bytes.to_vec(),
         prefix: prefix.map(|s| s.to_string()),
@@ -203,9 +215,7 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
             match response {
                 DelegateResponse::KeyStored => {
                     log("Delta: signing key stored in delegate");
-                    if !is_legacy {
-                        *HAS_CURRENT_KEY.write() = true;
-                    }
+                    // CURRENT_KEY_PREFIXES is updated optimistically in store_signing_key
                 }
                 DelegateResponse::SigningKey(key_bytes) => {
                     log("Delta: received signing key from delegate");
@@ -229,8 +239,10 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                         let code_hash: [u8; 32] = **responding_key.code_hash();
                         *LEGACY_SIGNING_DELEGATE.write() = Some((key_bytes, code_hash));
                     } else {
-                        log(&format!("Delta: delegate has key for site prefix {prefix}"));
-                        *HAS_CURRENT_KEY.write() = true;
+                        log(&format!(
+                            "Delta: current delegate has key for site {prefix}"
+                        ));
+                        *HAS_CURRENT_LEGACY_KEY.write() = true;
                     }
                     // Record this prefix as owned (resolves race with KnownSites)
                     OWNER_PREFIXES.with_mut(|prefixes| {
@@ -269,9 +281,23 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                 }
                 DelegateResponse::KnownSites(records) => {
                     log(&format!(
-                        "Delta: loaded {} known site(s) from delegate",
-                        records.len()
+                        "Delta: loaded {} known site(s) from delegate{}",
+                        records.len(),
+                        if is_legacy { " (legacy)" } else { "" }
                     ));
+                    // If this is from the current delegate, owned sites should
+                    // have per-prefix keys stored in it
+                    if !is_legacy {
+                        for r in &records {
+                            if r.is_owner {
+                                CURRENT_KEY_PREFIXES.with_mut(|prefixes| {
+                                    if !prefixes.contains(&r.prefix) {
+                                        prefixes.push(r.prefix.clone());
+                                    }
+                                });
+                            }
+                        }
+                    }
                     restore_known_sites(records);
                 }
                 DelegateResponse::SiteStateStored => {
@@ -392,9 +418,9 @@ pub fn send_delegate_request_pub(request: &delta_core::DelegateRequest) {
     send_signing_request(request);
 }
 
-/// Whether the current delegate has a signing key (not just a legacy fallback).
+/// Whether the current delegate has a signing key for any site.
 pub fn has_current_key() -> bool {
-    *HAS_CURRENT_KEY.read()
+    !CURRENT_KEY_PREFIXES.read().is_empty() || *HAS_CURRENT_LEGACY_KEY.read()
 }
 
 /// Send a request to the current delegate.
@@ -402,15 +428,31 @@ fn send_delegate_request(request: &delta_core::DelegateRequest) {
     send_to_delegate_key(request, current_delegate_key());
 }
 
-/// Send a signing request. Uses the legacy delegate if the current one has no key.
+/// Extract the prefix from a signing-related delegate request.
+fn request_prefix(request: &delta_core::DelegateRequest) -> Option<&str> {
+    match request {
+        delta_core::DelegateRequest::SignPage { prefix, .. }
+        | delta_core::DelegateRequest::SignPageDeletion { prefix, .. }
+        | delta_core::DelegateRequest::SignConfig { prefix, .. } => prefix.as_deref(),
+        _ => None,
+    }
+}
+
+/// Send a signing request. Routes to the current delegate if it has the key
+/// for this prefix, otherwise falls back to the legacy delegate.
 fn send_signing_request(request: &delta_core::DelegateRequest) {
-    let key = if *HAS_CURRENT_KEY.read() {
+    let prefix = request_prefix(request);
+    let current_has_key = match prefix {
+        Some(p) => CURRENT_KEY_PREFIXES.read().contains(&p.to_string()),
+        None => *HAS_CURRENT_LEGACY_KEY.read(),
+    };
+
+    let key = if current_has_key {
         current_delegate_key()
     } else if let Some((key_bytes, code_hash_bytes)) = *LEGACY_SIGNING_DELEGATE.read() {
         log("Delta: routing signing request through legacy delegate");
         DelegateKey::new(key_bytes, CodeHash::new(code_hash_bytes))
     } else {
-        // No key anywhere -- send to current delegate (will return error)
         current_delegate_key()
     };
     send_to_delegate_key(request, key);
