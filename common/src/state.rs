@@ -558,6 +558,13 @@ pub enum DelegateRequest {
     StoreKnownSites { sites: Vec<KnownSiteRecord> },
     /// Retrieve the list of known sites.
     GetKnownSites,
+    /// Back up a site's state in delegate storage.
+    StoreSiteState {
+        prefix: String,
+        state_bytes: Vec<u8>,
+    },
+    /// Retrieve a backed-up site state.
+    GetSiteState { prefix: String },
 }
 
 /// Responses from the delegate to the UI.
@@ -579,6 +586,13 @@ pub enum DelegateResponse {
     SitesStored,
     /// Retrieved known sites.
     KnownSites(Vec<KnownSiteRecord>),
+    /// Site state backed up.
+    SiteStateStored,
+    /// Retrieved site state backup.
+    SiteState {
+        prefix: String,
+        state_bytes: Vec<u8>,
+    },
     /// An error occurred.
     Error(String),
 }

@@ -130,6 +130,14 @@ fn handle_contract_response(response: ContractResponse) {
                 ));
                 let new_key = state::contract_key_from_prefix(&prefix);
                 get_site(&new_key);
+            } else {
+                // Network doesn't have this contract -- try restoring from delegate backup
+                if let Some(prefix) = find_prefix_for_contract_key_b58(&key_b58) {
+                    log(&format!(
+                        "Delta: contract not found on network, trying delegate backup for {prefix}"
+                    ));
+                    super::delegate::request_site_state_backup(&prefix);
+                }
             }
         }
         other => {
@@ -189,6 +197,11 @@ fn handle_site_state(key: ContractKey, state_bytes: &[u8]) {
     }
     drop(sites);
 
+    // Back up state to delegate for resilience
+    if let Some(site) = state::SITES.read().get(&prefix) {
+        super::delegate::backup_site_state(&prefix, &site.state);
+    }
+
     // If this is the currently selected site, re-select to pick up
     // pending page from hash route and update title
     if state::CURRENT_SITE.read().as_deref() == Some(&prefix) {
@@ -236,6 +249,11 @@ fn handle_site_delta(key: ContractKey, delta_bytes: &[u8]) {
             site.state.config = config.clone();
             site.name = config.config.name.clone();
         }
+    }
+
+    // Back up updated state to delegate
+    if let Some(site) = sites.get(&prefix) {
+        super::delegate::backup_site_state(&prefix, &site.state);
     }
 }
 
@@ -452,10 +470,16 @@ where
 
 /// Find the site prefix that corresponds to a contract key by checking existing sites.
 fn find_prefix_for_contract_key(key: &ContractKey) -> Option<String> {
+    find_prefix_for_contract_key_b58(&key.encoded_contract_id())
+}
+
+fn find_prefix_for_contract_key_b58(key_b58: &str) -> Option<String> {
     let sites = state::SITES.read();
     for (prefix, site) in sites.iter() {
-        if site.contract_key.as_ref() == Some(key) {
-            return Some(prefix.clone());
+        if let Some(ck) = &site.contract_key {
+            if ck.encoded_contract_id() == key_b58 {
+                return Some(prefix.clone());
+            }
         }
     }
     None

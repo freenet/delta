@@ -122,6 +122,27 @@ fn handle_app_message(
                 DelegateResponse::KnownSites(Vec::new())
             }
         }
+
+        DelegateRequest::StoreSiteState {
+            prefix,
+            state_bytes,
+        } => {
+            let key = format!("delta:site_state:{prefix}");
+            ctx.set_secret(key.as_bytes(), &state_bytes);
+            DelegateResponse::SiteStateStored
+        }
+
+        DelegateRequest::GetSiteState { prefix } => {
+            let key = format!("delta:site_state:{prefix}");
+            if let Some(data) = ctx.get_secret(key.as_bytes()) {
+                DelegateResponse::SiteState {
+                    prefix,
+                    state_bytes: data,
+                }
+            } else {
+                DelegateResponse::Error(format!("no backed-up state for site {prefix}"))
+            }
+        }
     };
 
     let mut payload = Vec::new();

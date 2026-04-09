@@ -33,3 +33,10 @@ description = "Added known sites persistence (b82d3bc)"
 date = "2026-03-30"
 code_hash = "1224d52d5175a937e512d8bd8c6c8a08c48f5b7c4bc7aa4e5cc1305bceb170d6"
 delegate_key = "b0cf1eb48f7437e2116016b4d0fd71af19afb8c44f147da65da2958e144e4cbf"
+
+[[entry]]
+version = "V4"
+description = "Before adding StoreSiteState/GetSiteState"
+date = "2026-04-08"
+delegate_key = "a25dbe6da3e6651e58a8f42f3ff1a7ded437cebcc15d50752722e02ab78f816b"
+code_hash = "c33f9f25daf4b62927f0100081fa057999de7dae62e6a017b8ea36d05292f8ad"

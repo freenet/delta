@@ -256,6 +256,18 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                     ));
                     restore_known_sites(records);
                 }
+                DelegateResponse::SiteStateStored => {
+                    log("Delta: site state backed up to delegate");
+                }
+                DelegateResponse::SiteState {
+                    prefix,
+                    state_bytes,
+                } => {
+                    log(&format!(
+                        "Delta: restoring site {prefix} from delegate backup"
+                    ));
+                    handle_restored_site_state(&prefix, &state_bytes);
+                }
                 DelegateResponse::Error(e) => {
                     log(&format!("Delta: delegate error: {e}"));
                 }
@@ -545,6 +557,61 @@ fn fire_legacy_migration() {
                     }
                 });
             }
+        }
+    }
+}
+
+/// Back up a site's state to the delegate for resilience against network drops.
+pub fn backup_site_state(prefix: &str, site_state: &delta_core::SiteState) {
+    let mut state_bytes = Vec::new();
+    if into_writer(site_state, &mut state_bytes).is_err() {
+        log("Delta: failed to serialize site state for backup");
+        return;
+    }
+    let request = delta_core::DelegateRequest::StoreSiteState {
+        prefix: prefix.to_string(),
+        state_bytes,
+    };
+    send_delegate_request(&request);
+}
+
+/// Request a site's backed-up state from the delegate.
+pub fn request_site_state_backup(prefix: &str) {
+    let request = delta_core::DelegateRequest::GetSiteState {
+        prefix: prefix.to_string(),
+    };
+    send_delegate_request(&request);
+}
+
+/// Handle a restored site state from delegate backup -- PUT it to the network.
+fn handle_restored_site_state(prefix: &str, state_bytes: &[u8]) {
+    let site_state: delta_core::SiteState = match from_reader(state_bytes) {
+        Ok(s) => s,
+        Err(e) => {
+            log(&format!(
+                "Delta: failed to deserialize backed-up state for {prefix}: {e}"
+            ));
+            return;
+        }
+    };
+
+    let mut sites = state::SITES.write();
+    if let Some(site) = sites.get_mut(prefix) {
+        if site.state == delta_core::SiteState::default() {
+            log(&format!(
+                "Delta: restoring site {prefix} from backup ({} pages)",
+                site_state.pages.len()
+            ));
+            site.state = site_state.clone();
+            site.name = site_state.config.config.name.clone();
+            site.owner_pubkey = site_state.owner.to_bytes();
+            drop(sites);
+
+            // PUT the backed-up state to the network to restore it
+            let params = delta_core::SiteParameters {
+                prefix: prefix.to_string(),
+            };
+            super::operations::put_site(&params, &site_state);
         }
     }
 }
