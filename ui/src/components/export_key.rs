@@ -15,6 +15,13 @@ pub fn request_export() {
     *EXPORT_TOKEN.write() = None;
     *SHOW_EXPORT.write() = true;
 
+    // GetSigningKey only works on the current delegate (V5+).
+    // If the key is in a legacy delegate, we can't extract raw bytes.
+    if !crate::freenet_api::delegate::has_current_key() {
+        *EXPORT_TOKEN.write() = Some("ERROR: Signing key is stored in a previous delegate version and cannot be exported. Create a new site to get an exportable key.".to_string());
+        return;
+    }
+
     let request = delta_core::DelegateRequest::GetSigningKey;
     crate::freenet_api::delegate::send_delegate_request_pub(&request);
 }

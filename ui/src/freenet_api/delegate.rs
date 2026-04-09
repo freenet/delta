@@ -38,6 +38,10 @@ static LEGACY_SIGNING_DELEGATE: GlobalSignal<Option<([u8; 32], [u8; 32])>> =
 /// Whether the current delegate has a signing key.
 static HAS_CURRENT_KEY: GlobalSignal<bool> = GlobalSignal::new(|| false);
 
+/// Prefixes for which we've received PublicKey from any delegate (legacy or current).
+/// Used to resolve race: PublicKey may arrive before KnownSites creates the site entry.
+static OWNER_PREFIXES: GlobalSignal<Vec<String>> = GlobalSignal::new(Vec::new);
+
 /// Register the site delegate with the Freenet node.
 pub fn register_delegate() {
     #[cfg(target_arch = "wasm32")]
@@ -220,7 +224,13 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                         log(&format!("Delta: delegate has key for site prefix {prefix}"));
                         *HAS_CURRENT_KEY.write() = true;
                     }
-                    // Mark the site as owner if we have it
+                    // Record this prefix as owned (resolves race with KnownSites)
+                    OWNER_PREFIXES.with_mut(|prefixes| {
+                        if !prefixes.contains(&prefix) {
+                            prefixes.push(prefix.clone());
+                        }
+                    });
+                    // Mark the site as owner if it exists already
                     let mut sites = state::SITES.write();
                     if let Some(site) = sites.get_mut(&prefix) {
                         site.role = state::SiteRole::Owner;
@@ -374,6 +384,11 @@ pub fn send_delegate_request_pub(request: &delta_core::DelegateRequest) {
     send_signing_request(request);
 }
 
+/// Whether the current delegate has a signing key (not just a legacy fallback).
+pub fn has_current_key() -> bool {
+    *HAS_CURRENT_KEY.read()
+}
+
 /// Send a request to the current delegate.
 fn send_delegate_request(request: &delta_core::DelegateRequest) {
     send_to_delegate_key(request, current_delegate_key());
@@ -429,12 +444,20 @@ fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
     for record in records {
         let prefix = record.prefix.clone();
 
-        // Skip if already loaded (e.g. from hash route)
+        // Skip if already loaded (e.g. from hash route), but still fix owner role
         if state::SITES.read().contains_key(&prefix) {
+            let is_owner = record.is_owner || OWNER_PREFIXES.read().contains(&prefix);
+            if is_owner {
+                let mut sites = state::SITES.write();
+                if let Some(site) = sites.get_mut(&prefix) {
+                    site.role = state::SiteRole::Owner;
+                }
+            }
             continue;
         }
 
-        let role = if record.is_owner {
+        // Check if PublicKey already confirmed ownership (may arrive before KnownSites)
+        let role = if record.is_owner || OWNER_PREFIXES.read().contains(&prefix) {
             state::SiteRole::Owner
         } else {
             state::SiteRole::Visitor
