@@ -60,9 +60,13 @@ pub fn connect_to_freenet() {
                     let truncated = if msg.len() > 200 {
                         format!("{}...", &msg[..200])
                     } else {
-                        msg
+                        msg.clone()
                     };
                     web_sys::console::error_1(&truncated.into());
+                    // If a GET timed out, try restoring from delegate backup
+                    if msg.contains("GET operation timed out") {
+                        super::operations::handle_get_timeout(&msg);
+                    }
                 }
             },
             move |error| {

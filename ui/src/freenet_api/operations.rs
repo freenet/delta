@@ -485,6 +485,20 @@ fn find_prefix_for_contract_key_b58(key_b58: &str) -> Option<String> {
     None
 }
 
+/// Handle a GET timeout -- try restoring from delegate backup.
+pub fn handle_get_timeout(_error_msg: &str) {
+    // Try backup for any site that still has default (empty) state
+    let sites = state::SITES.read();
+    for (prefix, site) in sites.iter() {
+        if site.state == delta_core::SiteState::default() {
+            log(&format!(
+                "Delta: GET timed out, trying delegate backup for site {prefix}"
+            ));
+            super::delegate::request_site_state_backup(prefix);
+        }
+    }
+}
+
 fn log(msg: &str) {
     #[cfg(target_arch = "wasm32")]
     web_sys::console::log_1(&msg.into());
