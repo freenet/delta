@@ -42,6 +42,10 @@ static CURRENT_KEY_PREFIXES: GlobalSignal<Vec<String>> = GlobalSignal::new(Vec::
 /// Whether the current delegate has ANY signing key (legacy single-key format).
 static HAS_CURRENT_LEGACY_KEY: GlobalSignal<bool> = GlobalSignal::new(|| false);
 
+/// Whether the current delegate's KnownSites has been loaded (and was non-empty).
+/// When true, legacy KnownSites are ignored to respect site removals.
+static CURRENT_SITES_LOADED: GlobalSignal<bool> = GlobalSignal::new(|| false);
+
 /// Prefixes for which we've received PublicKey from any delegate (legacy or current).
 /// Used to resolve race: PublicKey may arrive before KnownSites creates the site entry.
 static OWNER_PREFIXES: GlobalSignal<Vec<String>> = GlobalSignal::new(Vec::new);
@@ -280,25 +284,39 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                     log("Delta: known sites saved to delegate");
                 }
                 DelegateResponse::KnownSites(records) => {
-                    log(&format!(
-                        "Delta: loaded {} known site(s) from delegate{}",
-                        records.len(),
-                        if is_legacy { " (legacy)" } else { "" }
-                    ));
-                    // If this is from the current delegate, owned sites should
-                    // have per-prefix keys stored in it
-                    if !is_legacy {
-                        for r in &records {
-                            if r.is_owner {
-                                CURRENT_KEY_PREFIXES.with_mut(|prefixes| {
-                                    if !prefixes.contains(&r.prefix) {
-                                        prefixes.push(r.prefix.clone());
-                                    }
-                                });
+                    if is_legacy && *CURRENT_SITES_LOADED.read() {
+                        // Current delegate already has sites -- it's the source of
+                        // truth. Ignore legacy to respect site removals.
+                        log(&format!(
+                            "Delta: skipping {} legacy known site(s) (current is authoritative)",
+                            records.len()
+                        ));
+                    } else {
+                        log(&format!(
+                            "Delta: loaded {} known site(s) from delegate{}",
+                            records.len(),
+                            if is_legacy { " (legacy)" } else { "" }
+                        ));
+                        if !is_legacy && !records.is_empty() {
+                            *CURRENT_SITES_LOADED.write() = true;
+                            for r in &records {
+                                if r.is_owner {
+                                    CURRENT_KEY_PREFIXES.with_mut(|prefixes| {
+                                        if !prefixes.contains(&r.prefix) {
+                                            prefixes.push(r.prefix.clone());
+                                        }
+                                    });
+                                }
                             }
                         }
+                        let has_records = !records.is_empty();
+                        restore_known_sites(records);
+                        // If legacy sites were imported, persist to current delegate
+                        // so they're authoritative on next refresh
+                        if is_legacy && has_records {
+                            save_known_sites();
+                        }
                     }
-                    restore_known_sites(records);
                 }
                 DelegateResponse::SiteStateStored => {
                     log("Delta: site state backed up to delegate");
