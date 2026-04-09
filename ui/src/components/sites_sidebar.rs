@@ -40,7 +40,13 @@ pub fn SitesSidebar() -> Element {
                     div { class: "mb-5",
                         p { class: "section-label mb-2", "My Sites" }
                         for (prefix, site) in owned.iter() {
-                            { site_row(prefix, site, &current_prefix) }
+                            SiteRow {
+                                key: "{prefix}",
+                                prefix: prefix.clone(),
+                                name: site.name.clone(),
+                                site_prefix: site.prefix.clone(),
+                                is_selected: current_prefix.as_deref() == Some(prefix.as_str()),
+                            }
                         }
                     }
                 }
@@ -49,7 +55,13 @@ pub fn SitesSidebar() -> Element {
                     div {
                         p { class: "section-label mb-2", "Visited" }
                         for (prefix, site) in visited.iter() {
-                            { site_row(prefix, site, &current_prefix) }
+                            SiteRow {
+                                key: "{prefix}",
+                                prefix: prefix.clone(),
+                                name: site.name.clone(),
+                                site_prefix: site.prefix.clone(),
+                                is_selected: current_prefix.as_deref() == Some(prefix.as_str()),
+                            }
                         }
                     }
                 }
@@ -85,10 +97,10 @@ pub fn SitesSidebar() -> Element {
     }
 }
 
-fn site_row(prefix: &str, site: &state::KnownSite, current_prefix: &Option<String>) -> Element {
-    let is_selected = current_prefix.as_deref() == Some(prefix);
-    let prefix_owned = prefix.to_string();
-    let prefix_for_remove = prefix.to_string();
+#[component]
+fn SiteRow(prefix: String, name: String, site_prefix: String, is_selected: bool) -> Element {
+    let prefix_owned = prefix.clone();
+    let prefix_for_remove = prefix.clone();
     let mut confirming_remove = use_signal(|| false);
 
     let row_class = if is_selected {
@@ -105,8 +117,8 @@ fn site_row(prefix: &str, site: &state::KnownSite, current_prefix: &Option<Strin
                     confirming_remove.set(false);
                     state::select_site(&prefix_owned);
                 },
-                div { class: "text-sm text-text-light truncate font-medium", "{site.name}" }
-                div { class: "text-[10px] text-text-muted font-mono truncate", "{site.prefix}" }
+                div { class: "text-sm text-text-light truncate font-medium", "{name}" }
+                div { class: "text-[10px] text-text-muted font-mono truncate", "{site_prefix}" }
             }
             // Remove: two-click confirm
             if *confirming_remove.read() {
