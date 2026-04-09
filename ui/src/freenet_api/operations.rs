@@ -176,6 +176,9 @@ fn handle_site_state(key: ContractKey, state_bytes: &[u8]) {
 
     // Don't re-add sites the user explicitly removed
     if state::REMOVED_PREFIXES.read().contains(&prefix) {
+        log(&format!(
+            "Delta: blocked re-add of removed site {prefix} from network response"
+        ));
         return;
     }
 
