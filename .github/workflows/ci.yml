@@ -1,0 +1,98 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check, lint, and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test
+
+      - name: Check contract builds (WASM)
+        run: cargo build --release --target wasm32-unknown-unknown -p site-contract -p site-delegate
+
+      - name: Check UI builds (WASM)
+        run: cargo check -p delta-ui --target wasm32-unknown-unknown
+
+  migration-check:
+    name: Delegate migration safety
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Install b3sum
+        run: cargo install b3sum
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      - name: Verify delegate WASM matches source
+        run: |
+          cargo build --release --target wasm32-unknown-unknown -p site-delegate
+          COMMITTED=$(b3sum ui/public/contracts/site_delegate.wasm | cut -d' ' -f1)
+          BUILT=$(b3sum target/wasm32-unknown-unknown/release/site_delegate.wasm | cut -d' ' -f1)
+          if [ "$COMMITTED" != "$BUILT" ]; then
+            echo "::error::Committed delegate WASM is stale (doesn't match built from source)"
+            echo "  committed: $COMMITTED"
+            echo "  built:     $BUILT"
+            echo "Run ./scripts/sync-wasm.sh to update"
+            exit 1
+          fi
+
+      - name: Verify contract WASM matches source
+        run: |
+          cargo build --release --target wasm32-unknown-unknown -p site-contract
+          COMMITTED=$(b3sum ui/public/contracts/site_contract.wasm | cut -d' ' -f1)
+          BUILT=$(b3sum target/wasm32-unknown-unknown/release/site_contract.wasm | cut -d' ' -f1)
+          if [ "$COMMITTED" != "$BUILT" ]; then
+            echo "::error::Committed contract WASM is stale (doesn't match built from source)"
+            echo "  committed: $COMMITTED"
+            echo "  built:     $BUILT"
+            echo "Run ./scripts/sync-wasm.sh to update"
+            exit 1
+          fi
