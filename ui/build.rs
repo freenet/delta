@@ -19,9 +19,24 @@ struct LegacyEntry {
     code_hash: String,
 }
 
+#[derive(Deserialize)]
+struct LegacyContracts {
+    #[serde(default)]
+    entry: Vec<LegacyContractEntry>,
+}
+
+#[derive(Deserialize)]
+struct LegacyContractEntry {
+    version: String,
+    description: String,
+    date: String,
+    code_hash: String,
+}
+
 fn main() {
     generate_build_info();
     generate_legacy_delegates();
+    generate_legacy_contracts();
 }
 
 fn generate_build_info() {
@@ -89,6 +104,56 @@ fn generate_legacy_delegates() {
 
     let out_dir = env::var("OUT_DIR").unwrap();
     let dest = Path::new(&out_dir).join("legacy_delegates.rs");
+    let existing = fs::read_to_string(&dest).unwrap_or_default();
+    if existing != code {
+        fs::write(&dest, &code).unwrap();
+    }
+}
+
+fn generate_legacy_contracts() {
+    let toml_path = Path::new("..").join("legacy_contracts.toml");
+    println!("cargo:rerun-if-changed=../legacy_contracts.toml");
+
+    let toml_content = match fs::read_to_string(&toml_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "cargo:warning=legacy_contracts.toml not found ({}), using empty list",
+                e
+            );
+            let out_dir = env::var("OUT_DIR").unwrap();
+            let dest = Path::new(&out_dir).join("legacy_contracts.rs");
+            fs::write(
+                dest,
+                "pub const LEGACY_CONTRACT_HASHES: &[[u8; 32]] = &[];\n",
+            )
+            .unwrap();
+            return;
+        }
+    };
+
+    let parsed: LegacyContracts =
+        toml::from_str(&toml_content).expect("Failed to parse legacy_contracts.toml");
+
+    let mut code = String::new();
+    code.push_str(
+        "// AUTO-GENERATED from legacy_contracts.toml — do not edit.\n\n\
+         pub const LEGACY_CONTRACT_HASHES: &[[u8; 32]] = &[\n",
+    );
+
+    for entry in &parsed.entry {
+        let ch_bytes = hex_to_byte_array(&entry.code_hash, &entry.version, "code_hash");
+        code.push_str(&format!(
+            "    // {}: {} ({})\n",
+            entry.version, entry.description, entry.date
+        ));
+        code.push_str(&format_byte_array(&ch_bytes, "    "));
+    }
+
+    code.push_str("];\n");
+
+    let out_dir = env::var("OUT_DIR").unwrap();
+    let dest = Path::new(&out_dir).join("legacy_contracts.rs");
     let existing = fs::read_to_string(&dest).unwrap_or_default();
     if existing != code {
         fs::write(&dest, &code).unwrap();

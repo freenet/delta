@@ -643,12 +643,11 @@ fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
 
         let new_contract_key = state::contract_key_from_prefix(&prefix);
 
-        // Check if WASM upgrade happened (stored key differs from computed key)
         let old_key_b58 = record.contract_key_b58.clone();
         let new_key_b58 = new_contract_key.encoded_contract_id();
-        let needs_migration = old_key_b58.as_ref().is_some_and(|old| *old != new_key_b58);
+        let stored_key_is_stale = old_key_b58.as_ref().is_some_and(|old| *old != new_key_b58);
 
-        if needs_migration {
+        if stored_key_is_stale {
             log(&format!(
                 "Delta: contract WASM upgrade detected for site {prefix}, migrating state"
             ));
@@ -667,26 +666,36 @@ fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
             sites.insert(prefix.clone(), site);
         });
 
-        if needs_migration {
-            if let Some(old_b58) = old_key_b58 {
-                super::operations::get_for_migration(&old_b58, &prefix);
+        // Always GET the current contract key. Whichever response
+        // arrives first — current key, stored-but-stale key, or any
+        // legacy-hash probe — wins, and the others are cancelled by
+        // `clear_pending_migrations_for_prefix` once migration
+        // completes.
+        super::operations::get_site(&new_contract_key);
+
+        // If the delegate persisted a stale `contract_key_b58`, probe
+        // that specific key in addition to the generic legacy-hash
+        // sweep: the user's state most likely lives there.
+        if stored_key_is_stale {
+            if let Some(old_b58) = old_key_b58.as_deref() {
+                super::operations::get_for_migration(old_b58, &prefix);
             }
-        } else if old_key_b58.is_none() {
-            // No stored key - this is either a fresh site or pre-upgrade.
-            // Try both the current key and the old WASM key (one-time migration).
-            let old_b58 = super::operations::old_contract_id_for_prefix(&prefix);
-            if old_b58 != new_key_b58 {
-                log(&format!(
-                    "Delta: trying one-time migration from old WASM for site {prefix}"
-                ));
-                super::operations::get_for_migration(&old_b58, &prefix);
-            }
-            // Also GET from current key in case it already has state
-            super::operations::get_site(&new_contract_key);
-        } else {
-            // Stored key matches current - normal GET
-            super::operations::get_site(&new_contract_key);
         }
+
+        // Probe every historical contract WASM hash from
+        // `legacy_contracts.toml`. Runs unconditionally because:
+        //   - For records with no stored key (legacy delegates from
+        //     before `contract_key_b58` was added), this is the only
+        //     path to find on-network state.
+        //   - For records whose stored key is stale, the stored key
+        //     may itself be from a release that has since been
+        //     superseded on the network; a further-back hash may
+        //     still have data.
+        //   - For records already up-to-date, the filter inside
+        //     `legacy_contract_ids_for_prefix` drops the current key
+        //     from the probe set, so this is a no-op after the
+        //     filter.
+        super::operations::fire_legacy_contract_migrations(&prefix, &new_key_b58);
     }
 
     // Replay any pending hash navigation (from deep link)

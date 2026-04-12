@@ -12,51 +12,26 @@ use std::collections::BTreeMap;
 /// Site contract WASM (embedded at build time).
 const SITE_CONTRACT_WASM: &[u8] = include_bytes!("../../public/contracts/site_contract.wasm");
 
-/// Previous contract WASM BLAKE3 hash — the hash of the contract that
-/// shipped in the immediately-preceding Delta release. Used as a
-/// one-hop fallback when a restored KnownSiteRecord has no
-/// `contract_key_b58` (e.g. legacy delegates from before
-/// b82d3bc that pre-dated the field). For sites that *do* carry
-/// a stored key, that key takes precedence and this constant is unused.
-///
-/// **Must be updated before every release** whose commit changes
-/// `site_contract.wasm` — otherwise users of the previous release whose
-/// legacy delegate didn't persist `contract_key_b58` will be unable to
-/// reach their existing site state and see a permanent "Loading..."
-/// screen. A change to `common/src/state.rs` (e.g. adding a new
-/// `DelegateRequest` variant) is enough to perturb the contract hash
-/// because the contract depends on `delta-core`.
-///
-/// Previous value `1188d108…` (commit 2e664c3) covered the pre-tombstone
-/// WASM but was never updated through subsequent releases, silently
-/// breaking migration whenever someone deployed a new contract WASM.
-const OLD_WASM_HASH: [u8; 32] =
-    hex_literal("b92da83dae278fcdc237d976ec926ee2fdca20e817662ae8a3aeaf09aaf47fa4");
-
-const fn hex_literal(s: &str) -> [u8; 32] {
-    let bytes = s.as_bytes();
-    let mut result = [0u8; 32];
-    let mut i = 0;
-    while i < 32 {
-        let hi = hex_nibble(bytes[i * 2]);
-        let lo = hex_nibble(bytes[i * 2 + 1]);
-        result[i] = (hi << 4) | lo;
-        i += 1;
-    }
-    result
-}
-
-const fn hex_nibble(b: u8) -> u8 {
-    match b {
-        b'0'..=b'9' => b - b'0',
-        b'a'..=b'f' => b - b'a' + 10,
-        b'A'..=b'F' => b - b'A' + 10,
-        _ => panic!("invalid hex character in OLD_WASM_HASH"),
-    }
-}
+// BLAKE3 hashes of every previous `site_contract.wasm` shipped by Delta,
+// generated from `legacy_contracts.toml` by `ui/build.rs`.
+//
+// Every release commit that changes `site_contract.wasm` (including
+// incidental rebuilds caused by touching `common/`) must first record
+// the committed WASM hash via `./scripts/add-contract-migration.sh`
+// and commit the updated `legacy_contracts.toml`. Without this, users
+// of the previous release whose delegate-stored `contract_key_b58`
+// is missing or stale are unable to reach their existing site state
+// and see a permanent "Loading..." screen.
+include!(concat!(env!("OUT_DIR"), "/legacy_contracts.rs"));
 
 /// Pending migrations: maps old contract key (base58) -> site prefix.
 /// When a GET response arrives for an old key, we PUT the state to the new key.
+///
+/// Multiple old keys may be registered for the same prefix when the UI is
+/// probing several historical contract WASM hashes at startup; the first
+/// GET that returns non-empty state wins and the rest are cleared by
+/// `clear_pending_migrations_for_prefix` to prevent an older state from
+/// racing ahead of a newer one.
 static PENDING_MIGRATIONS: GlobalSignal<BTreeMap<String, String>> =
     GlobalSignal::new(BTreeMap::new);
 
@@ -88,23 +63,30 @@ fn handle_contract_response(response: ContractResponse) {
             let state_bytes = state.to_vec();
             if let Some(prefix) = &migration_prefix {
                 if !state_bytes.is_empty() {
-                    // Migration: PUT state to new contract key
+                    // Migration: PUT state to new contract key.
                     log(&format!(
                         "Delta: migrating state for site {prefix} from old key to new key"
                     ));
                     let new_key = state::contract_key_from_prefix(prefix);
                     handle_site_state(new_key, &state_bytes);
-                    // PUT to new contract (subscribe: true in PUT handles subscription)
                     migrate_state_to_new_key(prefix, &state_bytes);
                     // Persist the new contract key so migration doesn't re-run
                     super::delegate::save_known_sites();
+                    // Cancel any concurrent legacy-hash probes still
+                    // in flight for this prefix — their responses, if
+                    // they land after ours, would overwrite the fresh
+                    // state with whatever lives at an older hash.
+                    clear_pending_migrations_for_prefix(prefix);
                 } else {
-                    // Old state gone from network - fall back to normal GET on new key
+                    // Old state gone from network — don't eagerly retry
+                    // the current key here. Several migration probes
+                    // may be running for the same prefix; let each one
+                    // resolve independently. If the current key itself
+                    // was not separately GET'd by the caller, the
+                    // NotFound branch below will still request it.
                     log(&format!(
-                        "Delta: migration GET returned empty for site {prefix}, trying new key"
+                        "Delta: migration GET returned empty for site {prefix}"
                     ));
-                    let new_key = state::contract_key_from_prefix(prefix);
-                    get_site(&new_key);
                 }
             } else {
                 if !state_bytes.is_empty() {
@@ -138,21 +120,25 @@ fn handle_contract_response(response: ContractResponse) {
         ContractResponse::NotFound { instance_id } => {
             let key_b58 = instance_id.encode();
             log(&format!("Delta: contract not found: {key_b58}"));
-            // Clean up any pending migration for this key
-            if let Some(prefix) = PENDING_MIGRATIONS.write().remove(&key_b58) {
+            // Clean up any pending migration for this key. The caller
+            // in `restore_known_sites` always issues a GET for the
+            // current contract key alongside the legacy-hash probes,
+            // so a NotFound on one legacy hash does not need to retry
+            // the current key here — that GET is already in flight.
+            if PENDING_MIGRATIONS.write().remove(&key_b58).is_some() {
                 log(&format!(
-                    "Delta: old contract gone for site {prefix}, falling back to new key"
+                    "Delta: legacy contract key {key_b58} has no state; \
+                     another probe may still succeed"
                 ));
-                let new_key = state::contract_key_from_prefix(&prefix);
-                get_site(&new_key);
-            } else {
-                // Network doesn't have this contract -- try restoring from delegate backup
-                if let Some(prefix) = find_prefix_for_contract_key_b58(&key_b58) {
-                    log(&format!(
-                        "Delta: contract not found on network, trying delegate backup for {prefix}"
-                    ));
-                    super::delegate::request_site_state_backup(&prefix);
-                }
+            } else if let Some(prefix) = find_prefix_for_contract_key_b58(&key_b58) {
+                // Network doesn't have this contract under its current
+                // key either — try restoring from a delegate backup.
+                // Only runs for sites whose current key is unknown to
+                // the network; legacy-hash probes never reach here.
+                log(&format!(
+                    "Delta: contract not found on network, trying delegate backup for {prefix}"
+                ));
+                super::delegate::request_site_state_backup(&prefix);
             }
         }
         other => {
@@ -322,21 +308,39 @@ pub fn get_site_by_id(id: &ContractInstanceId) {
     });
 }
 
-/// Compute a contract instance ID using the old WASM hash and a prefix.
-/// This lets us find state at the old contract key after a WASM upgrade.
-pub fn old_contract_id_for_prefix(prefix: &str) -> String {
+/// Compute the contract instance ID for a given `prefix` under a
+/// specific contract WASM hash. `ContractInstanceId =
+/// BLAKE3(BLAKE3(wasm) || CBOR(params))`, where BLAKE3(wasm) is already
+/// `wasm_code_hash`.
+fn contract_id_for_prefix_with_hash(prefix: &str, wasm_code_hash: &[u8; 32]) -> String {
     let params = delta_core::SiteParameters {
         prefix: prefix.to_string(),
     };
     let mut params_buf = Vec::new();
     ciborium::ser::into_writer(&params, &mut params_buf).expect("CBOR params");
 
-    // ContractInstanceId = BLAKE3(BLAKE3(wasm) || params)
     let mut hasher = blake3::Hasher::new();
-    hasher.update(&OLD_WASM_HASH);
+    hasher.update(wasm_code_hash);
     hasher.update(&params_buf);
-    let hash = hasher.finalize();
-    bs58::encode(hash.as_bytes()).into_string()
+    bs58::encode(hasher.finalize().as_bytes()).into_string()
+}
+
+/// Legacy contract instance IDs for a given site prefix — one per
+/// historical `site_contract.wasm` hash recorded in
+/// `legacy_contracts.toml`. The caller fires a migration GET for each
+/// so that sites whose on-network state lives under any prior contract
+/// key can be rescued, not just the immediately-preceding release.
+///
+/// The current contract key is excluded: callers should issue a normal
+/// `get_site` for the current key separately.
+pub fn legacy_contract_ids_for_prefix(prefix: &str, current_id_b58: &str) -> Vec<String> {
+    LEGACY_CONTRACT_HASHES
+        .iter()
+        .map(|hash| contract_id_for_prefix_with_hash(prefix, hash))
+        .filter(|id| id != current_id_b58)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// GET from an old contract key for migration purposes.
@@ -372,6 +376,34 @@ pub fn get_for_migration(old_key_b58: &str, prefix: &str) {
             });
             api.send(request).await
         })
+    });
+}
+
+/// Fire migration GETs for every historical contract WASM hash recorded
+/// in `legacy_contracts.toml`. Called for sites with a missing or stale
+/// `contract_key_b58` so that state stored under any past contract key
+/// can be rescued, not just the immediately-preceding release.
+pub fn fire_legacy_contract_migrations(prefix: &str, current_key_b58: &str) {
+    let legacy_ids = legacy_contract_ids_for_prefix(prefix, current_key_b58);
+    if legacy_ids.is_empty() {
+        return;
+    }
+    log(&format!(
+        "Delta: probing {} legacy contract hash(es) for site {prefix}",
+        legacy_ids.len()
+    ));
+    for old_b58 in legacy_ids {
+        get_for_migration(&old_b58, prefix);
+    }
+}
+
+/// Drop every pending migration entry whose target is `prefix`. Called
+/// after one migration GET resolves successfully, so that subsequent
+/// responses from probes for the same prefix (racing older contract
+/// hashes) can't overwrite the just-migrated state with stale data.
+fn clear_pending_migrations_for_prefix(prefix: &str) {
+    PENDING_MIGRATIONS.with_mut(|pending| {
+        pending.retain(|_, p| p != prefix);
     });
 }
 
@@ -527,4 +559,71 @@ fn log(msg: &str) {
     web_sys::console::log_1(&msg.into());
     #[cfg(not(target_arch = "wasm32"))]
     eprintln!("{msg}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex32(s: &str) -> [u8; 32] {
+        let bytes: Vec<u8> = (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        arr
+    }
+
+    #[test]
+    fn contract_id_is_deterministic_and_depends_on_both_hash_and_prefix() {
+        // Different hashes must produce different IDs for the same prefix.
+        let h1 = hex32("1188d108180a4143e6e4107b193cb90d5c08644e3830499f46186f141f182e81");
+        let h2 = hex32("b92da83dae278fcdc237d976ec926ee2fdca20e817662ae8a3aeaf09aaf47fa4");
+        let id1 = contract_id_for_prefix_with_hash("abcdef1234", &h1);
+        let id2 = contract_id_for_prefix_with_hash("abcdef1234", &h2);
+        assert_ne!(id1, id2, "different WASM hashes must yield different keys");
+
+        // Same inputs must be deterministic.
+        assert_eq!(id1, contract_id_for_prefix_with_hash("abcdef1234", &h1));
+
+        // Different prefixes under the same hash must differ.
+        let id_other = contract_id_for_prefix_with_hash("wxyz123456", &h1);
+        assert_ne!(id1, id_other);
+    }
+
+    #[test]
+    fn legacy_ids_are_deduplicated_and_exclude_current() {
+        // Pretend the "current" key matches one of the legacy hashes by
+        // passing its base58 as current_id_b58; that hash must drop out
+        // of the probe set so the UI doesn't redundantly GET its own key.
+        let legacy = hex32("1188d108180a4143e6e4107b193cb90d5c08644e3830499f46186f141f182e81");
+        let pretend_current = contract_id_for_prefix_with_hash("abcdef1234", &legacy);
+
+        let ids = legacy_contract_ids_for_prefix("abcdef1234", &pretend_current);
+        assert!(
+            !ids.contains(&pretend_current),
+            "current key must be filtered out of the legacy probe set"
+        );
+
+        // Whatever comes back must be a unique set — the test doesn't
+        // know the exact count (depends on legacy_contracts.toml) but
+        // it must match the de-duplicated expectation.
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(ids.len(), sorted.len(), "legacy ids must be unique");
+    }
+
+    #[test]
+    fn legacy_contract_hashes_table_is_populated() {
+        // Guard against an empty or mis-generated legacy_contracts.rs:
+        // without at least one entry, users of the immediately-preceding
+        // release who hit the no-stored-key path have no fallback.
+        assert!(
+            !LEGACY_CONTRACT_HASHES.is_empty(),
+            "legacy_contracts.toml must contain at least one entry so that users \
+             of the previous release can migrate their site state"
+        );
+    }
 }
