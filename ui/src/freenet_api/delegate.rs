@@ -50,6 +50,17 @@ static CURRENT_SITES_LOADED: GlobalSignal<bool> = GlobalSignal::new(|| false);
 /// Used to resolve race: PublicKey may arrive before KnownSites creates the site entry.
 static OWNER_PREFIXES: GlobalSignal<Vec<String>> = GlobalSignal::new(Vec::new);
 
+/// Whether legacy migration has already been fired. Deferring legacy queries
+/// until the current delegate's KnownSites response arrives guarantees that
+/// a legacy response cannot race ahead of the current one and resurrect
+/// deleted sites.
+static LEGACY_MIGRATION_FIRED: GlobalSignal<bool> = GlobalSignal::new(|| false);
+
+// Tombstones let us persist removed prefixes across refreshes WITHOUT
+// changing the delegate WASM schema — the delegate just stores/returns
+// the Vec<KnownSiteRecord> as-is; the UI interprets sentinel entries via
+// KnownSiteRecord::is_tombstone / KnownSiteRecord::tombstone in delta_core.
+
 /// Register the site delegate with the Freenet node.
 pub fn register_delegate() {
     #[cfg(target_arch = "wasm32")]
@@ -72,11 +83,14 @@ pub fn register_delegate() {
                     Ok(_) => {
                         log("Delta: delegate registered");
                         drop(api);
-                        // Load persisted data
+                        // Load persisted data. Legacy migration is deferred
+                        // until the current delegate's KnownSites response
+                        // arrives (see the KnownSites arm of
+                        // handle_delegate_response) — otherwise a legacy
+                        // response could race ahead and resurrect sites the
+                        // user removed.
                         request_public_key();
                         load_known_sites();
-                        // Try to migrate from legacy delegates
-                        fire_legacy_migration();
                     }
                     Err(e) => log(&format!("Delta: delegate registration failed: {e:?}")),
                 }
@@ -103,9 +117,14 @@ pub fn store_signing_key(key_bytes: &[u8; 32], prefix: Option<&str>) {
 }
 
 /// Save the current known sites list to the delegate for persistence.
+///
+/// Tombstones for removed sites are stored alongside real entries (using a
+/// sentinel name) so that deletions survive a page refresh. Without this,
+/// a legacy delegate responding with old KnownSites could resurrect sites
+/// the user explicitly removed.
 pub fn save_known_sites() {
     let sites = state::SITES.read();
-    let records: Vec<delta_core::KnownSiteRecord> = sites
+    let mut records: Vec<delta_core::KnownSiteRecord> = sites
         .values()
         .map(|s| delta_core::KnownSiteRecord {
             prefix: s.prefix.clone(),
@@ -114,6 +133,10 @@ pub fn save_known_sites() {
             contract_key_b58: s.contract_key.map(|ck| ck.encoded_contract_id()),
         })
         .collect();
+    drop(sites);
+    for removed_prefix in state::REMOVED_PREFIXES.read().iter() {
+        records.push(delta_core::KnownSiteRecord::tombstone(removed_prefix));
+    }
     let request = delta_core::DelegateRequest::StoreKnownSites { sites: records };
     send_delegate_request(&request);
 }
@@ -286,22 +309,59 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                     log("Delta: known sites saved to delegate");
                 }
                 DelegateResponse::KnownSites(records) => {
+                    // Split tombstones out first — they populate
+                    // REMOVED_PREFIXES and must NOT be restored as sites.
+                    let (tombstones, real_records): (Vec<_>, Vec<_>) = records
+                        .into_iter()
+                        .partition(delta_core::KnownSiteRecord::is_tombstone);
+
+                    // Tombstones from either current or legacy delegate are
+                    // merged: a legacy delegate may still hold a removal we
+                    // recorded before a delegate upgrade, and the current
+                    // delegate holds all removals after this fix ships.
+                    if !tombstones.is_empty() {
+                        log(&format!(
+                            "Delta: loaded {} tombstone(s) from delegate{}",
+                            tombstones.len(),
+                            if is_legacy { " (legacy)" } else { "" }
+                        ));
+                        state::REMOVED_PREFIXES.with_mut(|removed| {
+                            for t in &tombstones {
+                                if !removed.contains(&t.prefix) {
+                                    removed.push(t.prefix.clone());
+                                }
+                            }
+                        });
+                    }
+
                     if is_legacy && *CURRENT_SITES_LOADED.read() {
-                        // Current delegate already has sites -- it's the source of
-                        // truth. Ignore legacy to respect site removals.
+                        // Current delegate is the source of truth. Ignore
+                        // legacy real records to respect site removals.
                         log(&format!(
                             "Delta: skipping {} legacy known site(s) (current is authoritative)",
-                            records.len()
+                            real_records.len()
                         ));
                     } else {
                         log(&format!(
                             "Delta: loaded {} known site(s) from delegate{}",
-                            records.len(),
+                            real_records.len(),
                             if is_legacy { " (legacy)" } else { "" }
                         ));
-                        if !is_legacy && !records.is_empty() {
-                            *CURRENT_SITES_LOADED.write() = true;
-                            for r in &records {
+                        if !is_legacy {
+                            // The current delegate has responded. Flip the
+                            // flag whenever it holds ANY state — real
+                            // records OR tombstones — because both signal
+                            // "this user has initialized the current
+                            // delegate, so any absent prefix is a removal,
+                            // not a never-seen site." An empty-empty
+                            // response means the user is pre-migration;
+                            // leave the flag off so legacy migration can
+                            // populate the initial state.
+                            let has_any = !real_records.is_empty() || !tombstones.is_empty();
+                            if has_any {
+                                *CURRENT_SITES_LOADED.write() = true;
+                            }
+                            for r in &real_records {
                                 if r.is_owner {
                                     CURRENT_KEY_PREFIXES.with_mut(|prefixes| {
                                         if !prefixes.contains(&r.prefix) {
@@ -311,15 +371,25 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                                 }
                             }
                         }
-                        let has_records = !records.is_empty();
-                        restore_known_sites(records);
-                        // If legacy sites were imported, persist to current delegate
-                        // and mark as authoritative so subsequent legacy responses
-                        // are blocked (prevents re-adding removed sites)
-                        if is_legacy && has_records {
+                        let has_real = !real_records.is_empty();
+                        restore_known_sites(real_records);
+                        // If legacy sites were imported, persist to current
+                        // delegate (including the tombstones we just
+                        // learned about) and mark as authoritative so
+                        // subsequent legacy responses are blocked.
+                        if is_legacy && has_real {
                             save_known_sites();
                             *CURRENT_SITES_LOADED.write() = true;
                         }
+                    }
+
+                    // Once the current delegate has responded, it is safe
+                    // to query legacy delegates: any legacy KnownSites
+                    // response is now either blocked (CURRENT_SITES_LOADED
+                    // is set) or merged into a fresh migration path.
+                    if !is_legacy && !*LEGACY_MIGRATION_FIRED.read() {
+                        *LEGACY_MIGRATION_FIRED.write() = true;
+                        fire_legacy_migration();
                     }
                 }
                 DelegateResponse::SiteStateStored => {
