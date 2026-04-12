@@ -652,8 +652,12 @@ pub enum DelegateRequest {
     },
     /// Get the owner's public key. If prefix is set, returns per-site key.
     GetPublicKey,
-    /// Get the owner's signing key (for export).
-    GetSigningKey,
+    /// Get the owner's signing key (for export). If prefix is set, returns
+    /// the per-site key; otherwise falls back to legacy single-key storage.
+    GetSigningKey {
+        #[serde(default)]
+        prefix: Option<String>,
+    },
     /// Store the list of known sites (for persistence across refreshes).
     StoreKnownSites { sites: Vec<KnownSiteRecord> },
     /// Retrieve the list of known sites.
@@ -955,6 +959,37 @@ mod tests {
             contract_key_b58: None,
         };
         assert!(!fake.is_tombstone());
+    }
+
+    #[test]
+    fn get_signing_key_request_roundtrips_with_prefix() {
+        // Regression guard: export must be able to ask the delegate for the
+        // per-site signing key. If GetSigningKey loses its `prefix` field,
+        // the delegate falls back to the legacy single-key slot and returns
+        // a key that does NOT match the site's owner_pubkey, silently
+        // producing an export token that can't sign valid updates after
+        // import.
+        let with_prefix = DelegateRequest::GetSigningKey {
+            prefix: Some("abcdef1234".into()),
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&with_prefix, &mut buf).unwrap();
+        let decoded: DelegateRequest = ciborium::de::from_reader(buf.as_slice()).unwrap();
+        match decoded {
+            DelegateRequest::GetSigningKey { prefix } => {
+                assert_eq!(prefix.as_deref(), Some("abcdef1234"));
+            }
+            other => panic!("expected GetSigningKey, got {other:?}"),
+        }
+
+        let without_prefix = DelegateRequest::GetSigningKey { prefix: None };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&without_prefix, &mut buf).unwrap();
+        let decoded: DelegateRequest = ciborium::de::from_reader(buf.as_slice()).unwrap();
+        match decoded {
+            DelegateRequest::GetSigningKey { prefix } => assert!(prefix.is_none()),
+            other => panic!("expected GetSigningKey, got {other:?}"),
+        }
     }
 
     #[test]

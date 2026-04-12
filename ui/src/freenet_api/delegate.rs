@@ -724,7 +724,7 @@ fn fire_legacy_migration() {
         let requests = [
             delta_core::DelegateRequest::GetPublicKey,
             delta_core::DelegateRequest::GetKnownSites,
-            delta_core::DelegateRequest::GetSigningKey,
+            delta_core::DelegateRequest::GetSigningKey { prefix: None },
         ];
 
         for (i, (key_bytes, code_hash_bytes)) in LEGACY_DELEGATES.iter().enumerate() {

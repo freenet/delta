@@ -18,6 +18,17 @@ pub fn request_export() {
     *EXPORT_TOKEN.write() = None;
     *EXPORT_ERROR.write() = None;
 
+    // The currently-selected site is the one being exported. Without a
+    // prefix the delegate would return whatever happens to live in the
+    // legacy single-key slot, which may not match this site's owner_pubkey
+    // at all — so the exported token would contain a key that can't sign
+    // valid updates on the importing node.
+    let Some(site) = state::current_site() else {
+        *EXPORT_ERROR.write() = Some("No site selected to export.".to_string());
+        *SHOW_EXPORT.write() = true;
+        return;
+    };
+
     // GetSigningKey only works on the current delegate (V5+).
     // If the key is in a legacy delegate, we can't extract raw bytes.
     if !crate::freenet_api::delegate::has_current_key() {
@@ -31,21 +42,52 @@ pub fn request_export() {
     }
 
     *SHOW_EXPORT.write() = true;
-    let request = delta_core::DelegateRequest::GetSigningKey;
+    let request = delta_core::DelegateRequest::GetSigningKey {
+        prefix: Some(site.prefix.clone()),
+    };
     crate::freenet_api::delegate::send_delegate_request_pub(&request);
 }
 
 /// Called by the delegate response handler when SigningKey arrives.
 pub fn handle_signing_key_response(key_bytes: Vec<u8>) {
-    if let Some(site) = state::current_site() {
-        let export = SiteKeyExport {
-            signing_key: key_bytes,
-            owner_pubkey: site.owner_pubkey.to_vec(),
-            prefix: site.prefix.clone(),
-            name: site.name.clone(),
-        };
-        *EXPORT_TOKEN.write() = Some(export.to_armored());
+    // Legacy-migration code path also fires SigningKey requests; only treat
+    // this response as an export result when the export modal is open.
+    if !*SHOW_EXPORT.read() {
+        return;
     }
+    let Some(site) = state::current_site() else {
+        return;
+    };
+
+    // Defence in depth: verify the returned signing key actually matches
+    // the current site's owner_pubkey. The pre-V7 delegate only had a
+    // legacy single-key slot and would silently return the wrong key for
+    // sites with per-prefix storage, producing an export token that could
+    // not sign valid updates after import.
+    let key_array: [u8; 32] = match key_bytes.as_slice().try_into() {
+        Ok(a) => a,
+        Err(_) => {
+            *EXPORT_ERROR.write() = Some("Delegate returned malformed signing key.".to_string());
+            return;
+        }
+    };
+    let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_array);
+    if signing_key.verifying_key().to_bytes() != site.owner_pubkey {
+        *EXPORT_ERROR.write() = Some(
+            "Delegate returned a signing key that does not match this site's owner. \
+             Export aborted to avoid producing a broken token."
+                .to_string(),
+        );
+        return;
+    }
+
+    let export = SiteKeyExport {
+        signing_key: key_bytes,
+        owner_pubkey: site.owner_pubkey.to_vec(),
+        prefix: site.prefix.clone(),
+        name: site.name.clone(),
+    };
+    *EXPORT_TOKEN.write() = Some(export.to_armored());
 }
 
 #[component]
