@@ -64,6 +64,27 @@ The delegate stores:
 - **Known sites**: `delta:known_sites` - list of sites with prefix, name, role, contract key
 - **Site state backups**: `delta:site_state:{prefix}` - full state backup for network resilience
 
+### Known-Sites Tombstone Convention
+
+The `delta:known_sites` `Vec<KnownSiteRecord>` doubles as the persistent
+tombstone store for removed sites. A record with
+`name == TOMBSTONE_NAME_SENTINEL` (`"\0__delta_removed__"`, defined in
+`common/src/state.rs`) is a tombstone, not a real site. Tombstones exist
+to block legacy delegates from resurrecting deleted sites after a page
+refresh.
+
+**Every code path that consumes `KnownSites` responses MUST filter
+tombstones via `KnownSiteRecord::is_tombstone()`** before iterating.
+Forgetting this will leak sentinel entries into the UI and display a
+ghost site named `"\0__delta_removed__"`. `restore_known_sites` has a
+`debug_assert!` that catches this in debug builds.
+
+Tombstones are cleared by `clear_tombstone(prefix)` in `ui/src/state.rs`,
+which must be called by any path that adds a site (`create_new_site`,
+`import_site_key`, `visit_site`) — otherwise a previously-removed prefix
+would be silently filtered out of `restore_known_sites` and the re-add
+would appear to fail.
+
 ## Contract Upgrade / State Migration
 
 ### When Contract WASM Changes

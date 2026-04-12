@@ -133,8 +133,16 @@ pub fn save_known_sites() {
             contract_key_b58: s.contract_key.map(|ck| ck.encoded_contract_id()),
         })
         .collect();
+    let live_prefixes: std::collections::HashSet<String> = sites.keys().cloned().collect();
     drop(sites);
     for removed_prefix in state::REMOVED_PREFIXES.read().iter() {
+        // Belt and braces: if a prefix is somehow both live and tombstoned
+        // (e.g. add/remove race), never serialize the tombstone — a live
+        // site wins. `clear_tombstone` is the primary defense; this
+        // prevents a persisted contradiction if it is ever bypassed.
+        if live_prefixes.contains(removed_prefix) {
+            continue;
+        }
         records.push(delta_core::KnownSiteRecord::tombstone(removed_prefix));
     }
     let request = delta_core::DelegateRequest::StoreKnownSites { sites: records };
@@ -319,6 +327,11 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                     // merged: a legacy delegate may still hold a removal we
                     // recorded before a delegate upgrade, and the current
                     // delegate holds all removals after this fix ships.
+                    //
+                    // If a tombstone arrives for a prefix that's currently in
+                    // SITES (e.g. added via hash route before known_sites
+                    // loaded), remove it too — the user's intent to delete
+                    // must not be silently ignored.
                     if !tombstones.is_empty() {
                         log(&format!(
                             "Delta: loaded {} tombstone(s) from delegate{}",
@@ -330,6 +343,11 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                                 if !removed.contains(&t.prefix) {
                                     removed.push(t.prefix.clone());
                                 }
+                            }
+                        });
+                        state::SITES.with_mut(|sites| {
+                            for t in &tombstones {
+                                sites.remove(&t.prefix);
                             }
                         });
                     }
@@ -372,12 +390,15 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                             }
                         }
                         let has_real = !real_records.is_empty();
+                        let has_tombstones = !tombstones.is_empty();
                         restore_known_sites(real_records);
-                        // If legacy sites were imported, persist to current
-                        // delegate (including the tombstones we just
-                        // learned about) and mark as authoritative so
-                        // subsequent legacy responses are blocked.
-                        if is_legacy && has_real {
+                        // If legacy contributed ANY state — real records OR
+                        // tombstones — persist to the current delegate so
+                        // the merged view survives a refresh. Without this,
+                        // a legacy delegate holding ONLY tombstones would
+                        // leak those tombstones back out of REMOVED_PREFIXES
+                        // on next load and resurrect removed sites.
+                        if is_legacy && (has_real || has_tombstones) {
                             save_known_sites();
                             *CURRENT_SITES_LOADED.write() = true;
                         }
@@ -584,6 +605,17 @@ fn send_to_delegate_key(request: &delta_core::DelegateRequest, delegate_key: Del
 /// For each site, creates a placeholder entry and sends GET+SUBSCRIBE.
 fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
     for record in records {
+        // Tombstones must be partitioned out before this call — seeing one
+        // here means a new caller bypassed the partition in
+        // handle_delegate_response and we're about to resurrect a removed
+        // site. Fail loudly in debug builds and skip in release.
+        debug_assert!(
+            !record.is_tombstone(),
+            "tombstone reached restore_known_sites — partition is broken"
+        );
+        if record.is_tombstone() {
+            continue;
+        }
         let prefix = record.prefix.clone();
 
         // Don't restore sites the user explicitly removed

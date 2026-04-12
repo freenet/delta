@@ -164,6 +164,21 @@ pub fn rename_site(prefix: &str, new_name: String) {
     }
 }
 
+/// Clear a tombstone for a previously-removed site. Called by any code path
+/// that represents explicit user intent to (re-)add a site with this prefix:
+/// `create_new_site`, `import_site_key`, `visit_site`. Without this, a
+/// persisted tombstone would silently filter the new site out of
+/// `restore_known_sites` and it would appear to "not work".
+///
+/// Note: the caller is responsible for triggering `save_known_sites()` after
+/// inserting the site; that save also re-persists the (shrunk)
+/// REMOVED_PREFIXES list.
+pub fn clear_tombstone(prefix: &str) {
+    REMOVED_PREFIXES.with_mut(|removed| {
+        removed.retain(|p| p != prefix);
+    });
+}
+
 /// Remove a site from the sidebar.
 pub fn remove_site(prefix: &str) {
     REMOVED_PREFIXES.with_mut(|removed| {
@@ -219,6 +234,7 @@ pub fn create_new_site(name: String) {
     let sk_bytes = signing_key.to_bytes();
     crate::freenet_api::delegate::store_signing_key(&sk_bytes, Some(&prefix));
 
+    clear_tombstone(&prefix);
     let site = KnownSite {
         name: name.clone(),
         prefix: prefix.clone(),
@@ -276,6 +292,7 @@ pub fn import_site_key(token: String) -> Result<(), String> {
     let mut owner_bytes = [0u8; 32];
     owner_bytes.copy_from_slice(&export.owner_pubkey);
 
+    clear_tombstone(&prefix);
     let site = KnownSite {
         name,
         prefix: prefix.clone(),
@@ -339,6 +356,7 @@ pub fn visit_site(input: String) {
         return;
     }
 
+    clear_tombstone(&prefix);
     let contract_key = contract_key_from_prefix(&prefix);
 
     let placeholder = KnownSite {
