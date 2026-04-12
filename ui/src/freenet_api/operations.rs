@@ -12,11 +12,26 @@ use std::collections::BTreeMap;
 /// Site contract WASM (embedded at build time).
 const SITE_CONTRACT_WASM: &[u8] = include_bytes!("../../public/contracts/site_contract.wasm");
 
-/// Previous WASM BLAKE3 hash (commit 2e664c3, before deleted_pages tombstone).
-/// Only covers one-hop migration from pre-tombstone WASM to current.
-/// For future WASM changes, stored contract_key_b58 handles migration.
+/// Previous contract WASM BLAKE3 hash — the hash of the contract that
+/// shipped in the immediately-preceding Delta release. Used as a
+/// one-hop fallback when a restored KnownSiteRecord has no
+/// `contract_key_b58` (e.g. legacy delegates from before
+/// b82d3bc that pre-dated the field). For sites that *do* carry
+/// a stored key, that key takes precedence and this constant is unused.
+///
+/// **Must be updated before every release** whose commit changes
+/// `site_contract.wasm` — otherwise users of the previous release whose
+/// legacy delegate didn't persist `contract_key_b58` will be unable to
+/// reach their existing site state and see a permanent "Loading..."
+/// screen. A change to `common/src/state.rs` (e.g. adding a new
+/// `DelegateRequest` variant) is enough to perturb the contract hash
+/// because the contract depends on `delta-core`.
+///
+/// Previous value `1188d108…` (commit 2e664c3) covered the pre-tombstone
+/// WASM but was never updated through subsequent releases, silently
+/// breaking migration whenever someone deployed a new contract WASM.
 const OLD_WASM_HASH: [u8; 32] =
-    hex_literal("1188d108180a4143e6e4107b193cb90d5c08644e3830499f46186f141f182e81");
+    hex_literal("b92da83dae278fcdc237d976ec926ee2fdca20e817662ae8a3aeaf09aaf47fa4");
 
 const fn hex_literal(s: &str) -> [u8; 32] {
     let bytes = s.as_bytes();
