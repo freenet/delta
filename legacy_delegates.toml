@@ -61,3 +61,10 @@ description = "Before per-prefix GetSigningKey for export"
 date = "2026-04-12"
 delegate_key = "68f6d44a67506cb7086483cf2a7c44558cb322be930de51ed2d43bf42d7f9b2f"
 code_hash = "eb5396ef340832847151d1339e676b57ca79968ae498fa67951d280b1f5b9231"
+
+[[entry]]
+version = "V8"
+description = "Reproducible WASM build (remap-path-prefix) #3"
+date = "2026-04-12"
+delegate_key = "f3b89ee5249b1e07af57adf839b09b5b01049f930ecc3e09fc0b02a4e8026cf3"
+code_hash = "8a78b8b529aabfa2e160a9ef0c5754aa20d527ee5babaa1951d56ac69082dcda"

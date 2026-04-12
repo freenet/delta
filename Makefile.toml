@@ -66,7 +66,7 @@ set -euo pipefail
 echo "=== Pre-publish delegate WASM check ==="
 
 # 1. Rebuild delegate from source
-cargo build --release --target wasm32-unknown-unknown -p site-delegate 2>/dev/null
+./scripts/build-wasm.sh -p site-delegate 2>/dev/null
 
 COMMITTED="ui/public/contracts/site_delegate.wasm"
 BUILT="target/wasm32-unknown-unknown/release/site_delegate.wasm"

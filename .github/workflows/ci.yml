@@ -42,7 +42,7 @@ jobs:
         run: cargo test
 
       - name: Check contract builds (WASM)
-        run: cargo build --release --target wasm32-unknown-unknown -p site-contract -p site-delegate
+        run: ./scripts/build-wasm.sh -p site-contract -p site-delegate
 
       - name: Check UI builds (WASM)
         run: cargo check -p delta-ui --target wasm32-unknown-unknown
@@ -73,7 +73,7 @@ jobs:
 
       - name: Verify delegate WASM matches source
         run: |
-          cargo build --release --target wasm32-unknown-unknown -p site-delegate
+          ./scripts/build-wasm.sh -p site-delegate
           COMMITTED=$(b3sum ui/public/contracts/site_delegate.wasm | cut -d' ' -f1)
           BUILT=$(b3sum target/wasm32-unknown-unknown/release/site_delegate.wasm | cut -d' ' -f1)
           if [ "$COMMITTED" != "$BUILT" ]; then
@@ -86,7 +86,7 @@ jobs:
 
       - name: Verify contract WASM matches source
         run: |
-          cargo build --release --target wasm32-unknown-unknown -p site-contract
+          ./scripts/build-wasm.sh -p site-contract
           COMMITTED=$(b3sum ui/public/contracts/site_contract.wasm | cut -d' ' -f1)
           BUILT=$(b3sum target/wasm32-unknown-unknown/release/site_contract.wasm | cut -d' ' -f1)
           if [ "$COMMITTED" != "$BUILT" ]; then
