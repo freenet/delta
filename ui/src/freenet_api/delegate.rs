@@ -542,13 +542,32 @@ fn send_delegate_request(request: &delta_core::DelegateRequest) {
 }
 
 /// Extract the prefix from a signing-related delegate request.
+///
+/// Every variant that `send_signing_request` may route MUST be listed
+/// here. If a request variant with a prefix is missing, the router
+/// falls back to the `HAS_CURRENT_LEGACY_KEY` heuristic and can pick
+/// the legacy delegate — which, for any variant introduced after V6
+/// (e.g. `GetSigningKeyForPrefix`), cannot deserialize the request
+/// and leaves the UI hanging on a request that will never complete.
 fn request_prefix(request: &delta_core::DelegateRequest) -> Option<&str> {
     match request {
         delta_core::DelegateRequest::SignPage { prefix, .. }
         | delta_core::DelegateRequest::SignPageDeletion { prefix, .. }
         | delta_core::DelegateRequest::SignConfig { prefix, .. } => prefix.as_deref(),
+        delta_core::DelegateRequest::GetSigningKeyForPrefix { prefix } => Some(prefix.as_str()),
         _ => None,
     }
+}
+
+/// True for `DelegateRequest` variants that were introduced after V6
+/// and therefore CANNOT be deserialized by any legacy (pre-V7)
+/// delegate. Routing such a request to a legacy delegate would leave
+/// the UI hanging on a request the legacy side can't parse.
+fn variant_is_v7_plus(request: &delta_core::DelegateRequest) -> bool {
+    matches!(
+        request,
+        delta_core::DelegateRequest::GetSigningKeyForPrefix { .. }
+    )
 }
 
 /// Send a signing request. Routes to the current delegate if it has the key
@@ -561,6 +580,13 @@ fn send_signing_request(request: &delta_core::DelegateRequest) {
     };
 
     let key = if current_has_key {
+        current_delegate_key()
+    } else if variant_is_v7_plus(request) {
+        // Never route V7+ variants to a legacy delegate: the legacy
+        // side can't deserialize them and the request would hang.
+        // Send to the current delegate — if the key isn't there, the
+        // current delegate returns a clean error instead of silence.
+        log("Delta: V7+ signing request, forcing current delegate (no legacy fallback)");
         current_delegate_key()
     } else if let Some((key_bytes, code_hash_bytes)) = *LEGACY_SIGNING_DELEGATE.read() {
         log("Delta: routing signing request through legacy delegate");
