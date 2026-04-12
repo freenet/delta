@@ -32,3 +32,9 @@ version = "C2"
 description = "Pre-V7 WASM (f5ecff5, before per-prefix export signing key)"
 date = "2026-04-09"
 code_hash = "b92da83dae278fcdc237d976ec926ee2fdca20e817662ae8a3aeaf09aaf47fa4"
+
+[[entry]]
+version = "C3"
+description = "V7 WASM (62fe35b/356e6b6, before reproducible builds)"
+date = "2026-04-12"
+code_hash = "53e3395f42d563e6095e6b21d76d6dbcb9db2fc4068fc6705a353f6f46f48778"

@@ -666,11 +666,13 @@ fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
             sites.insert(prefix.clone(), site);
         });
 
-        // Always GET the current contract key. Whichever response
-        // arrives first — current key, stored-but-stale key, or any
-        // legacy-hash probe — wins, and the others are cancelled by
-        // `clear_pending_migrations_for_prefix` once migration
-        // completes.
+        // Enter the initial-capture window for this prefix. Until one
+        // non-empty GET response arrives, every incoming response is
+        // treated as a candidate; the first wins and siblings are
+        // dropped via `finalize_prefix_capture`.
+        super::operations::mark_prefix_migrating(&prefix);
+
+        // Always GET the current contract key.
         super::operations::get_site(&new_contract_key);
 
         // If the delegate persisted a stale `contract_key_b58`, probe
@@ -682,20 +684,18 @@ fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
             }
         }
 
-        // Probe every historical contract WASM hash from
-        // `legacy_contracts.toml`. Runs unconditionally because:
-        //   - For records with no stored key (legacy delegates from
-        //     before `contract_key_b58` was added), this is the only
-        //     path to find on-network state.
-        //   - For records whose stored key is stale, the stored key
-        //     may itself be from a release that has since been
-        //     superseded on the network; a further-back hash may
-        //     still have data.
-        //   - For records already up-to-date, the filter inside
-        //     `legacy_contract_ids_for_prefix` drops the current key
-        //     from the probe set, so this is a no-op after the
-        //     filter.
-        super::operations::fire_legacy_contract_migrations(&prefix, &new_key_b58);
+        // Only fire the generic legacy-hash sweep when the stored
+        // contract key is either absent or demonstrably stale. In the
+        // steady state where the delegate-persisted
+        // `contract_key_b58` matches the current WASM, there is no
+        // release-era before the current one whose state could live
+        // on the network under this prefix — the site was created
+        // under the current contract WASM. Skipping the sweep avoids
+        // a startup thundering herd: N sites × M legacy hashes of
+        // redundant GETs that will all NotFound.
+        if old_key_b58.is_none() || stored_key_is_stale {
+            super::operations::fire_legacy_contract_migrations(&prefix, &new_key_b58);
+        }
     }
 
     // Replay any pending hash navigation (from deep link)

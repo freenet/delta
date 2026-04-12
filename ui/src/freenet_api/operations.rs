@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::state::{self, KnownSite, SiteRole};
 use dioxus::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Site contract WASM (embedded at build time).
 const SITE_CONTRACT_WASM: &[u8] = include_bytes!("../../public/contracts/site_contract.wasm");
@@ -35,6 +35,89 @@ include!(concat!(env!("OUT_DIR"), "/legacy_contracts.rs"));
 static PENDING_MIGRATIONS: GlobalSignal<BTreeMap<String, String>> =
     GlobalSignal::new(BTreeMap::new);
 
+/// Prefixes whose initial state capture is in progress.
+///
+/// Populated by `restore_known_sites` for each site it is restoring,
+/// and cleared the first time a GET response arrives with non-empty
+/// state for that prefix. While a prefix is in this set, ANY
+/// subsequent non-empty state response for the same prefix — migration
+/// or current-key — is dropped, so a late arrival from an older hash
+/// cannot overwrite state just captured from a newer source.
+///
+/// Once a prefix has been captured (or the user edits/adds a site
+/// outside the startup path), it leaves this set and `handle_site_state`
+/// behaves normally: subsequent `UpdateNotification` state pushes
+/// from the network are accepted for live update.
+static MIGRATING_PREFIXES: GlobalSignal<BTreeSet<String>> = GlobalSignal::new(BTreeSet::new);
+
+/// Register a prefix as "currently being captured from the network".
+/// Called by `restore_known_sites` before firing any GETs for it.
+pub fn mark_prefix_migrating(prefix: &str) {
+    MIGRATING_PREFIXES.with_mut(|set| {
+        set.insert(prefix.to_string());
+    });
+}
+
+/// True iff the given prefix is currently in its initial-capture
+/// window (see `MIGRATING_PREFIXES`).
+fn is_prefix_migrating(prefix: &str) -> bool {
+    MIGRATING_PREFIXES.read().contains(prefix)
+}
+
+/// Classification of an incoming GET response as determined by the
+/// (prefix, key, pending-migrations, migrating-prefixes) tuple. Exposed
+/// for unit testing the state machine in isolation from Dioxus signals
+/// and the WebSocket runtime.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GetClassification {
+    /// GET for a legacy/migration key that is currently pending. The
+    /// caller should process the state (if non-empty), PUT-migrate it
+    /// to the current key, cancel sibling probes for the prefix, and
+    /// remove this prefix from `MIGRATING_PREFIXES`.
+    PendingMigration { prefix: String },
+    /// GET for the current contract key belonging to a prefix that is
+    /// still being captured. The caller should process the state (if
+    /// non-empty), cancel sibling legacy probes for the prefix, and
+    /// remove the prefix from `MIGRATING_PREFIXES`. No migration PUT
+    /// is needed because the state is already under the current key.
+    InitialCurrentKey { prefix: String },
+    /// GET for a prefix that has already completed its initial capture
+    /// (or was never in the migration window). The response should be
+    /// treated as a live update — processed only if non-empty, no
+    /// migration bookkeeping.
+    LiveUpdate,
+    /// GET for a key we do not recognize at all (pending-migrations
+    /// lookup missed and the prefix cannot be resolved from the key).
+    /// Fall through to the delegate-backup path on NotFound; otherwise
+    /// treat as a live update.
+    Unknown,
+}
+
+/// Pure classifier used by `handle_contract_response::GetResponse`.
+/// Takes the key and three reads of global state so it can be tested
+/// with mocked inputs.
+pub(crate) fn classify_get_response(
+    key_b58: &str,
+    pending_migrations: &BTreeMap<String, String>,
+    migrating_prefixes: &BTreeSet<String>,
+    prefix_for_current_key: Option<&str>,
+) -> GetClassification {
+    if let Some(prefix) = pending_migrations.get(key_b58) {
+        return GetClassification::PendingMigration {
+            prefix: prefix.clone(),
+        };
+    }
+    match prefix_for_current_key {
+        Some(prefix) if migrating_prefixes.contains(prefix) => {
+            GetClassification::InitialCurrentKey {
+                prefix: prefix.to_string(),
+            }
+        }
+        Some(_) => GetClassification::LiveUpdate,
+        None => GetClassification::Unknown,
+    }
+}
+
 /// Handle an incoming response from the Freenet node.
 pub fn handle_response(response: HostResponse) {
     match response {
@@ -57,43 +140,80 @@ fn handle_contract_response(response: ContractResponse) {
             let key_b58 = key.encoded_contract_id();
             log(&format!("Delta: GET response for {key}"));
 
-            // Check if this is a migration GET (old key)
-            let migration_prefix = PENDING_MIGRATIONS.write().remove(&key_b58);
+            let prefix_for_key = find_prefix_for_contract_key(&key);
+            let classification = classify_get_response(
+                &key_b58,
+                &PENDING_MIGRATIONS.read(),
+                &MIGRATING_PREFIXES.read(),
+                prefix_for_key.as_deref(),
+            );
 
             let state_bytes = state.to_vec();
-            if let Some(prefix) = &migration_prefix {
-                if !state_bytes.is_empty() {
-                    // Migration: PUT state to new contract key.
+            match classification {
+                GetClassification::PendingMigration { prefix } => {
+                    // Clear this one entry up front so the classifier
+                    // doesn't re-fire for the same key on a duplicate
+                    // delivery. Sibling probes for the same prefix are
+                    // cleared below on success.
+                    PENDING_MIGRATIONS.write().remove(&key_b58);
+
+                    if state_bytes.is_empty() {
+                        log(&format!(
+                            "Delta: migration GET returned empty for site {prefix}"
+                        ));
+                        return;
+                    }
+                    if !is_prefix_migrating(&prefix) {
+                        // Some other probe already captured fresh
+                        // state for this prefix and removed it from
+                        // the migrating set. Drop the late arrival —
+                        // it would otherwise last-write-wins clobber
+                        // whatever we already captured.
+                        log(&format!(
+                            "Delta: dropping late migration response for {prefix} \
+                             (prefix already captured)"
+                        ));
+                        return;
+                    }
                     log(&format!(
                         "Delta: migrating state for site {prefix} from old key to new key"
                     ));
-                    let new_key = state::contract_key_from_prefix(prefix);
+                    let new_key = state::contract_key_from_prefix(&prefix);
                     handle_site_state(new_key, &state_bytes);
-                    migrate_state_to_new_key(prefix, &state_bytes);
-                    // Persist the new contract key so migration doesn't re-run
+                    migrate_state_to_new_key(&prefix, &state_bytes);
                     super::delegate::save_known_sites();
-                    // Cancel any concurrent legacy-hash probes still
-                    // in flight for this prefix — their responses, if
-                    // they land after ours, would overwrite the fresh
-                    // state with whatever lives at an older hash.
-                    clear_pending_migrations_for_prefix(prefix);
-                } else {
-                    // Old state gone from network — don't eagerly retry
-                    // the current key here. Several migration probes
-                    // may be running for the same prefix; let each one
-                    // resolve independently. If the current key itself
-                    // was not separately GET'd by the caller, the
-                    // NotFound branch below will still request it.
+                    finalize_prefix_capture(&prefix);
+                }
+                GetClassification::InitialCurrentKey { prefix } => {
+                    if state_bytes.is_empty() {
+                        // Empty state for the current key during the
+                        // initial capture window doesn't tell us
+                        // anything useful; let legacy probes resolve.
+                        log(&format!(
+                            "Delta: current-key GET returned empty for site {prefix} \
+                             during initial capture; awaiting legacy probes"
+                        ));
+                        return;
+                    }
                     log(&format!(
-                        "Delta: migration GET returned empty for site {prefix}"
+                        "Delta: captured fresh state for site {prefix} from current contract key"
                     ));
-                }
-            } else {
-                if !state_bytes.is_empty() {
                     handle_site_state(key, &state_bytes);
+                    finalize_prefix_capture(&prefix);
+                    subscribe_to_site_by_id(&key.id().clone());
                 }
-                // Subscribe AFTER successful GET
-                subscribe_to_site(&key);
+                GetClassification::LiveUpdate => {
+                    if !state_bytes.is_empty() {
+                        handle_site_state(key, &state_bytes);
+                    }
+                    subscribe_to_site(&key);
+                }
+                GetClassification::Unknown => {
+                    if !state_bytes.is_empty() {
+                        handle_site_state(key, &state_bytes);
+                    }
+                    subscribe_to_site(&key);
+                }
             }
         }
         ContractResponse::UpdateNotification { key, update } => {
@@ -401,6 +521,17 @@ pub fn fire_legacy_contract_migrations(prefix: &str, current_key_b58: &str) {
 /// after one migration GET resolves successfully, so that subsequent
 /// responses from probes for the same prefix (racing older contract
 /// hashes) can't overwrite the just-migrated state with stale data.
+/// Mark a prefix's initial capture as complete: cancel any remaining
+/// legacy-hash probes for it and remove it from `MIGRATING_PREFIXES`
+/// so that later responses take the `LiveUpdate` path and can't
+/// overwrite the captured state with stale data.
+fn finalize_prefix_capture(prefix: &str) {
+    clear_pending_migrations_for_prefix(prefix);
+    MIGRATING_PREFIXES.with_mut(|set| {
+        set.remove(prefix);
+    });
+}
+
 fn clear_pending_migrations_for_prefix(prefix: &str) {
     PENDING_MIGRATIONS.with_mut(|pending| {
         pending.retain(|_, p| p != prefix);
@@ -575,6 +706,88 @@ mod tests {
         arr
     }
 
+    fn pending(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn migrating(prefixes: &[&str]) -> BTreeSet<String> {
+        prefixes.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn classifier_routes_pending_migration_key_even_if_prefix_not_migrating() {
+        // A legacy-hash probe response must route through the
+        // migration branch because the key itself is in
+        // PENDING_MIGRATIONS, regardless of whether the prefix is
+        // still in MIGRATING_PREFIXES. (The caller later checks the
+        // migrating flag to decide whether to drop a late response.)
+        let pending = pending(&[("legacy_key_b58", "abcdef1234")]);
+        let migrating = migrating(&[]);
+        let c = classify_get_response("legacy_key_b58", &pending, &migrating, None);
+        assert_eq!(
+            c,
+            GetClassification::PendingMigration {
+                prefix: "abcdef1234".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn classifier_routes_current_key_during_initial_capture() {
+        // GET for the current contract key (not in PENDING_MIGRATIONS)
+        // while its prefix is still in the initial-capture window must
+        // be treated as `InitialCurrentKey` so the caller can cancel
+        // sibling legacy probes once this one succeeds.
+        let pending = pending(&[]);
+        let migrating = migrating(&["abcdef1234"]);
+        let c = classify_get_response("current_key_b58", &pending, &migrating, Some("abcdef1234"));
+        assert_eq!(
+            c,
+            GetClassification::InitialCurrentKey {
+                prefix: "abcdef1234".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn classifier_routes_post_capture_to_live_update() {
+        // Same current-key GET *after* the prefix has been removed
+        // from MIGRATING_PREFIXES must route to LiveUpdate so normal
+        // UpdateNotification merging continues to work in steady state.
+        let pending = pending(&[]);
+        let migrating = migrating(&[]);
+        let c = classify_get_response("current_key_b58", &pending, &migrating, Some("abcdef1234"));
+        assert_eq!(c, GetClassification::LiveUpdate);
+    }
+
+    #[test]
+    fn classifier_routes_unknown_key_to_unknown() {
+        let pending = pending(&[]);
+        let migrating = migrating(&[]);
+        let c = classify_get_response("mystery_key", &pending, &migrating, None);
+        assert_eq!(c, GetClassification::Unknown);
+    }
+
+    #[test]
+    fn classifier_prefers_pending_over_migrating_set() {
+        // If a key is BOTH in PENDING_MIGRATIONS and its prefix is in
+        // MIGRATING_PREFIXES, the pending branch must win — we need
+        // to run the migration PUT, which the InitialCurrentKey
+        // branch would skip.
+        let pending = pending(&[("legacy_key", "abcdef1234")]);
+        let migrating = migrating(&["abcdef1234"]);
+        let c = classify_get_response("legacy_key", &pending, &migrating, Some("abcdef1234"));
+        assert_eq!(
+            c,
+            GetClassification::PendingMigration {
+                prefix: "abcdef1234".to_string()
+            }
+        );
+    }
+
     #[test]
     fn contract_id_is_deterministic_and_depends_on_both_hash_and_prefix() {
         // Different hashes must produce different IDs for the same prefix.
@@ -613,6 +826,26 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(ids.len(), sorted.len(), "legacy ids must be unique");
+    }
+
+    #[test]
+    fn contract_id_matches_state_key_derivation_for_current_wasm() {
+        // Cross-consistency guard: `contract_id_for_prefix_with_hash`
+        // (used for legacy probes) and `state::contract_key_from_prefix`
+        // (used for the current key) must agree when called with the
+        // current WASM's hash. If freenet-stdlib ever changes its
+        // `ContractKey::from_params_and_code` internals in a
+        // backwards-incompatible way, this test catches it before a
+        // release strands users.
+        let current_wasm_hash: [u8; 32] = blake3::hash(SITE_CONTRACT_WASM).into();
+        let prefix = "abcdef1234";
+        let ours = contract_id_for_prefix_with_hash(prefix, &current_wasm_hash);
+        let theirs = state::contract_key_from_prefix(prefix).encoded_contract_id();
+        assert_eq!(
+            ours, theirs,
+            "legacy-probe key derivation must match state::contract_key_from_prefix; \
+             freenet-stdlib may have changed ContractKey::from_params_and_code"
+        );
     }
 
     #[test]
