@@ -12,7 +12,8 @@ delta/
 ├── ui/               # Dioxus web UI (compiled to WASM)
 ├── published-contract/ # Committed web container WASM + params
 ├── legacy_delegates.toml  # Migration entries for delegate WASM changes
-├── scripts/          # add-migration.sh, sync-wasm.sh
+├── legacy_contracts.toml  # Migration entries for contract WASM changes
+├── scripts/          # add-migration.sh, add-contract-migration.sh, sync-wasm.sh
 └── Makefile.toml     # Build tasks
 ```
 
@@ -107,6 +108,24 @@ The new contract validates all signatures and accepts the state.
 
 This happens automatically - no user action needed.
 
+**Multi-hop migration fallback:** when a restored `KnownSiteRecord`
+has no `contract_key_b58` (legacy delegates from before b82d3bc) or
+when the stored key itself refers to a hash no longer on the network,
+the UI additionally probes every previous contract WASM hash recorded
+in `legacy_contracts.toml`. The first GET that returns non-empty
+state wins, and concurrent probes for the same prefix are cancelled
+so a slower response from an older hash can't overwrite fresh state.
+
+**Recording contract WASM hashes is part of the release process.**
+Any commit that changes `site_contract.wasm` — including an incidental
+rebuild caused by touching `common/`, even if the contract's own
+source is unchanged — must first record the currently-committed
+contract WASM hash via `./scripts/add-contract-migration.sh`. The
+`check-migration.sh` preflight script enforces this by comparing the
+previous git-tracked hash against the entries in
+`legacy_contracts.toml` and refusing to publish if the predecessor
+is missing.
+
 ### Delegate WASM Migration
 
 When `site_delegate.wasm` changes, the delegate key changes and stored secrets (signing keys, known sites) become inaccessible under the old key.
@@ -120,19 +139,24 @@ Migration entries in `legacy_delegates.toml` allow the UI to read from old deleg
 ### Upgrade Workflow
 
 ```bash
-# 1. Record old delegate WASM hash (BEFORE code changes)
+# 1. Record old delegate + contract WASM hashes (BEFORE any code change).
+#    Run whichever applies — delegate-only changes don't need the
+#    contract entry, and vice-versa. Changes to `common/` touch BOTH
+#    WASMs because the contract and delegate both depend on delta-core.
 ./scripts/add-migration.sh V2 "Before adding deleted_pages field"
+./scripts/add-contract-migration.sh C3 "Before adding deleted_pages field"
 
 # 2. Make code changes
 
 # 3. Rebuild WASMs
 ./scripts/sync-wasm.sh
 
-# 4. Build and publish
+# 4. Build and publish (preflight check-migration.sh runs automatically
+#    and refuses to publish if a previous hash was not recorded)
 cargo make publish-delta
 
 # 5. Commit everything
-git add legacy_delegates.toml ui/public/contracts/ common/ contracts/
+git add legacy_delegates.toml legacy_contracts.toml ui/public/contracts/ common/ contracts/
 git commit -m "fix: description with delegate migration"
 git push
 ```

@@ -1,0 +1,40 @@
+# Legacy Contract Registry
+#
+# Contract WASM hashes shipped by previous Delta releases. When the
+# contract WASM changes (code changes, dependency updates, or incidental
+# rebuilds caused by modifying `common/`), the contract_key of every
+# site changes because contract_key = BLAKE3(BLAKE3(wasm) || params).
+#
+# For sites where `KnownSiteRecord.contract_key_b58` is persisted, the
+# delegate-stored key is authoritative and this list is not consulted.
+# But records restored from pre-b82d3bc delegates, or any other path
+# where the stored key is missing or stale, need a way to find their
+# state on the network. On startup the UI iterates every entry here
+# and issues a migration GET for each, then PUTs whichever state
+# arrives back under the current contract key.
+#
+# Fields:
+#   code_hash    = BLAKE3 hash of the raw contract WASM bytes (hex, 64 chars)
+#
+# To add a new entry:  ./scripts/add-contract-migration.sh VERSION "DESCRIPTION"
+#   Run this BEFORE modifying `common/` or the contract so that the
+#   committed `ui/public/contracts/site_contract.wasm` is still the
+#   old release's WASM when its hash is recorded.
+
+[[entry]]
+version = "C1"
+description = "Pre-tombstone WASM (commit 2e664c3)"
+date = "2026-03-29"
+code_hash = "1188d108180a4143e6e4107b193cb90d5c08644e3830499f46186f141f182e81"
+
+[[entry]]
+version = "C2"
+description = "Pre-V7 WASM (f5ecff5, before per-prefix export signing key)"
+date = "2026-04-09"
+code_hash = "b92da83dae278fcdc237d976ec926ee2fdca20e817662ae8a3aeaf09aaf47fa4"
+
+[[entry]]
+version = "C3"
+description = "V7 WASM (62fe35b/356e6b6, before reproducible builds)"
+date = "2026-04-12"
+code_hash = "53e3395f42d563e6095e6b21d76d6dbcb9db2fc4068fc6705a353f6f46f48778"

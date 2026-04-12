@@ -7,58 +7,116 @@ use std::sync::Arc;
 
 use crate::state::{self, KnownSite, SiteRole};
 use dioxus::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Site contract WASM (embedded at build time).
 const SITE_CONTRACT_WASM: &[u8] = include_bytes!("../../public/contracts/site_contract.wasm");
 
-/// Previous contract WASM BLAKE3 hash — the hash of the contract that
-/// shipped in the immediately-preceding Delta release. Used as a
-/// one-hop fallback when a restored KnownSiteRecord has no
-/// `contract_key_b58` (e.g. legacy delegates from before
-/// b82d3bc that pre-dated the field). For sites that *do* carry
-/// a stored key, that key takes precedence and this constant is unused.
-///
-/// **Must be updated before every release** whose commit changes
-/// `site_contract.wasm` — otherwise users of the previous release whose
-/// legacy delegate didn't persist `contract_key_b58` will be unable to
-/// reach their existing site state and see a permanent "Loading..."
-/// screen. A change to `common/src/state.rs` (e.g. adding a new
-/// `DelegateRequest` variant) is enough to perturb the contract hash
-/// because the contract depends on `delta-core`.
-///
-/// Previous value `1188d108…` (commit 2e664c3) covered the pre-tombstone
-/// WASM but was never updated through subsequent releases, silently
-/// breaking migration whenever someone deployed a new contract WASM.
-const OLD_WASM_HASH: [u8; 32] =
-    hex_literal("b92da83dae278fcdc237d976ec926ee2fdca20e817662ae8a3aeaf09aaf47fa4");
-
-const fn hex_literal(s: &str) -> [u8; 32] {
-    let bytes = s.as_bytes();
-    let mut result = [0u8; 32];
-    let mut i = 0;
-    while i < 32 {
-        let hi = hex_nibble(bytes[i * 2]);
-        let lo = hex_nibble(bytes[i * 2 + 1]);
-        result[i] = (hi << 4) | lo;
-        i += 1;
-    }
-    result
-}
-
-const fn hex_nibble(b: u8) -> u8 {
-    match b {
-        b'0'..=b'9' => b - b'0',
-        b'a'..=b'f' => b - b'a' + 10,
-        b'A'..=b'F' => b - b'A' + 10,
-        _ => panic!("invalid hex character in OLD_WASM_HASH"),
-    }
-}
+// BLAKE3 hashes of every previous `site_contract.wasm` shipped by Delta,
+// generated from `legacy_contracts.toml` by `ui/build.rs`.
+//
+// Every release commit that changes `site_contract.wasm` (including
+// incidental rebuilds caused by touching `common/`) must first record
+// the committed WASM hash via `./scripts/add-contract-migration.sh`
+// and commit the updated `legacy_contracts.toml`. Without this, users
+// of the previous release whose delegate-stored `contract_key_b58`
+// is missing or stale are unable to reach their existing site state
+// and see a permanent "Loading..." screen.
+include!(concat!(env!("OUT_DIR"), "/legacy_contracts.rs"));
 
 /// Pending migrations: maps old contract key (base58) -> site prefix.
 /// When a GET response arrives for an old key, we PUT the state to the new key.
+///
+/// Multiple old keys may be registered for the same prefix when the UI is
+/// probing several historical contract WASM hashes at startup; the first
+/// GET that returns non-empty state wins and the rest are cleared by
+/// `clear_pending_migrations_for_prefix` to prevent an older state from
+/// racing ahead of a newer one.
 static PENDING_MIGRATIONS: GlobalSignal<BTreeMap<String, String>> =
     GlobalSignal::new(BTreeMap::new);
+
+/// Prefixes whose initial state capture is in progress.
+///
+/// Populated by `restore_known_sites` for each site it is restoring,
+/// and cleared the first time a GET response arrives with non-empty
+/// state for that prefix. While a prefix is in this set, ANY
+/// subsequent non-empty state response for the same prefix — migration
+/// or current-key — is dropped, so a late arrival from an older hash
+/// cannot overwrite state just captured from a newer source.
+///
+/// Once a prefix has been captured (or the user edits/adds a site
+/// outside the startup path), it leaves this set and `handle_site_state`
+/// behaves normally: subsequent `UpdateNotification` state pushes
+/// from the network are accepted for live update.
+static MIGRATING_PREFIXES: GlobalSignal<BTreeSet<String>> = GlobalSignal::new(BTreeSet::new);
+
+/// Register a prefix as "currently being captured from the network".
+/// Called by `restore_known_sites` before firing any GETs for it.
+pub fn mark_prefix_migrating(prefix: &str) {
+    MIGRATING_PREFIXES.with_mut(|set| {
+        set.insert(prefix.to_string());
+    });
+}
+
+/// True iff the given prefix is currently in its initial-capture
+/// window (see `MIGRATING_PREFIXES`).
+fn is_prefix_migrating(prefix: &str) -> bool {
+    MIGRATING_PREFIXES.read().contains(prefix)
+}
+
+/// Classification of an incoming GET response as determined by the
+/// (prefix, key, pending-migrations, migrating-prefixes) tuple. Exposed
+/// for unit testing the state machine in isolation from Dioxus signals
+/// and the WebSocket runtime.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum GetClassification {
+    /// GET for a legacy/migration key that is currently pending. The
+    /// caller should process the state (if non-empty), PUT-migrate it
+    /// to the current key, cancel sibling probes for the prefix, and
+    /// remove this prefix from `MIGRATING_PREFIXES`.
+    PendingMigration { prefix: String },
+    /// GET for the current contract key belonging to a prefix that is
+    /// still being captured. The caller should process the state (if
+    /// non-empty), cancel sibling legacy probes for the prefix, and
+    /// remove the prefix from `MIGRATING_PREFIXES`. No migration PUT
+    /// is needed because the state is already under the current key.
+    InitialCurrentKey { prefix: String },
+    /// GET for a prefix that has already completed its initial capture
+    /// (or was never in the migration window). The response should be
+    /// treated as a live update — processed only if non-empty, no
+    /// migration bookkeeping.
+    LiveUpdate,
+    /// GET for a key we do not recognize at all (pending-migrations
+    /// lookup missed and the prefix cannot be resolved from the key).
+    /// Fall through to the delegate-backup path on NotFound; otherwise
+    /// treat as a live update.
+    Unknown,
+}
+
+/// Pure classifier used by `handle_contract_response::GetResponse`.
+/// Takes the key and three reads of global state so it can be tested
+/// with mocked inputs.
+pub(crate) fn classify_get_response(
+    key_b58: &str,
+    pending_migrations: &BTreeMap<String, String>,
+    migrating_prefixes: &BTreeSet<String>,
+    prefix_for_current_key: Option<&str>,
+) -> GetClassification {
+    if let Some(prefix) = pending_migrations.get(key_b58) {
+        return GetClassification::PendingMigration {
+            prefix: prefix.clone(),
+        };
+    }
+    match prefix_for_current_key {
+        Some(prefix) if migrating_prefixes.contains(prefix) => {
+            GetClassification::InitialCurrentKey {
+                prefix: prefix.to_string(),
+            }
+        }
+        Some(_) => GetClassification::LiveUpdate,
+        None => GetClassification::Unknown,
+    }
+}
 
 /// Handle an incoming response from the Freenet node.
 pub fn handle_response(response: HostResponse) {
@@ -82,36 +140,80 @@ fn handle_contract_response(response: ContractResponse) {
             let key_b58 = key.encoded_contract_id();
             log(&format!("Delta: GET response for {key}"));
 
-            // Check if this is a migration GET (old key)
-            let migration_prefix = PENDING_MIGRATIONS.write().remove(&key_b58);
+            let prefix_for_key = find_prefix_for_contract_key(&key);
+            let classification = classify_get_response(
+                &key_b58,
+                &PENDING_MIGRATIONS.read(),
+                &MIGRATING_PREFIXES.read(),
+                prefix_for_key.as_deref(),
+            );
 
             let state_bytes = state.to_vec();
-            if let Some(prefix) = &migration_prefix {
-                if !state_bytes.is_empty() {
-                    // Migration: PUT state to new contract key
+            match classification {
+                GetClassification::PendingMigration { prefix } => {
+                    // Clear this one entry up front so the classifier
+                    // doesn't re-fire for the same key on a duplicate
+                    // delivery. Sibling probes for the same prefix are
+                    // cleared below on success.
+                    PENDING_MIGRATIONS.write().remove(&key_b58);
+
+                    if state_bytes.is_empty() {
+                        log(&format!(
+                            "Delta: migration GET returned empty for site {prefix}"
+                        ));
+                        return;
+                    }
+                    if !is_prefix_migrating(&prefix) {
+                        // Some other probe already captured fresh
+                        // state for this prefix and removed it from
+                        // the migrating set. Drop the late arrival —
+                        // it would otherwise last-write-wins clobber
+                        // whatever we already captured.
+                        log(&format!(
+                            "Delta: dropping late migration response for {prefix} \
+                             (prefix already captured)"
+                        ));
+                        return;
+                    }
                     log(&format!(
                         "Delta: migrating state for site {prefix} from old key to new key"
                     ));
-                    let new_key = state::contract_key_from_prefix(prefix);
+                    let new_key = state::contract_key_from_prefix(&prefix);
                     handle_site_state(new_key, &state_bytes);
-                    // PUT to new contract (subscribe: true in PUT handles subscription)
-                    migrate_state_to_new_key(prefix, &state_bytes);
-                    // Persist the new contract key so migration doesn't re-run
+                    migrate_state_to_new_key(&prefix, &state_bytes);
                     super::delegate::save_known_sites();
-                } else {
-                    // Old state gone from network - fall back to normal GET on new key
+                    finalize_prefix_capture(&prefix);
+                }
+                GetClassification::InitialCurrentKey { prefix } => {
+                    if state_bytes.is_empty() {
+                        // Empty state for the current key during the
+                        // initial capture window doesn't tell us
+                        // anything useful; let legacy probes resolve.
+                        log(&format!(
+                            "Delta: current-key GET returned empty for site {prefix} \
+                             during initial capture; awaiting legacy probes"
+                        ));
+                        return;
+                    }
                     log(&format!(
-                        "Delta: migration GET returned empty for site {prefix}, trying new key"
+                        "Delta: captured fresh state for site {prefix} from current contract key"
                     ));
-                    let new_key = state::contract_key_from_prefix(prefix);
-                    get_site(&new_key);
-                }
-            } else {
-                if !state_bytes.is_empty() {
                     handle_site_state(key, &state_bytes);
+                    finalize_prefix_capture(&prefix);
+                    subscribe_to_site_by_id(&key.id().clone());
                 }
-                // Subscribe AFTER successful GET
-                subscribe_to_site(&key);
+                GetClassification::LiveUpdate => {
+                    if !state_bytes.is_empty() {
+                        handle_site_state(key, &state_bytes);
+                    }
+                    subscribe_to_site(&key);
+                }
+                GetClassification::Unknown => {
+                    if !state_bytes.is_empty() {
+                        handle_site_state(key, &state_bytes);
+                    }
+                    subscribe_to_site(&key);
+                }
             }
         }
         ContractResponse::UpdateNotification { key, update } => {
@@ -138,21 +240,25 @@ fn handle_contract_response(response: ContractResponse) {
         ContractResponse::NotFound { instance_id } => {
             let key_b58 = instance_id.encode();
             log(&format!("Delta: contract not found: {key_b58}"));
-            // Clean up any pending migration for this key
-            if let Some(prefix) = PENDING_MIGRATIONS.write().remove(&key_b58) {
+            // Clean up any pending migration for this key. The caller
+            // in `restore_known_sites` always issues a GET for the
+            // current contract key alongside the legacy-hash probes,
+            // so a NotFound on one legacy hash does not need to retry
+            // the current key here — that GET is already in flight.
+            if PENDING_MIGRATIONS.write().remove(&key_b58).is_some() {
                 log(&format!(
-                    "Delta: old contract gone for site {prefix}, falling back to new key"
+                    "Delta: legacy contract key {key_b58} has no state; \
+                     another probe may still succeed"
                 ));
-                let new_key = state::contract_key_from_prefix(&prefix);
-                get_site(&new_key);
-            } else {
-                // Network doesn't have this contract -- try restoring from delegate backup
-                if let Some(prefix) = find_prefix_for_contract_key_b58(&key_b58) {
-                    log(&format!(
-                        "Delta: contract not found on network, trying delegate backup for {prefix}"
-                    ));
-                    super::delegate::request_site_state_backup(&prefix);
-                }
+            } else if let Some(prefix) = find_prefix_for_contract_key_b58(&key_b58) {
+                // Network doesn't have this contract under its current
+                // key either — try restoring from a delegate backup.
+                // Only runs for sites whose current key is unknown to
+                // the network; legacy-hash probes never reach here.
+                log(&format!(
+                    "Delta: contract not found on network, trying delegate backup for {prefix}"
+                ));
+                super::delegate::request_site_state_backup(&prefix);
             }
         }
         other => {
@@ -322,21 +428,39 @@ pub fn get_site_by_id(id: &ContractInstanceId) {
     });
 }
 
-/// Compute a contract instance ID using the old WASM hash and a prefix.
-/// This lets us find state at the old contract key after a WASM upgrade.
-pub fn old_contract_id_for_prefix(prefix: &str) -> String {
+/// Compute the contract instance ID for a given `prefix` under a
+/// specific contract WASM hash. `ContractInstanceId =
+/// BLAKE3(BLAKE3(wasm) || CBOR(params))`, where BLAKE3(wasm) is already
+/// `wasm_code_hash`.
+fn contract_id_for_prefix_with_hash(prefix: &str, wasm_code_hash: &[u8; 32]) -> String {
     let params = delta_core::SiteParameters {
         prefix: prefix.to_string(),
     };
     let mut params_buf = Vec::new();
     ciborium::ser::into_writer(&params, &mut params_buf).expect("CBOR params");
 
-    // ContractInstanceId = BLAKE3(BLAKE3(wasm) || params)
     let mut hasher = blake3::Hasher::new();
-    hasher.update(&OLD_WASM_HASH);
+    hasher.update(wasm_code_hash);
     hasher.update(&params_buf);
-    let hash = hasher.finalize();
-    bs58::encode(hash.as_bytes()).into_string()
+    bs58::encode(hasher.finalize().as_bytes()).into_string()
+}
+
+/// Legacy contract instance IDs for a given site prefix — one per
+/// historical `site_contract.wasm` hash recorded in
+/// `legacy_contracts.toml`. The caller fires a migration GET for each
+/// so that sites whose on-network state lives under any prior contract
+/// key can be rescued, not just the immediately-preceding release.
+///
+/// The current contract key is excluded: callers should issue a normal
+/// `get_site` for the current key separately.
+pub fn legacy_contract_ids_for_prefix(prefix: &str, current_id_b58: &str) -> Vec<String> {
+    LEGACY_CONTRACT_HASHES
+        .iter()
+        .map(|hash| contract_id_for_prefix_with_hash(prefix, hash))
+        .filter(|id| id != current_id_b58)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// GET from an old contract key for migration purposes.
@@ -372,6 +496,45 @@ pub fn get_for_migration(old_key_b58: &str, prefix: &str) {
             });
             api.send(request).await
         })
+    });
+}
+
+/// Fire migration GETs for every historical contract WASM hash recorded
+/// in `legacy_contracts.toml`. Called for sites with a missing or stale
+/// `contract_key_b58` so that state stored under any past contract key
+/// can be rescued, not just the immediately-preceding release.
+pub fn fire_legacy_contract_migrations(prefix: &str, current_key_b58: &str) {
+    let legacy_ids = legacy_contract_ids_for_prefix(prefix, current_key_b58);
+    if legacy_ids.is_empty() {
+        return;
+    }
+    log(&format!(
+        "Delta: probing {} legacy contract hash(es) for site {prefix}",
+        legacy_ids.len()
+    ));
+    for old_b58 in legacy_ids {
+        get_for_migration(&old_b58, prefix);
+    }
+}
+
+/// Drop every pending migration entry whose target is `prefix`. Called
+/// after one migration GET resolves successfully, so that subsequent
+/// responses from probes for the same prefix (racing older contract
+/// hashes) can't overwrite the just-migrated state with stale data.
+/// Mark a prefix's initial capture as complete: cancel any remaining
+/// legacy-hash probes for it and remove it from `MIGRATING_PREFIXES`
+/// so that later responses take the `LiveUpdate` path and can't
+/// overwrite the captured state with stale data.
+fn finalize_prefix_capture(prefix: &str) {
+    clear_pending_migrations_for_prefix(prefix);
+    MIGRATING_PREFIXES.with_mut(|set| {
+        set.remove(prefix);
+    });
+}
+
+fn clear_pending_migrations_for_prefix(prefix: &str) {
+    PENDING_MIGRATIONS.with_mut(|pending| {
+        pending.retain(|_, p| p != prefix);
     });
 }
 
@@ -527,4 +690,173 @@ fn log(msg: &str) {
     web_sys::console::log_1(&msg.into());
     #[cfg(not(target_arch = "wasm32"))]
     eprintln!("{msg}");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex32(s: &str) -> [u8; 32] {
+        let bytes: Vec<u8> = (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect();
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        arr
+    }
+
+    fn pending(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn migrating(prefixes: &[&str]) -> BTreeSet<String> {
+        prefixes.iter().map(|p| p.to_string()).collect()
+    }
+
+    #[test]
+    fn classifier_routes_pending_migration_key_even_if_prefix_not_migrating() {
+        // A legacy-hash probe response must route through the
+        // migration branch because the key itself is in
+        // PENDING_MIGRATIONS, regardless of whether the prefix is
+        // still in MIGRATING_PREFIXES. (The caller later checks the
+        // migrating flag to decide whether to drop a late response.)
+        let pending = pending(&[("legacy_key_b58", "abcdef1234")]);
+        let migrating = migrating(&[]);
+        let c = classify_get_response("legacy_key_b58", &pending, &migrating, None);
+        assert_eq!(
+            c,
+            GetClassification::PendingMigration {
+                prefix: "abcdef1234".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn classifier_routes_current_key_during_initial_capture() {
+        // GET for the current contract key (not in PENDING_MIGRATIONS)
+        // while its prefix is still in the initial-capture window must
+        // be treated as `InitialCurrentKey` so the caller can cancel
+        // sibling legacy probes once this one succeeds.
+        let pending = pending(&[]);
+        let migrating = migrating(&["abcdef1234"]);
+        let c = classify_get_response("current_key_b58", &pending, &migrating, Some("abcdef1234"));
+        assert_eq!(
+            c,
+            GetClassification::InitialCurrentKey {
+                prefix: "abcdef1234".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn classifier_routes_post_capture_to_live_update() {
+        // Same current-key GET *after* the prefix has been removed
+        // from MIGRATING_PREFIXES must route to LiveUpdate so normal
+        // UpdateNotification merging continues to work in steady state.
+        let pending = pending(&[]);
+        let migrating = migrating(&[]);
+        let c = classify_get_response("current_key_b58", &pending, &migrating, Some("abcdef1234"));
+        assert_eq!(c, GetClassification::LiveUpdate);
+    }
+
+    #[test]
+    fn classifier_routes_unknown_key_to_unknown() {
+        let pending = pending(&[]);
+        let migrating = migrating(&[]);
+        let c = classify_get_response("mystery_key", &pending, &migrating, None);
+        assert_eq!(c, GetClassification::Unknown);
+    }
+
+    #[test]
+    fn classifier_prefers_pending_over_migrating_set() {
+        // If a key is BOTH in PENDING_MIGRATIONS and its prefix is in
+        // MIGRATING_PREFIXES, the pending branch must win — we need
+        // to run the migration PUT, which the InitialCurrentKey
+        // branch would skip.
+        let pending = pending(&[("legacy_key", "abcdef1234")]);
+        let migrating = migrating(&["abcdef1234"]);
+        let c = classify_get_response("legacy_key", &pending, &migrating, Some("abcdef1234"));
+        assert_eq!(
+            c,
+            GetClassification::PendingMigration {
+                prefix: "abcdef1234".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn contract_id_is_deterministic_and_depends_on_both_hash_and_prefix() {
+        // Different hashes must produce different IDs for the same prefix.
+        let h1 = hex32("1188d108180a4143e6e4107b193cb90d5c08644e3830499f46186f141f182e81");
+        let h2 = hex32("b92da83dae278fcdc237d976ec926ee2fdca20e817662ae8a3aeaf09aaf47fa4");
+        let id1 = contract_id_for_prefix_with_hash("abcdef1234", &h1);
+        let id2 = contract_id_for_prefix_with_hash("abcdef1234", &h2);
+        assert_ne!(id1, id2, "different WASM hashes must yield different keys");
+
+        // Same inputs must be deterministic.
+        assert_eq!(id1, contract_id_for_prefix_with_hash("abcdef1234", &h1));
+
+        // Different prefixes under the same hash must differ.
+        let id_other = contract_id_for_prefix_with_hash("wxyz123456", &h1);
+        assert_ne!(id1, id_other);
+    }
+
+    #[test]
+    fn legacy_ids_are_deduplicated_and_exclude_current() {
+        // Pretend the "current" key matches one of the legacy hashes by
+        // passing its base58 as current_id_b58; that hash must drop out
+        // of the probe set so the UI doesn't redundantly GET its own key.
+        let legacy = hex32("1188d108180a4143e6e4107b193cb90d5c08644e3830499f46186f141f182e81");
+        let pretend_current = contract_id_for_prefix_with_hash("abcdef1234", &legacy);
+
+        let ids = legacy_contract_ids_for_prefix("abcdef1234", &pretend_current);
+        assert!(
+            !ids.contains(&pretend_current),
+            "current key must be filtered out of the legacy probe set"
+        );
+
+        // Whatever comes back must be a unique set — the test doesn't
+        // know the exact count (depends on legacy_contracts.toml) but
+        // it must match the de-duplicated expectation.
+        let mut sorted = ids.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(ids.len(), sorted.len(), "legacy ids must be unique");
+    }
+
+    #[test]
+    fn contract_id_matches_state_key_derivation_for_current_wasm() {
+        // Cross-consistency guard: `contract_id_for_prefix_with_hash`
+        // (used for legacy probes) and `state::contract_key_from_prefix`
+        // (used for the current key) must agree when called with the
+        // current WASM's hash. If freenet-stdlib ever changes its
+        // `ContractKey::from_params_and_code` internals in a
+        // backwards-incompatible way, this test catches it before a
+        // release strands users.
+        let current_wasm_hash: [u8; 32] = blake3::hash(SITE_CONTRACT_WASM).into();
+        let prefix = "abcdef1234";
+        let ours = contract_id_for_prefix_with_hash(prefix, &current_wasm_hash);
+        let theirs = state::contract_key_from_prefix(prefix).encoded_contract_id();
+        assert_eq!(
+            ours, theirs,
+            "legacy-probe key derivation must match state::contract_key_from_prefix; \
+             freenet-stdlib may have changed ContractKey::from_params_and_code"
+        );
+    }
+
+    #[test]
+    fn legacy_contract_hashes_table_is_populated() {
+        // Guard against an empty or mis-generated legacy_contracts.rs:
+        // without at least one entry, users of the immediately-preceding
+        // release who hit the no-stored-key path have no fallback.
+        assert!(
+            !LEGACY_CONTRACT_HASHES.is_empty(),
+            "legacy_contracts.toml must contain at least one entry so that users \
+             of the previous release can migrate their site state"
+        );
+    }
 }
