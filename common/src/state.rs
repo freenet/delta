@@ -579,6 +579,11 @@ pub fn is_site_owned(
 }
 
 /// A lightweight record of a known site (stored in delegate for persistence).
+///
+/// Records with `name == TOMBSTONE_NAME_SENTINEL` are tombstones for sites
+/// the user explicitly removed. They are stored alongside real records in
+/// the delegate so that deletions survive a page refresh and cannot be
+/// resurrected by a legacy delegate returning stale data.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct KnownSiteRecord {
     pub prefix: String,
@@ -588,6 +593,28 @@ pub struct KnownSiteRecord {
     /// Used to detect contract WASM upgrades and migrate state.
     #[serde(default)]
     pub contract_key_b58: Option<String>,
+}
+
+/// Sentinel value stored in `KnownSiteRecord::name` to mark a record as a
+/// tombstone for a removed site. The NUL prefix guarantees the sentinel
+/// can never collide with a user-supplied site name (UI input strips NULs).
+pub const TOMBSTONE_NAME_SENTINEL: &str = "\u{0000}__delta_removed__";
+
+impl KnownSiteRecord {
+    /// Build a tombstone record for a removed site prefix.
+    pub fn tombstone(prefix: impl Into<String>) -> Self {
+        Self {
+            prefix: prefix.into(),
+            name: TOMBSTONE_NAME_SENTINEL.to_string(),
+            is_owner: false,
+            contract_key_b58: None,
+        }
+    }
+
+    /// Returns true if this record is a removed-site tombstone.
+    pub fn is_tombstone(&self) -> bool {
+        self.name == TOMBSTONE_NAME_SENTINEL
+    }
 }
 
 /// Requests from the UI to the delegate.
@@ -892,6 +919,42 @@ mod tests {
         let mut tampered = page.clone();
         tampered.order = 10;
         assert!(tampered.verify(1, &owner.verifying_key()).is_err());
+    }
+
+    #[test]
+    fn known_site_record_tombstone_roundtrip() {
+        // The tombstone sentinel must survive a CBOR roundtrip through the
+        // existing KnownSiteRecord schema so that no delegate WASM change
+        // is required to persist removed-site tombstones.
+        let real = KnownSiteRecord {
+            prefix: "abcdef1234".into(),
+            name: "My Site".into(),
+            is_owner: true,
+            contract_key_b58: Some("ck".into()),
+        };
+        let tomb = KnownSiteRecord::tombstone("xyz9876543");
+        assert!(!real.is_tombstone());
+        assert!(tomb.is_tombstone());
+
+        let records = vec![real.clone(), tomb.clone()];
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&records, &mut buf).unwrap();
+        let decoded: Vec<KnownSiteRecord> = ciborium::de::from_reader(buf.as_slice()).unwrap();
+        assert_eq!(decoded.len(), 2);
+        assert!(!decoded[0].is_tombstone());
+        assert_eq!(decoded[0].prefix, "abcdef1234");
+        assert!(decoded[1].is_tombstone());
+        assert_eq!(decoded[1].prefix, "xyz9876543");
+
+        // A record whose name happens to start with NUL but differs must
+        // NOT be treated as a tombstone.
+        let fake = KnownSiteRecord {
+            prefix: "p".into(),
+            name: "\u{0000}not_removed".into(),
+            is_owner: false,
+            contract_key_b58: None,
+        };
+        assert!(!fake.is_tombstone());
     }
 
     #[test]
