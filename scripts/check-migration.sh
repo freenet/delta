@@ -20,7 +20,7 @@ CURRENT_HASH=$(b3sum "$COMMITTED" | cut -d' ' -f1)
 
 # Build the delegate from source and compare
 echo "Building delegate WASM from source..."
-cargo build --release --target wasm32-unknown-unknown -p site-delegate 2>/dev/null
+"$REPO_ROOT/scripts/build-wasm.sh" -p site-delegate 2>/dev/null
 BUILT_HASH=$(b3sum "$REPO_ROOT/target/wasm32-unknown-unknown/release/site_delegate.wasm" | cut -d' ' -f1)
 
 if [ "$CURRENT_HASH" != "$BUILT_HASH" ]; then

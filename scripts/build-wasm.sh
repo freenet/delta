@@ -7,11 +7,14 @@
 # they cannot drift out of agreement.
 set -euo pipefail
 
-REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 cd "$REPO_ROOT"
 
-CARGO_HOME_DIR="${CARGO_HOME:-$HOME/.cargo}"
-RUSTUP_HOME_DIR="${RUSTUP_HOME:-$HOME/.rustup}"
+# Canonicalize to match what rustc sees (it resolves symlinks on source
+# paths), and strip trailing slashes so --remap-path-prefix literal
+# matching isn't thrown off by CARGO_HOME=/foo/ vs /foo.
+CARGO_HOME_DIR="$(realpath -m "${CARGO_HOME:-${HOME:?HOME or CARGO_HOME must be set}/.cargo}")"
+RUSTUP_HOME_DIR="$(realpath -m "${RUSTUP_HOME:-${HOME:?HOME or RUSTUP_HOME must be set}/.rustup}")"
 
 REMAP="--remap-path-prefix=${REPO_ROOT}=/delta"
 REMAP="$REMAP --remap-path-prefix=${CARGO_HOME_DIR}=/cargo-home"

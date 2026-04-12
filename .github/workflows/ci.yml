@@ -76,13 +76,20 @@ jobs:
           ./scripts/build-wasm.sh -p site-delegate
           COMMITTED=$(b3sum ui/public/contracts/site_delegate.wasm | cut -d' ' -f1)
           BUILT=$(b3sum target/wasm32-unknown-unknown/release/site_delegate.wasm | cut -d' ' -f1)
+          echo "  committed: $COMMITTED"
+          echo "  built:     $BUILT"
           if [ "$COMMITTED" != "$BUILT" ]; then
             echo "::error::Committed delegate WASM is stale (doesn't match built from source)"
-            echo "  committed: $COMMITTED"
-            echo "  built:     $BUILT"
             echo "Run ./scripts/sync-wasm.sh to update"
             exit 1
           fi
+
+      - name: Upload built WASM for diff (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-built-wasm
+          path: target/wasm32-unknown-unknown/release/site_*.wasm
 
       - name: Verify contract WASM matches source
         run: |
