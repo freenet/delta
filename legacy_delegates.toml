@@ -54,3 +54,10 @@ description = "Before signed page order"
 date = "2026-04-09"
 delegate_key = "67e5be4df8bbb06addbee8993ca4b3fbe5d3c10b1cd98e01a2e752a558fad420"
 code_hash = "5cac3e5ba33c3995536456dde35d027e23ed9cd5969e0b43b5d904843dddd0e4"
+
+[[entry]]
+version = "V7"
+description = "Before per-prefix GetSigningKey for export"
+date = "2026-04-12"
+delegate_key = "68f6d44a67506cb7086483cf2a7c44558cb322be930de51ed2d43bf42d7f9b2f"
+code_hash = "eb5396ef340832847151d1339e676b57ca79968ae498fa67951d280b1f5b9231"

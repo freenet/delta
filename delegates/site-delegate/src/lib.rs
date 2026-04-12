@@ -116,6 +116,13 @@ fn handle_app_message(
             Err(e) => DelegateResponse::Error(e),
         },
 
+        DelegateRequest::GetSigningKeyForPrefix { prefix } => {
+            match load_signing_key(ctx, Some(prefix.as_str())) {
+                Ok(key) => DelegateResponse::SigningKey(key.to_bytes().to_vec()),
+                Err(e) => DelegateResponse::Error(e),
+            }
+        }
+
         DelegateRequest::StoreKnownSites { sites } => {
             let mut buf = Vec::new();
             into_writer(&sites, &mut buf)
@@ -168,19 +175,30 @@ fn handle_app_message(
 
 /// Load a signing key. Tries per-prefix first, then falls back to legacy single-key storage.
 fn load_signing_key(ctx: &mut DelegateCtx, prefix: Option<&str>) -> Result<SigningKey, String> {
-    // Try per-prefix key first
+    let key_bytes = select_key_bytes(prefix, |name| ctx.get_secret(name.as_bytes()))
+        .ok_or_else(|| "no signing key stored -- store key first".to_string())?;
+    parse_signing_key(&key_bytes)
+}
+
+/// Key-selection policy for `load_signing_key`, extracted so it can be
+/// unit-tested without a `DelegateCtx`.
+///
+/// The pre-V7 bug was that `GetSigningKey` had no prefix, so this function
+/// (effectively) was always called with `prefix = None` from the export
+/// path, silently returning the legacy single-key slot regardless of which
+/// site was being exported. The priority must be: per-prefix key wins
+/// when available; fall back to legacy only when no per-prefix key is
+/// stored (or when no prefix was supplied at all).
+fn select_key_bytes<F>(prefix: Option<&str>, mut read: F) -> Option<Vec<u8>>
+where
+    F: FnMut(&str) -> Option<Vec<u8>>,
+{
     if let Some(p) = prefix {
-        let per_prefix_key = signing_key_for_prefix(p);
-        if let Some(key_bytes) = ctx.get_secret(per_prefix_key.as_bytes()) {
-            return parse_signing_key(&key_bytes);
+        if let Some(bytes) = read(&signing_key_for_prefix(p)) {
+            return Some(bytes);
         }
     }
-
-    // Fall back to legacy single-key storage
-    let Some(key_bytes) = ctx.get_secret(LEGACY_SIGNING_KEY.as_bytes()) else {
-        return Err("no signing key stored -- store key first".into());
-    };
-    parse_signing_key(&key_bytes)
+    read(LEGACY_SIGNING_KEY)
 }
 
 fn parse_signing_key(key_bytes: &[u8]) -> Result<SigningKey, String> {
@@ -188,4 +206,68 @@ fn parse_signing_key(key_bytes: &[u8]) -> Result<SigningKey, String> {
         .try_into()
         .map_err(|_| "stored key is not 32 bytes".to_string())?;
     Ok(SigningKey::from_bytes(&key_array))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn store(entries: &[(&str, Vec<u8>)]) -> HashMap<String, Vec<u8>> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn per_prefix_key_wins_when_both_slots_populated() {
+        // Regression test for the pre-V7 bug: when both per-prefix and
+        // legacy slots hold keys, the per-prefix key must win so that
+        // export returns the key matching the site's owner_pubkey.
+        let per_prefix_bytes = vec![1u8; 32];
+        let legacy_bytes = vec![2u8; 32];
+        let store = store(&[
+            (
+                signing_key_for_prefix("abcdef1234").as_str(),
+                per_prefix_bytes.clone(),
+            ),
+            (LEGACY_SIGNING_KEY, legacy_bytes),
+        ]);
+
+        let got = select_key_bytes(Some("abcdef1234"), |name| store.get(name).cloned());
+        assert_eq!(got, Some(per_prefix_bytes));
+    }
+
+    #[test]
+    fn falls_back_to_legacy_when_no_prefix_provided() {
+        let legacy_bytes = vec![9u8; 32];
+        let store = store(&[(LEGACY_SIGNING_KEY, legacy_bytes.clone())]);
+        let got = select_key_bytes(None, |name| store.get(name).cloned());
+        assert_eq!(got, Some(legacy_bytes));
+    }
+
+    #[test]
+    fn falls_back_to_legacy_when_per_prefix_empty() {
+        // Useful for users migrating from V1–V6: they have a key in the
+        // legacy slot but no per-prefix entry yet. The delegate should
+        // still return that key on signing requests.
+        let legacy_bytes = vec![5u8; 32];
+        let store = store(&[(LEGACY_SIGNING_KEY, legacy_bytes.clone())]);
+        let got = select_key_bytes(Some("abcdef1234"), |name| store.get(name).cloned());
+        assert_eq!(got, Some(legacy_bytes));
+    }
+
+    #[test]
+    fn returns_none_when_nothing_stored() {
+        let empty: HashMap<String, Vec<u8>> = HashMap::new();
+        assert_eq!(
+            select_key_bytes(Some("abcdef1234"), |name| empty.get(name).cloned()),
+            None
+        );
+        assert_eq!(
+            select_key_bytes(None, |name| empty.get(name).cloned()),
+            None
+        );
+    }
 }

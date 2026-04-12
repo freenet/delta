@@ -652,8 +652,24 @@ pub enum DelegateRequest {
     },
     /// Get the owner's public key. If prefix is set, returns per-site key.
     GetPublicKey,
-    /// Get the owner's signing key (for export).
+    /// Get the owner's signing key from the legacy single-key slot.
+    ///
+    /// Kept as a unit variant for CBOR wire-format compatibility with
+    /// pre-V7 delegates: the legacy-migration path probes old delegates
+    /// with this request to rescue signing keys stranded there after a
+    /// delegate WASM upgrade. Changing the shape of this variant would
+    /// break deserialization on those old delegates and silently kill
+    /// the migration path. For export, use `GetSigningKeyForPrefix`.
     GetSigningKey,
+    /// Get the owner's signing key for a specific site prefix (for export).
+    ///
+    /// Introduced in V7 to fix a bug where `GetSigningKey` returned the
+    /// legacy single-key slot regardless of which site the user was
+    /// exporting, producing tokens whose signing_key did not match the
+    /// site's owner_pubkey. Only the current (V7+) delegate understands
+    /// this variant; pre-V7 delegates will fail to deserialize it, which
+    /// is fine because pre-V7 delegates did not have per-prefix storage.
+    GetSigningKeyForPrefix { prefix: String },
     /// Store the list of known sites (for persistence across refreshes).
     StoreKnownSites { sites: Vec<KnownSiteRecord> },
     /// Retrieve the list of known sites.
@@ -955,6 +971,52 @@ mod tests {
             contract_key_b58: None,
         };
         assert!(!fake.is_tombstone());
+    }
+
+    #[test]
+    fn get_signing_key_for_prefix_roundtrips() {
+        // Regression guard: export must be able to ask the delegate for the
+        // per-site signing key, not the legacy single-key slot. If this
+        // variant is dropped or its prefix field renamed, export silently
+        // falls back to the legacy slot and produces tokens whose
+        // signing_key does not match the site's owner_pubkey — edits on
+        // the importing node then fail contract signature validation.
+        let req = DelegateRequest::GetSigningKeyForPrefix {
+            prefix: "abcdef1234".into(),
+        };
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&req, &mut buf).unwrap();
+        let decoded: DelegateRequest = ciborium::de::from_reader(buf.as_slice()).unwrap();
+        match decoded {
+            DelegateRequest::GetSigningKeyForPrefix { prefix } => {
+                assert_eq!(prefix, "abcdef1234");
+            }
+            other => panic!("expected GetSigningKeyForPrefix, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn get_signing_key_stays_wire_compatible_with_pre_v7_delegates() {
+        // CBOR wire-format compatibility check: `GetSigningKey` must remain
+        // a unit variant so the legacy-migration path can probe pre-V7
+        // delegates for signing keys stranded in the legacy single-key
+        // slot. Changing this variant to a struct variant would break
+        // deserialization on pre-V7 delegates and silently kill key
+        // migration.
+        //
+        // ciborium encodes externally-tagged unit variants as a bare
+        // string containing the variant name. Assert exactly that.
+        let req = DelegateRequest::GetSigningKey;
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(&req, &mut buf).unwrap();
+        let as_value: ciborium::Value = ciborium::de::from_reader(buf.as_slice()).unwrap();
+        match as_value {
+            ciborium::Value::Text(s) => assert_eq!(s, "GetSigningKey"),
+            other => panic!(
+                "GetSigningKey must serialize as a bare string (unit variant) \
+                 for legacy-delegate wire compat, got: {other:?}"
+            ),
+        }
     }
 
     #[test]
