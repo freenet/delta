@@ -982,6 +982,39 @@ mod tests {
     }
 
     #[test]
+    fn empty_tombstones_yields_empty_result() {
+        // Sanity: the function must handle an empty batch cleanly for
+        // every flag combination, otherwise a future refactor could
+        // regress the iterator path.
+        let live_empty: HashSet<&str> = HashSet::new();
+        let live_some: HashSet<&str> = ["abc"].into_iter().collect();
+        for &is_legacy in &[false, true] {
+            for &current_loaded in &[false, true] {
+                for live in [&live_empty, &live_some] {
+                    assert!(
+                        filter_applicable_tombstones(&[], is_legacy, current_loaded, live)
+                            .is_empty()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn applies_current_delegate_tombstone_after_current_loaded() {
+        // Production steady-state case: the current delegate has
+        // responded (CURRENT_SITES_LOADED=true), no live site for the
+        // prefix, current delegate sends a tombstone. This must still
+        // apply — the CURRENT_SITES_LOADED gate is only for LEGACY
+        // tombstones, not current ones.
+        let tombstones = vec![tomb("abc")];
+        let live: HashSet<&str> = HashSet::new();
+        let result = filter_applicable_tombstones(&tombstones, false, true, &live);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].prefix, "abc");
+    }
+
+    #[test]
     fn mixed_batch_partitions_correctly() {
         let tombstones = vec![tomb("live"), tomb("gone"), tomb("also-gone")];
         let live: HashSet<&str> = ["live"].into_iter().collect();

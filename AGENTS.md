@@ -86,6 +86,26 @@ which must be called by any path that adds a site (`create_new_site`,
 would be silently filtered out of `restore_known_sites` and the re-add
 would appear to fail.
 
+**Tombstone-application rules** (enforced by
+`filter_applicable_tombstones` in `ui/src/freenet_api/delegate.rs`):
+
+1. Once the current delegate has responded (`CURRENT_SITES_LOADED` is
+   true), legacy-delegate tombstones are dropped. The current delegate
+   is authoritative for the removal set; a stale legacy tombstone must
+   not override it. Without this rule, deleting a site and then
+   re-visiting it would make the site briefly appear and then vanish
+   when a legacy delegate's KnownSites response arrived later.
+
+2. A tombstone whose prefix is currently live in `SITES` is always
+   dropped, regardless of source. Live user intent (via `visit_site` /
+   `create_new_site` / `import_site_key`) beats any stale removal
+   record. This is the guardrail for ordering races between
+   `save_known_sites` and a `load_known_sites` response already in
+   flight.
+
+Any change to the KnownSites response handler must preserve both rules;
+the `filter_applicable_tombstones` unit tests pin them.
+
 ## Contract Upgrade / State Migration
 
 ### When Contract WASM Changes
