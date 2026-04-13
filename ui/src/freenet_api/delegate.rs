@@ -323,30 +323,55 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                         .into_iter()
                         .partition(delta_core::KnownSiteRecord::is_tombstone);
 
-                    // Tombstones from either current or legacy delegate are
-                    // merged: a legacy delegate may still hold a removal we
-                    // recorded before a delegate upgrade, and the current
-                    // delegate holds all removals after this fix ships.
+                    // Tombstone application rules:
                     //
-                    // If a tombstone arrives for a prefix that's currently in
-                    // SITES (e.g. added via hash route before known_sites
-                    // loaded), remove it too — the user's intent to delete
-                    // must not be silently ignored.
+                    // 1. Once the current delegate has responded
+                    //    (CURRENT_SITES_LOADED), it is authoritative for
+                    //    tombstones as well as real records — legacy
+                    //    tombstones must be ignored, otherwise a legacy
+                    //    delegate holding a stale removal record can
+                    //    resurrect-then-re-delete a site that the user has
+                    //    since explicitly re-visited. See the
+                    //    "delete-then-revisit vanishes" bug.
+                    //
+                    // 2. A tombstone whose prefix is currently present in
+                    //    SITES is ALWAYS ignored. If the user has an active
+                    //    site for that prefix (e.g. they just called
+                    //    visit_site / create_new_site / import_site_key),
+                    //    their live intent beats any stale removal record,
+                    //    even from the current delegate. `clear_tombstone`
+                    //    is the primary defense; this is the guardrail for
+                    //    ordering races between save_known_sites and a
+                    //    load_known_sites response already in flight.
+                    let tombstones_to_apply: Vec<_> = {
+                        let live_sites = state::SITES.read();
+                        let live_prefixes: std::collections::HashSet<&str> =
+                            live_sites.keys().map(String::as_str).collect();
+                        filter_applicable_tombstones(
+                            &tombstones,
+                            is_legacy,
+                            *CURRENT_SITES_LOADED.read(),
+                            &live_prefixes,
+                        )
+                    };
+                    let skipped = tombstones.len() - tombstones_to_apply.len();
                     if !tombstones.is_empty() {
                         log(&format!(
-                            "Delta: loaded {} tombstone(s) from delegate{}",
+                            "Delta: loaded {} tombstone(s) from delegate{} ({} applied, {} skipped)",
                             tombstones.len(),
-                            if is_legacy { " (legacy)" } else { "" }
+                            if is_legacy { " (legacy)" } else { "" },
+                            tombstones_to_apply.len(),
+                            skipped
                         ));
                         state::REMOVED_PREFIXES.with_mut(|removed| {
-                            for t in &tombstones {
+                            for t in &tombstones_to_apply {
                                 if !removed.contains(&t.prefix) {
                                     removed.push(t.prefix.clone());
                                 }
                             }
                         });
                         state::SITES.with_mut(|sites| {
-                            for t in &tombstones {
+                            for t in &tombstones_to_apply {
                                 sites.remove(&t.prefix);
                             }
                         });
@@ -857,4 +882,144 @@ fn log(msg: &str) {
     web_sys::console::log_1(&msg.into());
     #[cfg(not(target_arch = "wasm32"))]
     eprintln!("{msg}");
+}
+
+/// Decide which tombstones from a KnownSites response should actually be
+/// applied to local state, given whether the response came from a legacy
+/// delegate, whether the current delegate has already been loaded, and
+/// which site prefixes are currently live in `SITES`.
+///
+/// Two rules:
+///
+/// 1. Once the current delegate has spoken (`current_sites_loaded`), legacy
+///    tombstones are dropped. The current delegate is authoritative for the
+///    removal set; a stale legacy tombstone must not override it.
+///
+/// 2. A tombstone whose prefix is currently live (explicitly re-added by
+///    the user via `visit_site` / `create_new_site` / `import_site_key`) is
+///    always dropped, regardless of source. Live intent beats a stale
+///    removal record.
+fn filter_applicable_tombstones(
+    tombstones: &[delta_core::KnownSiteRecord],
+    is_legacy: bool,
+    current_sites_loaded: bool,
+    live_prefixes: &std::collections::HashSet<&str>,
+) -> Vec<delta_core::KnownSiteRecord> {
+    tombstones
+        .iter()
+        .filter(|t| {
+            if is_legacy && current_sites_loaded {
+                return false;
+            }
+            if live_prefixes.contains(t.prefix.as_str()) {
+                return false;
+            }
+            true
+        })
+        .cloned()
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn tomb(prefix: &str) -> delta_core::KnownSiteRecord {
+        delta_core::KnownSiteRecord::tombstone(prefix)
+    }
+
+    #[test]
+    fn applies_current_delegate_tombstone_when_not_live() {
+        let tombstones = vec![tomb("abc")];
+        let live: HashSet<&str> = HashSet::new();
+        let result = filter_applicable_tombstones(&tombstones, false, false, &live);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].prefix, "abc");
+    }
+
+    #[test]
+    fn skips_tombstone_for_live_site_even_from_current_delegate() {
+        // User just re-visited "abc"; a stale tombstone for "abc" from the
+        // current delegate must not clobber the live entry.
+        let tombstones = vec![tomb("abc")];
+        let live: HashSet<&str> = ["abc"].into_iter().collect();
+        let result = filter_applicable_tombstones(&tombstones, false, false, &live);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn skips_legacy_tombstone_when_current_is_authoritative() {
+        // Primary fix for "delete then re-visit vanishes": legacy delegate
+        // still holds the old removal record, but the current delegate has
+        // already responded without it.
+        let tombstones = vec![tomb("abc")];
+        let live: HashSet<&str> = HashSet::new();
+        let result = filter_applicable_tombstones(&tombstones, true, true, &live);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn applies_legacy_tombstone_before_current_loaded() {
+        // Pre-migration: current delegate hasn't responded yet, so legacy
+        // tombstones still seed REMOVED_PREFIXES.
+        let tombstones = vec![tomb("abc")];
+        let live: HashSet<&str> = HashSet::new();
+        let result = filter_applicable_tombstones(&tombstones, true, false, &live);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn skips_legacy_tombstone_when_site_is_live_even_before_current_loads() {
+        // Even if current hasn't loaded, if the user explicitly re-added
+        // a site (e.g. via hash-route visit before known_sites loaded),
+        // a legacy tombstone must not yank it.
+        let tombstones = vec![tomb("abc"), tomb("def")];
+        let live: HashSet<&str> = ["abc"].into_iter().collect();
+        let result = filter_applicable_tombstones(&tombstones, true, false, &live);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].prefix, "def");
+    }
+
+    #[test]
+    fn empty_tombstones_yields_empty_result() {
+        // Sanity: the function must handle an empty batch cleanly for
+        // every flag combination, otherwise a future refactor could
+        // regress the iterator path.
+        let live_empty: HashSet<&str> = HashSet::new();
+        let live_some: HashSet<&str> = ["abc"].into_iter().collect();
+        for &is_legacy in &[false, true] {
+            for &current_loaded in &[false, true] {
+                for live in [&live_empty, &live_some] {
+                    assert!(
+                        filter_applicable_tombstones(&[], is_legacy, current_loaded, live)
+                            .is_empty()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn applies_current_delegate_tombstone_after_current_loaded() {
+        // Production steady-state case: the current delegate has
+        // responded (CURRENT_SITES_LOADED=true), no live site for the
+        // prefix, current delegate sends a tombstone. This must still
+        // apply — the CURRENT_SITES_LOADED gate is only for LEGACY
+        // tombstones, not current ones.
+        let tombstones = vec![tomb("abc")];
+        let live: HashSet<&str> = HashSet::new();
+        let result = filter_applicable_tombstones(&tombstones, false, true, &live);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].prefix, "abc");
+    }
+
+    #[test]
+    fn mixed_batch_partitions_correctly() {
+        let tombstones = vec![tomb("live"), tomb("gone"), tomb("also-gone")];
+        let live: HashSet<&str> = ["live"].into_iter().collect();
+        let result = filter_applicable_tombstones(&tombstones, false, true, &live);
+        let prefixes: Vec<&str> = result.iter().map(|t| t.prefix.as_str()).collect();
+        assert_eq!(prefixes, vec!["gone", "also-gone"]);
+    }
 }
