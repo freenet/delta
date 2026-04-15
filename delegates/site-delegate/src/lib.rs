@@ -25,10 +25,29 @@ impl DelegateInterface for SiteDelegate {
         origin: Option<MessageOrigin>,
         message: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+        // `MessageOrigin` became `#[non_exhaustive]` in freenet-stdlib
+        // 0.5.0 when the `Delegate(DelegateKey)` variant was introduced
+        // for inter-delegate attestation. The site delegate is driven
+        // exclusively by the Delta web app via `MessageOrigin::WebApp` —
+        // inter-delegate calls are not a supported authorization path, so
+        // any `Delegate(..)` origin is rejected. The trailing wildcard
+        // guards against future variants.
         match origin {
             Some(MessageOrigin::WebApp(_)) => {}
+            Some(MessageOrigin::Delegate(caller)) => {
+                return Err(DelegateError::Other(format!(
+                    "site-delegate does not accept inter-delegate calls (caller: {caller})"
+                )));
+            }
             None => {
                 return Err(DelegateError::Other("missing message origin".to_string()));
+            }
+            _ => {
+                return Err(DelegateError::Other(
+                    "unknown MessageOrigin variant — \
+                     site-delegate must be rebuilt against a newer freenet-stdlib"
+                        .into(),
+                ));
             }
         }
 
@@ -269,5 +288,46 @@ mod tests {
             select_key_bytes(None, |name| empty.get(name).cloned()),
             None
         );
+    }
+
+    /// The site delegate is driven exclusively by the Delta web app via
+    /// `MessageOrigin::WebApp`; inter-delegate invocation is not a supported
+    /// authorization path. Regression test for the new rejection arm added
+    /// alongside the freenet-stdlib 0.5.0/0.6.0 bump — `MessageOrigin::Delegate`
+    /// did not exist at all before that bump, so this test pins the explicit
+    /// "reject inter-delegate caller" policy so it cannot regress silently
+    /// if a future refactor reorders the `match origin` arms.
+    #[test]
+    fn rejects_inter_delegate_origin() {
+        use freenet_stdlib::prelude::{CodeHash, DelegateKey};
+
+        // A trivial StoreKnownSites request payload so the inbound
+        // message is structurally valid — the test only needs to
+        // verify the origin rejection fires BEFORE request dispatch.
+        let request = DelegateRequest::StoreKnownSites { sites: vec![] };
+        let mut payload = Vec::new();
+        into_writer(&request, &mut payload).unwrap();
+        let app_msg = ApplicationMessage::new(payload);
+        let inbound_msg = InboundDelegateMsg::ApplicationMessage(app_msg);
+
+        let caller = DelegateKey::new([0xA1u8; 32], CodeHash::new([0xA2u8; 32]));
+        let origin = Some(MessageOrigin::Delegate(caller));
+
+        let result = SiteDelegate::process(
+            &mut DelegateCtx::default(),
+            Parameters::from(vec![]),
+            origin,
+            inbound_msg,
+        );
+        assert!(result.is_err(), "inter-delegate caller must be rejected");
+
+        if let Err(DelegateError::Other(msg)) = result {
+            assert!(
+                msg.contains("does not accept inter-delegate calls"),
+                "expected 'inter-delegate' rejection message, got: {msg}"
+            );
+        } else {
+            panic!("expected DelegateError::Other, got {result:?}");
+        }
     }
 }

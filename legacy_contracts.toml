@@ -38,3 +38,9 @@ version = "C3"
 description = "V7 WASM (62fe35b/356e6b6, before reproducible builds)"
 date = "2026-04-12"
 code_hash = "53e3395f42d563e6095e6b21d76d6dbcb9db2fc4068fc6705a353f6f46f48778"
+
+[[entry]]
+version = "C4"
+description = "Before freenet-stdlib 0.6.0 bump"
+date = "2026-04-15"
+code_hash = "6837a66d8ba5481a6256300368d25caa2250b3a586db372a938e65c2f06b6346"
