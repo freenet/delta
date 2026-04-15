@@ -25,10 +25,29 @@ impl DelegateInterface for SiteDelegate {
         origin: Option<MessageOrigin>,
         message: InboundDelegateMsg,
     ) -> Result<Vec<OutboundDelegateMsg>, DelegateError> {
+        // `MessageOrigin` became `#[non_exhaustive]` in freenet-stdlib
+        // 0.5.0 when the `Delegate(DelegateKey)` variant was introduced
+        // for inter-delegate attestation. The site delegate is driven
+        // exclusively by the Delta web app via `MessageOrigin::WebApp` —
+        // inter-delegate calls are not a supported authorization path, so
+        // any `Delegate(..)` origin is rejected. The trailing wildcard
+        // guards against future variants.
         match origin {
             Some(MessageOrigin::WebApp(_)) => {}
+            Some(MessageOrigin::Delegate(caller)) => {
+                return Err(DelegateError::Other(format!(
+                    "site-delegate does not accept inter-delegate calls (caller: {caller})"
+                )));
+            }
             None => {
                 return Err(DelegateError::Other("missing message origin".to_string()));
+            }
+            _ => {
+                return Err(DelegateError::Other(
+                    "unknown MessageOrigin variant — \
+                     site-delegate must be rebuilt against a newer freenet-stdlib"
+                        .into(),
+                ));
             }
         }
 

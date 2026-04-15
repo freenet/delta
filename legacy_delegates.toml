@@ -68,3 +68,10 @@ description = "Reproducible WASM build (remap-path-prefix) #3"
 date = "2026-04-12"
 delegate_key = "f3b89ee5249b1e07af57adf839b09b5b01049f930ecc3e09fc0b02a4e8026cf3"
 code_hash = "8a78b8b529aabfa2e160a9ef0c5754aa20d527ee5babaa1951d56ac69082dcda"
+
+[[entry]]
+version = "V9"
+description = "Before freenet-stdlib 0.6.0 bump (non_exhaustive hardening + MessageOrigin::Delegate)"
+date = "2026-04-15"
+delegate_key = "c1fbb764babe708f558636427e1d019554dda9ee9d7f0050c7cdc7b3a1915945"
+code_hash = "b7179907eb526754148c60fe9281070c4d8e629a824281455511881b3ee4c807"
