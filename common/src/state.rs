@@ -618,6 +618,22 @@ impl KnownSiteRecord {
 }
 
 /// Requests from the UI to the delegate.
+///
+/// **Migration rule:** Every `Get*` variant that reads persisted data MUST
+/// be covered by the legacy delegate migration path in
+/// `ui/src/freenet_api/delegate.rs`. When a delegate WASM upgrade changes
+/// the delegate key, data stored under the old key is only accessible via
+/// legacy migration. If a `Get*` variant is missing from the migration
+/// path, that data type is silently lost on upgrade.
+///
+/// Currently migrated:
+/// - `GetPublicKey` -- in `fire_legacy_migration()`
+/// - `GetSigningKey` -- in `fire_legacy_migration()`
+/// - `GetKnownSites` -- in `fire_legacy_migration()`
+/// - `GetSiteState` -- in KnownSites handler + `request_site_state_backup()`
+/// - `GetSigningKeyForPrefix` -- NOT migrated (V7+ only; per-prefix keys
+///   are discovered via `GetPublicKey` response and then individually
+///   migrated via `store_signing_key`)
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum DelegateRequest {
     /// Store the owner signing key. If prefix is set, stored per-site.
