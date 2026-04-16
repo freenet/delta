@@ -416,6 +416,13 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                         }
                         let has_real = !real_records.is_empty();
                         let has_tombstones = !tombstones.is_empty();
+                        // Capture prefixes before restore_known_sites consumes records.
+                        // Used below to fetch delegate-backed-up state from legacy delegates.
+                        let legacy_prefixes: Vec<String> = if is_legacy {
+                            real_records.iter().map(|r| r.prefix.clone()).collect()
+                        } else {
+                            Vec::new()
+                        };
                         restore_known_sites(real_records);
                         // If legacy contributed ANY state — real records OR
                         // tombstones — persist to the current delegate so
@@ -426,6 +433,19 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                         if is_legacy && (has_real || has_tombstones) {
                             save_known_sites();
                             *CURRENT_SITES_LOADED.write() = true;
+                            // Fetch backed-up site state from this legacy
+                            // delegate. If the network GETs all fail (state
+                            // GC'd, node offline, etc.), the delegate backup
+                            // is the only remaining copy of the user's data.
+                            // handle_restored_site_state only overwrites
+                            // default (empty) state, so a successful network
+                            // GET always wins over a stale backup.
+                            for prefix in &legacy_prefixes {
+                                let req = delta_core::DelegateRequest::GetSiteState {
+                                    prefix: prefix.clone(),
+                                };
+                                send_to_delegate_key(&req, responding_key.clone());
+                            }
                         }
                     }
 
@@ -841,7 +861,19 @@ pub fn request_site_state_backup(prefix: &str) {
     let request = delta_core::DelegateRequest::GetSiteState {
         prefix: prefix.to_string(),
     };
+    // Try the current delegate first.
     send_delegate_request(&request);
+    // Also try every legacy delegate -- the backup may be stranded under
+    // an old delegate key if the user upgraded without the state being
+    // migrated to the current delegate yet.
+    #[cfg(target_arch = "wasm32")]
+    {
+        for (key_bytes, code_hash_bytes) in LEGACY_DELEGATES.iter() {
+            let legacy_code_hash = CodeHash::new(*code_hash_bytes);
+            let legacy_delegate_key = DelegateKey::new(*key_bytes, legacy_code_hash);
+            send_to_delegate_key(&request, legacy_delegate_key);
+        }
+    }
 }
 
 /// Handle a restored site state from delegate backup -- PUT it to the network.
@@ -867,6 +899,10 @@ fn handle_restored_site_state(prefix: &str, state_bytes: &[u8]) {
             site.name = site_state.config.config.name.clone();
             site.owner_pubkey = site_state.owner.to_bytes();
             drop(sites);
+
+            // Persist the backup to the current delegate so it
+            // survives future delegate WASM upgrades.
+            backup_site_state(prefix, &site_state);
 
             // PUT the backed-up state to the network to restore it
             let params = delta_core::SiteParameters {

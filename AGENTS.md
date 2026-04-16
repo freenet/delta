@@ -148,13 +148,28 @@ is missing.
 
 ### Delegate WASM Migration
 
-When `site_delegate.wasm` changes, the delegate key changes and stored secrets (signing keys, known sites) become inaccessible under the old key.
+When `site_delegate.wasm` changes, the delegate key changes and stored secrets (signing keys, known sites, **site state backups**) become inaccessible under the old key.
 
 Migration entries in `legacy_delegates.toml` allow the UI to read from old delegate keys:
 1. Before changing delegate code: `./scripts/add-migration.sh VERSION "description"`
 2. Rebuild: `./scripts/sync-wasm.sh`
-3. On startup, the UI sends GetPublicKey to each legacy delegate key
-4. If an old delegate responds, the signing key is migrated to the current delegate
+3. On startup, the UI sends GetPublicKey, GetKnownSites, GetSigningKey to each legacy delegate
+4. When legacy KnownSites arrives, GetSiteState is also requested for each prefix from that legacy delegate
+5. If an old delegate responds, signing keys, known sites, and site state backups are migrated to the current delegate
+
+**CRITICAL: Every delegate storage key type must be migrated.** The
+legacy migration in `fire_legacy_migration()` and the KnownSites handler
+must cover ALL storage operations the delegate supports. If a new storage
+operation is added to the delegate (e.g. `StoreFoo` / `GetFoo`), the
+corresponding `GetFoo` MUST be added to the legacy migration path.
+Omitting it means that data is lost silently when the delegate WASM
+upgrades. April 2026 incident: `GetSiteState` was missing from legacy
+migration, causing sites to vanish when network state had been GC'd.
+
+**Defense in depth:** `request_site_state_backup()` (called from the
+NotFound handler) queries both the current delegate AND all legacy
+delegates, so even if the proactive fetch during KnownSites processing
+misses a prefix, the NotFound fallback catches it.
 
 ### Upgrade Workflow
 
