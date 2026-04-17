@@ -40,6 +40,16 @@ fn main() {
 }
 
 fn generate_build_info() {
+    // Without these rerun-if-changed directives, Cargo caches the
+    // build script output and the baked-in timestamp/commit drift
+    // from what's actually deployed. A stale timestamp masks whether
+    // the published webapp contains recent fixes. See AGENTS.md
+    // "Publishing" and the April 2026 incident in delta/#9 follow-up.
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=../.git/HEAD");
+    println!("cargo:rerun-if-changed=../.git/index");
+    println!("cargo:rerun-if-env-changed=FORCE_REBUILD_TIMESTAMP");
+
     let now = Utc::now();
     println!(
         "cargo:rustc-env=BUILD_TIMESTAMP_ISO={}",
