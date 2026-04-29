@@ -71,7 +71,7 @@ pub fn Editor() -> Element {
         // `cursor_pos` is a UTF-8 byte offset stored by
         // `update_autocomplete`. Clamp to a valid char boundary in
         // case the content was edited between the input event and
-        // this callback firing — slicing inside a multi-byte char
+        // this callback firing; slicing inside a multi-byte char
         // would panic with "unreachable" in WASM.
         let mut pos = (*cursor_pos.read()).min(content.len());
         while pos > 0 && !content.is_char_boundary(pos) {
@@ -306,8 +306,8 @@ pub fn Editor() -> Element {
 /// JS strings count UTF-16 code units; Rust strings are UTF-8 byte
 /// sequences. Slicing `text[..utf16_pos]` directly panics with
 /// "unreachable" in WASM whenever the cursor lands inside or after
-/// any non-ASCII character (·, é, emoji, CJK …). The result is always
-/// on a UTF-8 char boundary.
+/// any non-ASCII character (e.g. `·`, `é`, emoji, CJK). The result
+/// is always on a UTF-8 char boundary.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 pub(crate) fn utf16_to_byte_index(s: &str, utf16_pos: usize) -> usize {
     let mut utf16 = 0usize;
@@ -317,10 +317,10 @@ pub(crate) fn utf16_to_byte_index(s: &str, utf16_pos: usize) -> usize {
         }
         let next = utf16 + ch.len_utf16();
         if utf16_pos < next {
-            // The position lies inside a surrogate pair (rare — browsers
-            // generally don't put cursors between halves of a pair). Snap
-            // to the start of the char so the resulting byte index is on
-            // a valid UTF-8 boundary.
+            // The position lies inside a surrogate pair (rare;
+            // browsers don't normally put cursors between halves of
+            // a pair). Snap to the start of the char so the
+            // resulting byte index is on a valid UTF-8 boundary.
             return byte_idx;
         }
         utf16 = next;

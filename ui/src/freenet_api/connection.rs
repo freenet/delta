@@ -57,12 +57,8 @@ pub fn connect_to_freenet() {
                 Ok(response) => super::operations::handle_response(response),
                 Err(e) => {
                     let msg = format!("Delta: API error: {e:?}");
-                    let truncated = if msg.len() > 200 {
-                        format!("{}...", &msg[..200])
-                    } else {
-                        msg.clone()
-                    };
-                    web_sys::console::error_1(&truncated.into());
+                    let truncated = truncate_for_log(&msg, 200);
+                    web_sys::console::error_1(&truncated.as_ref().into());
                     // If a GET timed out, try restoring from delegate backup
                     if msg.contains("GET operation timed out") {
                         super::operations::handle_get_timeout(&msg);
@@ -71,11 +67,7 @@ pub fn connect_to_freenet() {
             },
             move |error| {
                 let msg = error.to_string();
-                let truncated = if msg.len() > 200 {
-                    format!("Delta: connection error: {}...", &msg[..200])
-                } else {
-                    format!("Delta: connection error: {msg}")
-                };
+                let truncated = format!("Delta: connection error: {}", truncate_for_log(&msg, 200));
                 web_sys::console::error_1(&truncated.into());
                 *CONNECTION_STATUS.write() =
                     ConnectionStatus::Error("Connection failed".to_string());
@@ -89,6 +81,59 @@ pub fn connect_to_freenet() {
         );
 
         *WEB_API.write() = Some(web_api);
+    }
+}
+
+/// Truncate `msg` to at most `max_bytes` UTF-8 bytes, appending `…`
+/// if any bytes were dropped. Always cuts on a char boundary so a
+/// long error message containing non-ASCII bytes (which can sit
+/// across the cut point) does not panic with `&str[..n]` slicing.
+pub(crate) fn truncate_for_log(msg: &str, max_bytes: usize) -> std::borrow::Cow<'_, str> {
+    if msg.len() <= max_bytes {
+        return std::borrow::Cow::Borrowed(msg);
+    }
+    let mut cut = max_bytes;
+    while cut > 0 && !msg.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    std::borrow::Cow::Owned(format!("{}…", &msg[..cut]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_for_log;
+
+    #[test]
+    fn short_message_passes_through() {
+        assert_eq!(truncate_for_log("hello", 200).as_ref(), "hello");
+    }
+
+    #[test]
+    fn long_ascii_message_truncates_with_ellipsis() {
+        let s = "x".repeat(250);
+        let out = truncate_for_log(&s, 200);
+        assert!(out.ends_with('…'));
+        // 200 'x' bytes plus the 3-byte ellipsis.
+        assert_eq!(out.as_ref().len(), 200 + '…'.len_utf8());
+    }
+
+    #[test]
+    fn non_ascii_at_boundary_does_not_panic() {
+        // "·" is 2 bytes; place it so naive `&s[..3]` would land
+        // mid-char.
+        let s = format!("ab·{}", "x".repeat(300));
+        let out = truncate_for_log(&s, 3);
+        // We cut at 2 (start of '·' fails boundary at 3, so we walk
+        // back to 2). Output is "ab" + ellipsis.
+        assert_eq!(out.as_ref(), "ab…");
+    }
+
+    #[test]
+    fn equal_length_returns_borrowed() {
+        let s = "exactly twenty char!";
+        assert_eq!(s.len(), 20);
+        let out = truncate_for_log(s, 20);
+        assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
     }
 }
 
