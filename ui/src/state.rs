@@ -593,9 +593,22 @@ pub fn swap_page_order(page_a: PageId, page_b: PageId) {
         return;
     };
 
+    // Compute the monotonic timestamps before mutating: each call reads
+    // the page's *current* `updated_at` so they have to be sampled
+    // BEFORE the swap writes new values. See `next_page_updated_at`
+    // for why equal timestamps would be dropped on the network.
+    let new_ts_a = next_page_updated_at(&prefix, page_a);
+    let new_ts_b = next_page_updated_at(&prefix, page_b);
+
+    // Apply the swap and the new timestamps in a single mutation so
+    // local state never advertises the new orders alongside the
+    // previous timestamps. The signature on disk is still the old one
+    // until the delegate echoes back a fresh signed page; that is the
+    // pre-existing optimistic-update pattern (see also `create_page`,
+    // which inserts pages with a zeroed signature placeholder).
     SITES.with_mut(|sites| {
         if let Some(site) = sites.get_mut(&prefix) {
-            // If all pages have order 0, assign sequential orders first
+            // If all pages have order 0, assign sequential orders first.
             let all_zero = site.state.pages.values().all(|p| p.order == 0);
             if all_zero {
                 let mut sorted: Vec<_> = site.state.pages.keys().copied().collect();
@@ -611,30 +624,16 @@ pub fn swap_page_order(page_a: PageId, page_b: PageId) {
             let order_b = site.state.pages.get(&page_b).map(|p| p.order).unwrap_or(0);
             if let Some(pa) = site.state.pages.get_mut(&page_a) {
                 pa.order = order_b;
+                pa.updated_at = new_ts_a;
             }
             if let Some(pb) = site.state.pages.get_mut(&page_b) {
                 pb.order = order_a;
+                pb.updated_at = new_ts_b;
             }
         }
     });
 
-    // Order is part of the v2 signature, so we need to re-sign both pages.
-    // Compute strictly-monotonic timestamps per page BEFORE writing them
-    // back to local state — see `next_page_updated_at` for why equal
-    // timestamps would be silently dropped on the network.
-    let new_ts_a = next_page_updated_at(&prefix, page_a);
-    let new_ts_b = next_page_updated_at(&prefix, page_b);
-    SITES.with_mut(|sites| {
-        if let Some(site) = sites.get_mut(&prefix) {
-            if let Some(p) = site.state.pages.get_mut(&page_a) {
-                p.updated_at = new_ts_a;
-            }
-            if let Some(p) = site.state.pages.get_mut(&page_b) {
-                p.updated_at = new_ts_b;
-            }
-        }
-    });
-
+    // Order is part of the v2 signature, so re-sign both pages.
     let sites = SITES.read();
     let site = match sites.get(&prefix) {
         Some(s) => s,
@@ -674,6 +673,11 @@ pub fn delete_page(page_id: PageId) {
 
     if is_owner {
         if let Some(ck) = contract_key {
+            // Deletions don't need the strictly-monotonic-timestamp
+            // dance: dominance for tombstones is via tombstone
+            // *presence* in `deleted_pages`, not by comparing
+            // `deleted_at` (`SiteState::delete_page` /
+            // `SiteState::merge` in delta-core).
             crate::freenet_api::delegate::request_sign_deletion(&prefix, ck, page_id, now_secs());
         }
     }
@@ -743,9 +747,12 @@ fn now_secs() -> u64 {
 /// updates with the same timestamp.
 ///
 /// Forcing `max(now_secs(), existing + 1)` per page restores the
-/// monotonicity the contract relies on. The drift is bounded; even
-/// 60 reorders in a second only nudge `updated_at` 60 seconds into
-/// the future, and a single elapsed wall-clock second resyncs.
+/// monotonicity the contract relies on. The drift is bounded by the
+/// click rate: each click bumps the per-page timestamp by 1 second,
+/// so a held arrow at a typical 30 Hz repeat rate adds ~30 s of
+/// drift per second held. Drift gradually decays once the wall
+/// clock catches up. Pathological abuse is filed for follow-up;
+/// this PR addresses the user-reported same-second collision.
 pub(crate) fn next_page_updated_at(prefix: &str, page_id: PageId) -> u64 {
     let existing = SITES
         .read()
@@ -827,5 +834,23 @@ mod tests {
         // existing == u64::MAX is unreachable in practice but the
         // helper must not panic.
         assert_eq!(monotonic_updated_at(0, Some(u64::MAX)), u64::MAX);
+    }
+
+    #[test]
+    fn three_rapid_updates_within_one_second_get_strictly_increasing_ts() {
+        // Simulates three reorder clicks at the same wall-clock
+        // second. Each pass feeds the previous result back as
+        // `existing` to mimic the loop where `next_page_updated_at`
+        // reads the just-written page state. The chain must be
+        // strictly increasing; otherwise the contract dominates the
+        // second and third updates and the user-visible bug recurs.
+        let now = 1_000;
+        let t1 = monotonic_updated_at(now, Some(now));
+        let t2 = monotonic_updated_at(now, Some(t1));
+        let t3 = monotonic_updated_at(now, Some(t2));
+        assert!(t1 > now);
+        assert!(t2 > t1);
+        assert!(t3 > t2);
+        assert_eq!((t1, t2, t3), (now + 1, now + 2, now + 3));
     }
 }

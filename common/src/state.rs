@@ -1002,6 +1002,54 @@ mod tests {
     }
 
     #[test]
+    fn reorder_with_same_timestamp_is_dropped_by_merge() {
+        // Same dominance bug as the apply_delta path, but exercised
+        // through `merge` (used when a peer sends a full state via
+        // `UpdateData::State` rather than a delta). Both code paths
+        // use `>=` for tie-breaking, so the UI's strict-monotonicity
+        // invariant is what makes either path actually replicate a
+        // reorder. If `merge` ever drifted from `apply_delta` on
+        // this rule, this test would fail.
+        let owner = gen_key();
+        let params = make_params(&owner);
+        let mut local = SiteState::new(SiteConfig::default(), &owner);
+        let mut peer = SiteState::new(SiteConfig::default(), &owner);
+
+        let page_a = Page::new_with_order(1, "A".into(), "a".into(), 100, 10, &owner);
+        let page_b = Page::new_with_order(2, "B".into(), "b".into(), 100, 20, &owner);
+        local
+            .upsert_page(1, page_a.clone(), &owner.verifying_key())
+            .unwrap();
+        local
+            .upsert_page(2, page_b.clone(), &owner.verifying_key())
+            .unwrap();
+
+        // Peer has the swapped orders but the same timestamp.
+        let swap_a = Page::new_with_order(1, "A".into(), "a".into(), 100, 20, &owner);
+        let swap_b = Page::new_with_order(2, "B".into(), "b".into(), 100, 10, &owner);
+        peer.upsert_page(1, swap_a, &owner.verifying_key()).unwrap();
+        peer.upsert_page(2, swap_b, &owner.verifying_key()).unwrap();
+
+        local.merge(&params, &peer).unwrap();
+        assert_eq!(local.pages[&1].order, 10, "merge dropped same-ts swap");
+        assert_eq!(local.pages[&2].order, 20, "merge dropped same-ts swap");
+
+        // With +1 the merge does take.
+        let swap_a = Page::new_with_order(1, "A".into(), "a".into(), 101, 20, &owner);
+        let swap_b = Page::new_with_order(2, "B".into(), "b".into(), 101, 10, &owner);
+        let mut peer2 = SiteState::new(SiteConfig::default(), &owner);
+        peer2
+            .upsert_page(1, swap_a, &owner.verifying_key())
+            .unwrap();
+        peer2
+            .upsert_page(2, swap_b, &owner.verifying_key())
+            .unwrap();
+        local.merge(&params, &peer2).unwrap();
+        assert_eq!(local.pages[&1].order, 20);
+        assert_eq!(local.pages[&2].order, 10);
+    }
+
+    #[test]
     fn page_order_is_signed() {
         let owner = gen_key();
         let page = Page::new_with_order(1, "Title".into(), "Content".into(), 100, 5, &owner);

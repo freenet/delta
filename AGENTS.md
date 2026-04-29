@@ -50,6 +50,8 @@ When adding a new field to any signed struct (Page, SignedConfig, SignedPageDele
 
 Page signatures use v2 format (`delta:page:v2:`) which covers: page_id, title, content, updated_at, order. V1 fallback (without order) exists for pre-existing pages.
 
+**`updated_at` must be strictly greater than the page's current `updated_at`.** `apply_delta` and `merge` in `delta-core` dominate equal timestamps with `>=`, so an UPDATE whose `updated_at` matches what's already in state is silently dropped on the network. Any UI path that produces a page UPDATE (`save_current_page`, `rename_page`, `swap_page_order`, …) MUST route through `next_page_updated_at` in `ui/src/state.rs`, which computes `max(now_secs(), existing + 1)`. Calling `now_secs()` directly is a recurrence of the reorder bug Ivvor reported on 2026-04-29 (silent same-second collisions).
+
 ### Page Links
 
 - `[[2]]` - renders as current page title, auto-updates on rename
