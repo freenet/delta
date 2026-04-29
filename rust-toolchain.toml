@@ -1,0 +1,97 @@
+[toolchain]
+# Pinned to keep site_delegate.wasm and site_contract.wasm builds
+# byte-deterministic across local dev and CI.
+#
+# Why this matters: the delegate key is BLAKE3(BLAKE3(wasm) || params).
+# A different rustc version produces different WASM bytes (LLVM
+# changes between releases) and therefore a different delegate key.
+# Users store their signing keys, known sites, and site state
+# backups under the current delegate's key — changing the key
+# without recording the old key in legacy_delegates.toml silently
+# orphans every user's data.
+#
+# This is the same reason river/main pins to the same channel.
+# `freenet/freenet-core` also pins; aim to keep these aligned so a
+# shared dependency built in two repos produces the same bytes.
+#
+# ============================================================
+# Procedure for bumping this pin (canonical; same as AGENTS.md)
+# ============================================================
+#
+# Run the steps in order from a clean working tree on a topic
+# branch. Each step has a verification you should perform before
+# moving on. Do NOT batch-run them blind.
+#
+# 0. Install the new toolchain locally so cargo can use it:
+#       rustup install <new-channel>
+#       rustup component add rustfmt clippy --toolchain <new-channel>
+#       rustup target add wasm32-unknown-unknown --toolchain <new-channel>
+#
+# 1. Record the CURRENT delegate WASM hash (BEFORE the bump):
+#       ./scripts/add-migration.sh V_N "rustc X.Y.Z -> X.Y.Z+1"
+#    The script reads ui/public/contracts/site_delegate.wasm,
+#    computes its BLAKE3 hash, and appends an [[entry]] block to
+#    legacy_delegates.toml. Verify the entry was written:
+#       tail -10 legacy_delegates.toml
+#
+# 2. Record the CURRENT contract WASM hash (BEFORE the bump):
+#       ./scripts/add-contract-migration.sh C_N "rustc X.Y.Z -> X.Y.Z+1"
+#    Same logic but for legacy_contracts.toml.
+#
+# 3. Bump the `channel` field below to the new version.
+#
+# 4. Rebuild WASMs with the new toolchain:
+#       ./scripts/sync-wasm.sh
+#    This invokes rustup with the channel from this file (you just
+#    bumped it), so the new bytes are produced and copied into
+#    ui/public/contracts/. Verify:
+#       b3sum ui/public/contracts/site_delegate.wasm
+#    Hash MUST differ from the one you just recorded in step 1.
+#
+# 5. Run the local migration check (the same one CI runs):
+#       ./scripts/check-migration.sh
+#    Must print "Safe to publish."
+#
+# 6. Commit everything together as ONE atomic change:
+#       git add rust-toolchain.toml \
+#               legacy_delegates.toml \
+#               legacy_contracts.toml \
+#               ui/public/contracts/site_delegate.wasm \
+#               ui/public/contracts/site_contract.wasm
+#       git commit -m "build: bump rustc X.Y.Z -> X.Y.Z+1"
+#    Reviewers can then verify in one diff that:
+#      (a) the predecessor hashes were recorded,
+#      (b) the WASMs changed,
+#      (c) the channel changed,
+#      (d) nothing else.
+#
+# 7. Open a PR. CI's migration-safety job rebuilds with the new
+#    pinned channel and compares against the just-committed WASMs
+#    — must match. (If it doesn't, the runner's stable doesn't
+#    include the version you pinned yet; pick a slightly older
+#    version or wait.)
+#
+# 8. After merge, republish to Freenet:
+#       cargo make publish-delta
+#    The new delegate / contract WASMs ship. Existing users boot
+#    the new UI, the legacy migration paths kick in, and their
+#    pre-bump data migrates from the old key to the new one.
+#
+# 9. Verify in a real browser:
+#       - load the published Delta with at least one existing site;
+#       - confirm the site is still listed (legacy migration of
+#         known_sites worked);
+#       - confirm at least one page loads (legacy migration of
+#         site_state backup worked);
+#       - confirm an edit saves and round-trips (new key is
+#         functional).
+#    Do NOT consider the bump done until step 9 passes against the
+#    actual deployment.
+#
+# Old legacy entries can in principle be pruned years later once we
+# are confident no users still hold data under those keys. Don't
+# rush this — leaving entries in costs nothing but a few KB in the
+# webapp bundle.
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]

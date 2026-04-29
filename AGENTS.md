@@ -106,6 +106,30 @@ would appear to fail.
 Any change to the KnownSites response handler must preserve both rules;
 the `filter_applicable_tombstones` unit tests pin them.
 
+## Reproducible WASM Builds
+
+The repo pins rustc via `rust-toolchain.toml` (currently `1.94.1`). This is **load-bearing for the migration system**: the delegate key is `BLAKE3(BLAKE3(wasm) || params)`, so any change in WASM bytes — including bytes produced by an LLVM upgrade in a newer rustc — produces a new delegate key and orphans every user's stored data unless a migration entry is recorded first.
+
+The migration-safety check in `.github/workflows/ci.yml` rebuilds the WASMs from source on each PR and refuses to merge if the committed hashes don't match. With a pinned toolchain CI and local always agree, so the gate provides real signal.
+
+The same pattern is used in `freenet/river` and `freenet/freenet-core`. Don't let the pin drift past those sibling repos without coordinating, since a Freenet dApp ecosystem with mismatched toolchain pins will silently produce different hashes for shared dependencies.
+
+### Upgrading the pinned rustc
+
+Bumping `channel` in `rust-toolchain.toml` is a **data-migration gesture**, not a routine maintenance task. Treat it the same way you treat changing delegate or contract code: predecessor hashes recorded first, WASM regenerated, single-commit PR, post-merge republish, browser verification. The full canonical procedure lives at the top of `rust-toolchain.toml`; the summary:
+
+1. `rustup install <new-channel>` (and add `rustfmt`, `clippy`, `wasm32-unknown-unknown` to it).
+2. `./scripts/add-migration.sh V_N "rustc X.Y.Z -> X.Y.Z+1"` — records the current delegate WASM hash in `legacy_delegates.toml` BEFORE the bump.
+3. `./scripts/add-contract-migration.sh C_N "rustc X.Y.Z -> X.Y.Z+1"` — same for the contract WASM.
+4. Bump `channel` in `rust-toolchain.toml`.
+5. `./scripts/sync-wasm.sh` — rebuilds with the new channel and copies the new bytes into `ui/public/contracts/`. The hash must differ from the one just recorded.
+6. `./scripts/check-migration.sh` — must print "Safe to publish."
+7. Single commit, single PR: `rust-toolchain.toml`, both `legacy_*.toml`, both `ui/public/contracts/*.wasm`. Reviewers see the whole atomic change in one diff.
+8. After merge: `cargo make publish-delta`.
+9. Browser verification on the live deploy: existing site still listed, at least one page loads (legacy migration of state backup worked), an edit saves and round-trips (new key functional). **Don't consider the bump done until step 9 passes.**
+
+Skipping any step silently breaks data continuity for every existing user; there is no automatic recovery. The procedure is in the toml file rather than a separate runbook so the person about to run `vim rust-toolchain.toml` has it directly in front of them.
+
 ## Contract Upgrade / State Migration
 
 ### When Contract WASM Changes

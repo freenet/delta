@@ -17,10 +17,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust
+        # No `with: toolchain:` — `dtolnay/rust-toolchain` honours the
+        # rust-toolchain.toml file at the repo root. Pinning lives in
+        # one place; CI and local devs run the same rustc, which is
+        # what makes the migration-safety check in the next job
+        # actually able to compare hashes.
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
-          components: clippy, rustfmt
 
       - name: Cache cargo
         uses: actions/cache@v4
@@ -54,9 +56,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust
+        # See note in the `check` job: pin lives in rust-toolchain.toml.
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
 
       - name: Install b3sum
         run: cargo install b3sum
@@ -71,16 +72,27 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-
 
+      - name: Print toolchain (for diagnostics if hashes mismatch)
+        run: rustc --version --verbose
+
       - name: Verify delegate WASM matches source
         run: |
           ./scripts/build-wasm.sh -p site-delegate
           COMMITTED=$(b3sum ui/public/contracts/site_delegate.wasm | cut -d' ' -f1)
           BUILT=$(b3sum target/wasm32-unknown-unknown/release/site_delegate.wasm | cut -d' ' -f1)
           if [ "$COMMITTED" != "$BUILT" ]; then
-            echo "::error::Committed delegate WASM is stale (doesn't match built from source)"
+            echo "::error::Committed delegate WASM does not match what this toolchain produced from source."
             echo "  committed: $COMMITTED"
             echo "  built:     $BUILT"
-            echo "Run ./scripts/sync-wasm.sh to update"
+            echo ""
+            echo "If you intentionally changed delegate code, run:"
+            echo "  ./scripts/add-migration.sh V_N \"<short description>\""
+            echo "  ./scripts/sync-wasm.sh"
+            echo ""
+            echo "If this CI failure surprises you (no delegate change in this PR),"
+            echo "the toolchain may have drifted from rust-toolchain.toml. The runner"
+            echo "above prints rustc --version --verbose; compare against:"
+            echo "  $(grep '^channel' rust-toolchain.toml || echo '(rust-toolchain.toml not found)')"
             exit 1
           fi
 
@@ -90,9 +102,17 @@ jobs:
           COMMITTED=$(b3sum ui/public/contracts/site_contract.wasm | cut -d' ' -f1)
           BUILT=$(b3sum target/wasm32-unknown-unknown/release/site_contract.wasm | cut -d' ' -f1)
           if [ "$COMMITTED" != "$BUILT" ]; then
-            echo "::error::Committed contract WASM is stale (doesn't match built from source)"
+            echo "::error::Committed contract WASM does not match what this toolchain produced from source."
             echo "  committed: $COMMITTED"
             echo "  built:     $BUILT"
-            echo "Run ./scripts/sync-wasm.sh to update"
+            echo ""
+            echo "If you intentionally changed contract code or common/, run:"
+            echo "  ./scripts/add-contract-migration.sh C_N \"<short description>\""
+            echo "  ./scripts/sync-wasm.sh"
+            echo ""
+            echo "If this CI failure surprises you (no contract / common/ change in"
+            echo "this PR), the toolchain may have drifted from rust-toolchain.toml."
+            echo "The runner above prints rustc --version --verbose; compare against:"
+            echo "  $(grep '^channel' rust-toolchain.toml || echo '(rust-toolchain.toml not found)')"
             exit 1
           fi
