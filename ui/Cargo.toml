@@ -55,3 +55,7 @@ delta-core.workspace = true
 chrono = "0.4"
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
+# Used to validate delegate_key == BLAKE3(code_hash) at compile time
+# so a typo in legacy_delegates.toml fails the build, not the live
+# UI rolling out a broken migration table.
+blake3 = "1"

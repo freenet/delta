@@ -100,6 +100,20 @@ fn generate_legacy_delegates() {
         let dk_bytes = hex_to_byte_array(&entry.delegate_key, &entry.version, "delegate_key");
         let ch_bytes = hex_to_byte_array(&entry.code_hash, &entry.version, "code_hash");
 
+        // Cross-check the relationship documented at the top of
+        // legacy_delegates.toml: `delegate_key = BLAKE3(code_hash_bytes)`.
+        // Catches typos / hand-computed-wrong / a future drift in the
+        // freenet-stdlib formula at build time, before the UI ships.
+        let computed_dk: [u8; 32] = *blake3::hash(&ch_bytes).as_bytes();
+        assert_eq!(
+            dk_bytes, computed_dk,
+            "{}: delegate_key in legacy_delegates.toml does not match BLAKE3(code_hash). \
+             stored = {}, computed = {}. Did the formula change in freenet-stdlib, or is one of the fields a typo?",
+            entry.version,
+            bytes_to_hex(&dk_bytes),
+            bytes_to_hex(&computed_dk),
+        );
+
         code.push_str(&format!(
             "    // {}: {} ({})\n",
             entry.version, entry.description, entry.date
@@ -168,6 +182,14 @@ fn generate_legacy_contracts() {
     if existing != code {
         fs::write(&dest, &code).unwrap();
     }
+}
+
+fn bytes_to_hex(bytes: &[u8; 32]) -> String {
+    let mut s = String::with_capacity(64);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
 }
 
 fn hex_to_byte_array(hex: &str, version: &str, field: &str) -> [u8; 32] {

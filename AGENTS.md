@@ -106,6 +106,14 @@ would appear to fail.
 Any change to the KnownSites response handler must preserve both rules;
 the `filter_applicable_tombstones` unit tests pin them.
 
+## Reproducible WASM Builds
+
+The repo pins rustc via `rust-toolchain.toml` (currently `1.94.1`). This is **load-bearing for the migration system**: the delegate key is `BLAKE3(BLAKE3(wasm) || params)`, so any change in WASM bytes — including bytes produced by an LLVM upgrade in a newer rustc — produces a new delegate key and orphans every user's stored data unless a migration entry is recorded first.
+
+The migration-safety check in `.github/workflows/ci.yml` rebuilds the WASMs from source on each PR and refuses to merge if the committed hashes don't match. With a pinned toolchain CI and local always agree, so the gate provides real signal. If `rust-toolchain.toml` changes, treat it like any other delegate / contract WASM change: run `./scripts/add-migration.sh` (and `./scripts/add-contract-migration.sh` if `common/` or contract code is also touched) **before** running `./scripts/sync-wasm.sh`.
+
+The same pattern is used in `freenet/river` and `freenet/freenet-core`. Don't let the pin drift past those sibling repos without coordinating, since a Freenet dApp ecosystem with mismatched toolchain pins will silently produce different hashes for shared dependencies.
+
 ## Contract Upgrade / State Migration
 
 ### When Contract WASM Changes

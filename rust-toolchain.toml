@@ -1,0 +1,30 @@
+[toolchain]
+# Pinned to keep site_delegate.wasm and site_contract.wasm builds
+# byte-deterministic across local dev and CI.
+#
+# Why this matters: the delegate key is BLAKE3(BLAKE3(wasm) || params).
+# A different rustc version produces different WASM bytes (LLVM
+# changes between releases) and therefore a different delegate key.
+# Users store their signing keys, known sites, and site state
+# backups under the current delegate's key — changing the key
+# without recording the old key in legacy_delegates.toml silently
+# orphans every user's data.
+#
+# This is the same reason river/main pins to the same channel.
+# When updating this pin (any rustc bump):
+#
+#   1. ./scripts/add-migration.sh V_N "rustc X.Y.Z -> X.Y.Z+1"
+#      -- records the CURRENT (old-rustc) delegate key in
+#         legacy_delegates.toml so the new delegate can read
+#         legacy state on first run.
+#   2. ./scripts/add-contract-migration.sh C_N "rustc X.Y.Z -> X.Y.Z+1"
+#      -- same as above for the contract WASM hash.
+#   3. Bump `channel` below.
+#   4. ./scripts/sync-wasm.sh -- regenerates the committed WASMs
+#      with the new toolchain. The CI migration-safety check will
+#      pass once committed and CI agree on the same rustc.
+#   5. Commit legacy_*.toml + ui/public/contracts/*.wasm + this
+#      file together in a single PR.
+channel = "1.94.1"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
