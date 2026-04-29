@@ -942,6 +942,114 @@ mod tests {
     }
 
     #[test]
+    fn reorder_with_same_timestamp_is_dropped_by_apply_delta() {
+        // Regression guard for the page-reorder bug Ivvor reported on
+        // 2026-04-29: swapping two pages within the same wall-clock
+        // second produces an UPDATE whose `updated_at` equals the
+        // current state's `updated_at` for both pages. `apply_delta`
+        // dominates equal timestamps, so the swap is silently dropped
+        // on the network even though the local UI optimistically
+        // applied it. The user sees the new order until reload, then
+        // the network state (without the swap) wins.
+        //
+        // This test pins the contract behavior: if an UPDATE arrives
+        // with `updated_at == existing.updated_at` and a different
+        // `order`, the change MUST be rejected. The fix has to live in
+        // the UI: every reorder must produce strictly greater
+        // timestamps. See the matching `swap_page_order` test in
+        // ui/src/state.rs.
+        let owner = gen_key();
+        let params = make_params(&owner);
+        let mut site = SiteState::new(SiteConfig::default(), &owner);
+
+        let page_a = Page::new_with_order(1, "A".into(), "a".into(), 100, 10, &owner);
+        let page_b = Page::new_with_order(2, "B".into(), "b".into(), 100, 20, &owner);
+        site.upsert_page(1, page_a, &owner.verifying_key()).unwrap();
+        site.upsert_page(2, page_b, &owner.verifying_key()).unwrap();
+
+        // Same-second reorder: orders swapped, timestamp unchanged.
+        let swap_a = Page::new_with_order(1, "A".into(), "a".into(), 100, 20, &owner);
+        let swap_b = Page::new_with_order(2, "B".into(), "b".into(), 100, 10, &owner);
+        let mut page_updates = BTreeMap::new();
+        page_updates.insert(1, swap_a);
+        page_updates.insert(2, swap_b);
+        let delta = SiteStateDelta {
+            config: None,
+            page_updates,
+            page_deletions: Vec::new(),
+        };
+
+        site.apply_delta(&delta, &params).unwrap();
+
+        // Bug behavior pinned: equal timestamps are dominated, swap dropped.
+        assert_eq!(site.pages[&1].order, 10, "swap was silently dropped");
+        assert_eq!(site.pages[&2].order, 20, "swap was silently dropped");
+
+        // Sanity: with a strictly greater timestamp, the swap applies.
+        let swap_a = Page::new_with_order(1, "A".into(), "a".into(), 101, 20, &owner);
+        let swap_b = Page::new_with_order(2, "B".into(), "b".into(), 101, 10, &owner);
+        let mut page_updates = BTreeMap::new();
+        page_updates.insert(1, swap_a);
+        page_updates.insert(2, swap_b);
+        let delta = SiteStateDelta {
+            config: None,
+            page_updates,
+            page_deletions: Vec::new(),
+        };
+        site.apply_delta(&delta, &params).unwrap();
+        assert_eq!(site.pages[&1].order, 20);
+        assert_eq!(site.pages[&2].order, 10);
+    }
+
+    #[test]
+    fn reorder_with_same_timestamp_is_dropped_by_merge() {
+        // Same dominance bug as the apply_delta path, but exercised
+        // through `merge` (used when a peer sends a full state via
+        // `UpdateData::State` rather than a delta). Both code paths
+        // use `>=` for tie-breaking, so the UI's strict-monotonicity
+        // invariant is what makes either path actually replicate a
+        // reorder. If `merge` ever drifted from `apply_delta` on
+        // this rule, this test would fail.
+        let owner = gen_key();
+        let params = make_params(&owner);
+        let mut local = SiteState::new(SiteConfig::default(), &owner);
+        let mut peer = SiteState::new(SiteConfig::default(), &owner);
+
+        let page_a = Page::new_with_order(1, "A".into(), "a".into(), 100, 10, &owner);
+        let page_b = Page::new_with_order(2, "B".into(), "b".into(), 100, 20, &owner);
+        local
+            .upsert_page(1, page_a.clone(), &owner.verifying_key())
+            .unwrap();
+        local
+            .upsert_page(2, page_b.clone(), &owner.verifying_key())
+            .unwrap();
+
+        // Peer has the swapped orders but the same timestamp.
+        let swap_a = Page::new_with_order(1, "A".into(), "a".into(), 100, 20, &owner);
+        let swap_b = Page::new_with_order(2, "B".into(), "b".into(), 100, 10, &owner);
+        peer.upsert_page(1, swap_a, &owner.verifying_key()).unwrap();
+        peer.upsert_page(2, swap_b, &owner.verifying_key()).unwrap();
+
+        local.merge(&params, &peer).unwrap();
+        assert_eq!(local.pages[&1].order, 10, "merge dropped same-ts swap");
+        assert_eq!(local.pages[&2].order, 20, "merge dropped same-ts swap");
+
+        // With +1 the merge does take.
+        let swap_a = Page::new_with_order(1, "A".into(), "a".into(), 101, 20, &owner);
+        let swap_b = Page::new_with_order(2, "B".into(), "b".into(), 101, 10, &owner);
+        let mut peer2 = SiteState::new(SiteConfig::default(), &owner);
+        peer2
+            .upsert_page(1, swap_a, &owner.verifying_key())
+            .unwrap();
+        peer2
+            .upsert_page(2, swap_b, &owner.verifying_key())
+            .unwrap();
+        local.merge(&params, &peer2).unwrap();
+        assert_eq!(local.pages[&1].order, 20);
+        assert_eq!(local.pages[&2].order, 10);
+    }
+
+    #[test]
     fn page_order_is_signed() {
         let owner = gen_key();
         let page = Page::new_with_order(1, "Title".into(), "Content".into(), 100, 5, &owner);
