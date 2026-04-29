@@ -68,7 +68,15 @@ pub fn Editor() -> Element {
     // Insert a page link (or create a new page)
     let mut insert_link = move |id: PageId, title: &str| {
         let content = state::EDITOR_CONTENT.read().clone();
-        let pos = (*cursor_pos.read()).min(content.len());
+        // `cursor_pos` is a UTF-8 byte offset stored by
+        // `update_autocomplete`. Clamp to a valid char boundary in
+        // case the content was edited between the input event and
+        // this callback firing; slicing inside a multi-byte char
+        // would panic with "unreachable" in WASM.
+        let mut pos = (*cursor_pos.read()).min(content.len());
+        while pos > 0 && !content.is_char_boundary(pos) {
+            pos -= 1;
+        }
         let before = &content[..pos];
 
         if id == u64::MAX {
@@ -291,6 +299,35 @@ pub fn Editor() -> Element {
     }
 }
 
+/// Convert a JavaScript UTF-16 code-unit offset (as returned by
+/// `HtmlTextAreaElement::selection_start`) to a UTF-8 byte offset
+/// suitable for slicing a Rust `&str`.
+///
+/// JS strings count UTF-16 code units; Rust strings are UTF-8 byte
+/// sequences. Slicing `text[..utf16_pos]` directly panics with
+/// "unreachable" in WASM whenever the cursor lands inside or after
+/// any non-ASCII character (e.g. `·`, `é`, emoji, CJK). The result
+/// is always on a UTF-8 char boundary.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub(crate) fn utf16_to_byte_index(s: &str, utf16_pos: usize) -> usize {
+    let mut utf16 = 0usize;
+    for (byte_idx, ch) in s.char_indices() {
+        if utf16_pos <= utf16 {
+            return byte_idx;
+        }
+        let next = utf16 + ch.len_utf16();
+        if utf16_pos < next {
+            // The position lies inside a surrogate pair (rare;
+            // browsers don't normally put cursors between halves of
+            // a pair). Snap to the start of the char so the
+            // resulting byte index is on a valid UTF-8 boundary.
+            return byte_idx;
+        }
+        utf16 = next;
+    }
+    s.len()
+}
+
 /// Check if cursor is inside [[ and update autocomplete state.
 #[allow(clippy::ptr_arg, clippy::too_many_arguments, unused_variables)]
 fn update_autocomplete(
@@ -311,17 +348,18 @@ fn update_autocomplete(
             .and_then(|d| d.get_element_by_id("delta-editor"))
             .and_then(|e| e.dyn_into::<web_sys::HtmlTextAreaElement>().ok())
         {
-            let pos = el.selection_start().ok().flatten().unwrap_or(0) as usize;
-            *cursor_pos.write() = pos;
+            let utf16_pos = el.selection_start().ok().flatten().unwrap_or(0) as usize;
+            let byte_pos = utf16_to_byte_index(text, utf16_pos);
+            *cursor_pos.write() = byte_pos;
 
-            let before_cursor = &text[..pos.min(text.len())];
+            let before_cursor = &text[..byte_pos];
             if let Some(open) = before_cursor.rfind("[[") {
                 let between = &before_cursor[open + 2..];
                 if !between.contains("]]") && !between.contains('\n') {
                     web_sys::console::log_1(
                         &format!(
                             "Delta: autocomplete triggered, query='{}' pos={}",
-                            between, pos
+                            between, byte_pos
                         )
                         .into(),
                     );
@@ -335,4 +373,75 @@ fn update_autocomplete(
     }
     ac_visible.set(false);
     ac_query.set(None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::utf16_to_byte_index;
+
+    #[test]
+    fn ascii_offsets_match_byte_offsets() {
+        assert_eq!(utf16_to_byte_index("abc", 0), 0);
+        assert_eq!(utf16_to_byte_index("abc", 1), 1);
+        assert_eq!(utf16_to_byte_index("abc", 3), 3);
+    }
+
+    #[test]
+    fn two_byte_utf8_char_advances_by_two_bytes_per_unit() {
+        // "·" is U+00B7: 1 UTF-16 unit, 2 UTF-8 bytes.
+        let s = "a·b";
+        assert_eq!(utf16_to_byte_index(s, 0), 0);
+        assert_eq!(utf16_to_byte_index(s, 1), 1); // after 'a'
+        assert_eq!(utf16_to_byte_index(s, 2), 3); // after '·' (skip its 2 bytes)
+        assert_eq!(utf16_to_byte_index(s, 3), 4); // after 'b'
+    }
+
+    #[test]
+    fn three_byte_utf8_char_advances_by_three_bytes_per_unit() {
+        // "汉" is U+6C49: 1 UTF-16 unit, 3 UTF-8 bytes.
+        let s = "a汉b";
+        assert_eq!(utf16_to_byte_index(s, 1), 1);
+        assert_eq!(utf16_to_byte_index(s, 2), 4);
+        assert_eq!(utf16_to_byte_index(s, 3), 5);
+    }
+
+    #[test]
+    fn surrogate_pair_consumes_two_utf16_units() {
+        // "🎉" is U+1F389: surrogate pair (2 UTF-16 units), 4 UTF-8 bytes.
+        let s = "a🎉b";
+        assert_eq!(utf16_to_byte_index(s, 1), 1); // after 'a'
+        assert_eq!(utf16_to_byte_index(s, 2), 1); // mid-surrogate, snap to char start
+        assert_eq!(utf16_to_byte_index(s, 3), 5); // after '🎉'
+        assert_eq!(utf16_to_byte_index(s, 4), 6); // after 'b'
+    }
+
+    #[test]
+    fn out_of_range_clamps_to_string_len() {
+        let s = "a·b";
+        assert_eq!(utf16_to_byte_index(s, 100), s.len());
+    }
+
+    #[test]
+    fn zero_pos_returns_zero() {
+        assert_eq!(utf16_to_byte_index("", 0), 0);
+        assert_eq!(utf16_to_byte_index("·", 0), 0);
+    }
+
+    #[test]
+    fn slicing_with_returned_index_never_panics() {
+        // Regression: the previous code did `&text[..selection_start]`,
+        // which panics inside any non-ASCII char. With the converter
+        // every reachable cursor position must yield a valid char
+        // boundary regardless of what is to the left.
+        let cases = ["·abc", "a·b·c", "汉a汉", "🎉x🎉", "café"];
+        for s in cases {
+            // Use the largest UTF-16 length the string can produce so
+            // we stress every code-unit position 0..=utf16_len.
+            let utf16_len: usize = s.chars().map(|c| c.len_utf16()).sum();
+            for pos in 0..=utf16_len + 2 {
+                let idx = utf16_to_byte_index(s, pos);
+                let _ = &s[..idx]; // must not panic
+            }
+        }
+    }
 }
