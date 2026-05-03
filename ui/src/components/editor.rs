@@ -24,6 +24,9 @@ pub fn Editor() -> Element {
     let content = state::EDITOR_CONTENT.read().clone();
     let preview_html = markdown::to_html_with_options(&content, &markdown::Options::gfm())
         .unwrap_or_else(|_| markdown::to_html(&content));
+    // Inject heading ids so in-page anchor links (`[Link](#heading)`) work
+    // in the live preview as well as in the rendered page view.
+    let preview_html = super::page_view::inject_heading_ids(&preview_html);
 
     // Autocomplete state
     let mut ac_query = use_signal(|| None::<String>);

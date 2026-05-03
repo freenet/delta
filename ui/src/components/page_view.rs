@@ -184,11 +184,181 @@ pub fn PageView() -> Element {
     }
 }
 
-/// Render markdown to HTML, resolving `[[id|text]]` page links as hash links.
+/// Render markdown to HTML, resolving `[[id|text]]` page links as hash links
+/// and injecting `id="..."` attributes on headings so in-page anchor links
+/// (`[Link to Heading](#heading)`) work natively.
 fn render_markdown(content: &str) -> String {
     let resolved = resolve_page_links(content);
-    markdown::to_html_with_options(&resolved, &markdown::Options::gfm())
-        .unwrap_or_else(|_| markdown::to_html(&resolved))
+    let html = markdown::to_html_with_options(&resolved, &markdown::Options::gfm())
+        .unwrap_or_else(|_| markdown::to_html(&resolved));
+    inject_heading_ids(&html)
+}
+
+/// Walk the rendered HTML and inject GFM-style `id="slug"` attributes on
+/// every `<h1>`..`<h6>` opening tag. The `markdown` crate does not emit
+/// these by default, so anchor links like `[Link](#test-heading)` have
+/// nowhere to land. The id is the slugified plain-text of the heading
+/// (HTML tags stripped); duplicate slugs are disambiguated with `-1`,
+/// `-2`, ... matching the convention GitHub uses.
+pub(super) fn inject_heading_ids(html: &str) -> String {
+    let mut result = String::with_capacity(html.len() + 64);
+    let mut id_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+    let bytes = html.as_bytes();
+    // Byte position up to which non-heading content has yet to be flushed
+    // into `result`. We accumulate ranges and slice via `html[..]` so
+    // multibyte UTF-8 characters survive the walk intact (byte-by-byte
+    // pushing-as-char would corrupt them). The byte-level pattern checks
+    // below all use ASCII bytes, which by UTF-8 invariant never collide
+    // with continuation bytes inside multibyte characters.
+    let mut copy_start = 0;
+    let mut i = 0;
+
+    while i < bytes.len() {
+        // Look for `<hN>` where N is 1..=6 and the next char is `>`.
+        if i + 4 <= bytes.len()
+            && bytes[i] == b'<'
+            && bytes[i + 1] == b'h'
+            && (b'1'..=b'6').contains(&bytes[i + 2])
+            && bytes[i + 3] == b'>'
+        {
+            let level = bytes[i + 2];
+            let close_tag = format!("</h{}>", level as char);
+            let inner_start = i + 4;
+            if let Some(rel) = html[inner_start..].find(&close_tag) {
+                let inner = &html[inner_start..inner_start + rel];
+                let plain = strip_html_tags(inner);
+                let base_slug = slugify_heading(&plain);
+                if base_slug.is_empty() {
+                    // Heading with no sluggable text — leave the tag
+                    // alone rather than emit `id=""`.
+                    i = inner_start;
+                    continue;
+                }
+                // Flush everything up to the start of this heading
+                // (`i` points at the `<`, which is ASCII, so the slice
+                // ends on a char boundary).
+                result.push_str(&html[copy_start..i]);
+                let count = id_counts.entry(base_slug.clone()).or_insert(0);
+                let slug = if *count == 0 {
+                    base_slug.clone()
+                } else {
+                    format!("{}-{}", base_slug, *count)
+                };
+                *count += 1;
+                result.push_str(&format!("<h{} id=\"{}\">", level as char, slug));
+                result.push_str(inner);
+                result.push_str(&close_tag);
+                let after = inner_start + rel + close_tag.len();
+                i = after;
+                copy_start = after;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    result.push_str(&html[copy_start..]);
+    result
+}
+
+/// Strip HTML tags from a string, returning just the textual content
+/// with the common HTML entities decoded back to their characters.
+/// Used for heading-id slugification so a heading containing a link or
+/// `<em>` produces a slug from the visible text only, and headings
+/// like `# Foo & Bar` (rendered as `Foo &amp; Bar` by the markdown
+/// crate) slugify the same way GitHub does.
+fn strip_html_tags(s: &str) -> String {
+    let stripped = {
+        let mut out = String::with_capacity(s.len());
+        let mut in_tag = false;
+        for c in s.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                _ if !in_tag => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    };
+    decode_html_entities(&stripped)
+}
+
+/// Minimal HTML entity decoder covering the entities the `markdown`
+/// crate emits: `&amp;`, `&lt;`, `&gt;`, `&quot;`, `&#39;`, plus
+/// numeric character references `&#N;` and `&#xN;`. Anything unknown
+/// is passed through verbatim.
+fn decode_html_entities(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp..];
+        if let Some(semi) = after.find(';') {
+            let entity = &after[..=semi];
+            let decoded: Option<char> = match entity {
+                "&amp;" => Some('&'),
+                "&lt;" => Some('<'),
+                "&gt;" => Some('>'),
+                "&quot;" => Some('"'),
+                "&apos;" => Some('\''),
+                "&#39;" => Some('\''),
+                _ => {
+                    // Numeric character references: &#N; (decimal) or &#xN; (hex)
+                    let body = &entity[1..entity.len() - 1];
+                    if let Some(rest_body) = body.strip_prefix('#') {
+                        let cp = if let Some(hex) = rest_body
+                            .strip_prefix('x')
+                            .or_else(|| rest_body.strip_prefix('X'))
+                        {
+                            u32::from_str_radix(hex, 16).ok()
+                        } else {
+                            rest_body.parse::<u32>().ok()
+                        };
+                        cp.and_then(char::from_u32)
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(c) = decoded {
+                out.push(c);
+                rest = &after[semi + 1..];
+                continue;
+            }
+            // Unknown entity — pass the `&` through verbatim and keep
+            // scanning from the next byte so we don't infinite-loop.
+            out.push('&');
+            rest = &after[1..];
+        } else {
+            // No closing `;` — pass the rest through.
+            out.push_str(after);
+            return out;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Slugify heading text into an HTML `id`. Approximates the GitHub
+/// algorithm: lowercase, drop punctuation, collapse whitespace runs to
+/// a single hyphen, keep alphanumerics, hyphens and underscores.
+fn slugify_heading(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut last_was_hyphen = false;
+    for c in text.to_lowercase().chars() {
+        if c.is_alphanumeric() || c == '_' {
+            out.push(c);
+            last_was_hyphen = false;
+        } else if (c.is_whitespace() || c == '-') && !last_was_hyphen && !out.is_empty() {
+            out.push('-');
+            last_was_hyphen = true;
+        }
+        // else: drop punctuation
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
 }
 
 /// Replace page links with hash-routed markdown links.
@@ -344,4 +514,198 @@ fn format_timestamp(ts: u64) -> String {
     let dt = DateTime::<Utc>::from_timestamp(ts as i64, 0);
     dt.map(|d| d.format("%b %d, %Y").to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{inject_heading_ids, slugify_heading, strip_html_tags};
+
+    #[test]
+    fn slugify_simple_heading() {
+        assert_eq!(slugify_heading("Hello World"), "hello-world");
+    }
+
+    #[test]
+    fn slugify_drops_punctuation() {
+        // GitHub-style: punctuation is stripped, not replaced with hyphens.
+        assert_eq!(slugify_heading("Foo's Bar!"), "foos-bar");
+        assert_eq!(slugify_heading("What? Why!"), "what-why");
+    }
+
+    #[test]
+    fn slugify_collapses_runs_of_whitespace() {
+        // Multiple spaces / tabs become a single hyphen.
+        assert_eq!(slugify_heading("Foo   Bar"), "foo-bar");
+        assert_eq!(slugify_heading("Foo \t Bar"), "foo-bar");
+    }
+
+    #[test]
+    fn slugify_keeps_underscores() {
+        // Underscores are valid in HTML ids and meaningful in code-style headings.
+        assert_eq!(slugify_heading("snake_case_heading"), "snake_case_heading");
+    }
+
+    #[test]
+    fn slugify_trims_leading_and_trailing_separators() {
+        assert_eq!(slugify_heading("  Hello  "), "hello");
+        assert_eq!(slugify_heading("--Hello--"), "hello");
+    }
+
+    #[test]
+    fn slugify_empty_for_punctuation_only_heading() {
+        assert_eq!(slugify_heading("???"), "");
+        assert_eq!(slugify_heading(""), "");
+    }
+
+    #[test]
+    fn slugify_lowercases_unicode() {
+        assert_eq!(slugify_heading("Café"), "café");
+    }
+
+    #[test]
+    fn strip_tags_keeps_text_only() {
+        assert_eq!(
+            strip_html_tags("Hello <em>World</em>"),
+            "Hello World".to_string()
+        );
+        assert_eq!(
+            strip_html_tags("<a href=\"x\">Link</a> Text"),
+            "Link Text".to_string()
+        );
+    }
+
+    #[test]
+    fn inject_id_into_simple_h1() {
+        let html = "<h1>Hello World</h1>";
+        assert_eq!(
+            inject_heading_ids(html),
+            "<h1 id=\"hello-world\">Hello World</h1>"
+        );
+    }
+
+    #[test]
+    fn inject_id_for_all_levels_h1_through_h6() {
+        for level in 1..=6 {
+            let html = format!("<h{level}>Test</h{level}>");
+            let expected = format!("<h{level} id=\"test\">Test</h{level}>");
+            assert_eq!(inject_heading_ids(&html), expected);
+        }
+    }
+
+    #[test]
+    fn inject_id_uses_text_only_for_heading_with_inline_html() {
+        // Heading with a `<em>` produces an id from the visible text,
+        // not from the raw HTML.
+        let html = "<h2>The <em>Way</em> Forward</h2>";
+        assert_eq!(
+            inject_heading_ids(html),
+            "<h2 id=\"the-way-forward\">The <em>Way</em> Forward</h2>"
+        );
+    }
+
+    #[test]
+    fn duplicate_headings_get_disambiguating_suffixes() {
+        // GitHub convention: the second `<h2>Notes</h2>` becomes id="notes-1".
+        let html = "<h2>Notes</h2><h2>Notes</h2><h2>Notes</h2>";
+        assert_eq!(
+            inject_heading_ids(html),
+            "<h2 id=\"notes\">Notes</h2><h2 id=\"notes-1\">Notes</h2><h2 id=\"notes-2\">Notes</h2>"
+        );
+    }
+
+    #[test]
+    fn empty_heading_is_left_untouched() {
+        // `<h1></h1>` slugifies to "", and we'd rather leave the tag
+        // alone than emit `id=""`.
+        let html = "<h1></h1>";
+        assert_eq!(inject_heading_ids(html), "<h1></h1>");
+    }
+
+    #[test]
+    fn punctuation_only_heading_is_left_untouched() {
+        let html = "<h1>!!!</h1>";
+        assert_eq!(inject_heading_ids(html), "<h1>!!!</h1>");
+    }
+
+    #[test]
+    fn non_heading_tags_are_left_alone() {
+        let html = "<p>Not a heading</p><div><h1>Header</h1></div>";
+        assert_eq!(
+            inject_heading_ids(html),
+            "<p>Not a heading</p><div><h1 id=\"header\">Header</h1></div>"
+        );
+    }
+
+    #[test]
+    fn h7_or_higher_is_not_a_real_heading() {
+        // Defensive: there is no `<h7>` in HTML; don't try to inject.
+        let html = "<h7>Fake</h7>";
+        assert_eq!(inject_heading_ids(html), "<h7>Fake</h7>");
+    }
+
+    #[test]
+    fn anchor_link_target_matches_heading_id() {
+        // The reproduction Ivvor reported: `[Link to Heading](#heading)`
+        // generates `<a href="#heading">` and the matching heading must
+        // get `id="heading"` so the browser can scroll to it.
+        let html = "<h2>Heading</h2><p><a href=\"#heading\">jump</a></p>";
+        let with_ids = inject_heading_ids(html);
+        assert!(with_ids.contains("<h2 id=\"heading\">"));
+        assert!(with_ids.contains("href=\"#heading\""));
+    }
+
+    #[test]
+    fn multibyte_utf8_outside_headings_is_preserved() {
+        // Regression test: an earlier draft pushed bytes one at a time
+        // via `push(bytes[i] as char)`, which corrupted multibyte UTF-8
+        // sequences in non-heading content (e.g. `é` -> `Ã©`).
+        let html = "<p>Café was open</p><h1>Title</h1><p>Naïve</p>";
+        let result = inject_heading_ids(html);
+        assert!(
+            result.contains("Café"),
+            "Café was corrupted in non-heading content: {result}"
+        );
+        assert!(result.contains("Naïve"), "Naïve was corrupted: {result}");
+        assert!(result.contains("<h1 id=\"title\">"));
+    }
+
+    #[test]
+    fn multibyte_utf8_inside_headings_survives_and_slugifies() {
+        let html = "<h1>Café Résumé</h1>";
+        let result = inject_heading_ids(html);
+        assert_eq!(result, "<h1 id=\"café-résumé\">Café Résumé</h1>");
+    }
+
+    #[test]
+    fn strip_tags_decodes_common_html_entities() {
+        // The markdown crate emits `&amp;` for `&`, `&lt;` for `<`, etc.
+        // The slugifier must see the *decoded* text so a heading
+        // `# Foo & Bar` produces id="foo-bar", matching GitHub.
+        assert_eq!(strip_html_tags("Foo &amp; Bar"), "Foo & Bar");
+        assert_eq!(strip_html_tags("&lt;tag&gt;"), "<tag>");
+        assert_eq!(strip_html_tags("It&#39;s"), "It's");
+        assert_eq!(strip_html_tags("&quot;quoted&quot;"), "\"quoted\"");
+    }
+
+    #[test]
+    fn slug_for_heading_with_ampersand_matches_github() {
+        let html = "<h2>Foo &amp; Bar</h2>";
+        let result = inject_heading_ids(html);
+        assert_eq!(result, "<h2 id=\"foo-bar\">Foo &amp; Bar</h2>");
+    }
+
+    #[test]
+    fn unknown_entity_passes_through() {
+        // `&unknownEntity;` isn't decoded; the `&` is preserved verbatim
+        // so we don't lose data and the slugifier strips it as
+        // punctuation.
+        assert_eq!(strip_html_tags("foo &unknown; bar"), "foo &unknown; bar");
+    }
+
+    #[test]
+    fn stray_ampersand_without_semicolon_passes_through() {
+        // No closing `;` -> not an entity; pass the rest of the string
+        // through without trying to parse.
+        assert_eq!(strip_html_tags("foo & bar"), "foo & bar");
+    }
 }
