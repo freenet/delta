@@ -194,7 +194,7 @@ fn render_markdown(content: &str) -> String {
     let html = markdown::to_html_with_options(&resolved, &markdown::Options::gfm())
         .unwrap_or_else(|_| markdown::to_html(&resolved));
     let html = inject_heading_ids(&html);
-    finalize_anchors(&html, running_behind_freenet_gateway())
+    finalize_anchors(&html, behind_gateway())
 }
 
 /// True when Delta is currently being served from a path under
@@ -202,8 +202,13 @@ fn render_markdown(content: &str) -> String {
 /// browser. Returning false suppresses the host-stripping href rewrite
 /// for `dx serve` and other dev flows where the rewritten same-origin
 /// path would have no gateway behind it.
+///
+/// Exposed at module level so the editor live-preview honors the same
+/// flag — without that the preview shows a same-origin path for
+/// Freenet URLs in dev mode while the rendered page view doesn't,
+/// which surprises authors during `dx serve` iteration.
 #[cfg(target_arch = "wasm32")]
-fn running_behind_freenet_gateway() -> bool {
+pub(super) fn behind_gateway() -> bool {
     web_sys::window()
         .and_then(|w| w.location().pathname().ok())
         .map(|p| p.starts_with("/v1/contract/web/"))
@@ -214,7 +219,7 @@ fn running_behind_freenet_gateway() -> bool {
 /// production (gateway-hosted) behavior. Tests covering the dev-mode
 /// path call `finalize_anchors` with an explicit `false` flag.
 #[cfg(not(target_arch = "wasm32"))]
-fn running_behind_freenet_gateway() -> bool {
+pub(super) fn behind_gateway() -> bool {
     true
 }
 
@@ -1126,6 +1131,26 @@ mod tests {
         let result = finalize_anchors(&html, false);
         assert!(result.contains(">My Custom Label</a>"));
         assert!(!result.contains("freenet:"));
+    }
+
+    #[test]
+    fn finalize_anchors_beautifies_autolink_with_ampersand_in_query() {
+        // Regression test for the `&amp;`-encoding concern raised in the
+        // PR #22 skeptical review: GFM autolinks emit the SAME
+        // entity-encoded form in both `href="..."` and the visible
+        // text, so the byte-exact comparison `href == inner` still
+        // holds and beautification fires. Without this test, a future
+        // markdown crate bump that changes the encoding asymmetry
+        // would silently skip beautification on URLs with `&` in the
+        // query string.
+        let html = format!(
+            "<a href=\"http://gw/v1/contract/web/{RIVER_ID}/?a=1&amp;b=2\">http://gw/v1/contract/web/{RIVER_ID}/?a=1&amp;b=2</a>"
+        );
+        let result = finalize_anchors(&html, false);
+        assert!(
+            result.contains(">freenet:raAqMhMG/?a=1&amp;b=2</a>"),
+            "expected beautified label with `&amp;amp;` preserved; got: {result}"
+        );
     }
 
     #[test]
