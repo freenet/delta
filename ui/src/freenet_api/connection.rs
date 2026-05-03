@@ -19,6 +19,48 @@ pub enum ConnectionStatus {
     Error(String),
 }
 
+/// Whether a reconnect attempt is already scheduled. Prevents the
+/// error callback from queueing multiple parallel reconnects when
+/// it fires more than once during a teardown.
+#[cfg(target_arch = "wasm32")]
+static RECONNECT_PENDING: GlobalSignal<bool> = GlobalSignal::new(|| false);
+
+/// Schedule a `connect_to_freenet()` retry after a 2 s delay. Called
+/// from the error callback when the WebSocket closes — without this,
+/// the iframe stays in `Error` state until the user refreshes,
+/// because nothing in the codebase reopens a closed WebSocket.
+#[cfg(target_arch = "wasm32")]
+fn schedule_reconnect() {
+    if *RECONNECT_PENDING.read() {
+        return;
+    }
+    *RECONNECT_PENDING.write() = true;
+
+    use wasm_bindgen::prelude::*;
+    let cb = Closure::<dyn Fn()>::new(|| {
+        *RECONNECT_PENDING.write() = false;
+        // Skip if the user has already manually reconnected (e.g.
+        // by triggering a hash navigation that fires
+        // connect_to_freenet) — `Connecting` and `Connected` both
+        // mean we don't want to clobber a fresh socket.
+        if matches!(
+            &*CONNECTION_STATUS.read(),
+            ConnectionStatus::Connected | ConnectionStatus::Connecting
+        ) {
+            return;
+        }
+        web_sys::console::log_1(&"Delta: attempting WebSocket reconnect".into());
+        connect_to_freenet();
+    });
+    if let Some(window) = web_sys::window() {
+        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            cb.as_ref().unchecked_ref(),
+            2_000,
+        );
+    }
+    cb.forget();
+}
+
 /// Connect to the Freenet node's WebSocket API.
 pub fn connect_to_freenet() {
     #[cfg(target_arch = "wasm32")]
@@ -71,6 +113,14 @@ pub fn connect_to_freenet() {
                 web_sys::console::error_1(&truncated.into());
                 *CONNECTION_STATUS.write() =
                     ConnectionStatus::Error("Connection failed".to_string());
+                // Schedule a reconnect attempt. Without this, the
+                // WebSocket stays dead until the user refreshes the
+                // iframe — which is what surfaced as Ivvor's "red
+                // Error indicator" 2026-05-03 12:20 ("WebSocket
+                // connection closed" + "{error:'connection closed'}"
+                // in the console). Backed off to 2 s so a flapping
+                // node doesn't trigger a tight retry loop.
+                schedule_reconnect();
             },
             move || {
                 web_sys::console::log_1(&"Delta: connected to Freenet".into());
