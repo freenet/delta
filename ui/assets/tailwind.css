@@ -294,6 +294,14 @@ html, body {
   text-align: left;
   font-size: 0.9375em;
 }
+/* GFM table column alignment. The `markdown` crate emits the
+ * deprecated `align="left|center|right"` HTML attribute on `<th>` /
+ * `<td>` for `| :--- |`, `| :---: |`, `| ---: |` separator rows.
+ * Modern browsers don't always honor that attribute when CSS sets
+ * `text-align`, so map it explicitly. */
+.prose th[align="left"], .prose td[align="left"] { text-align: left; }
+.prose th[align="center"], .prose td[align="center"] { text-align: center; }
+.prose th[align="right"], .prose td[align="right"] { text-align: right; }
 .prose th {
   background-color: var(--color-panel-warm);
   font-weight: 600;
