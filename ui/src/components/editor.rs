@@ -25,8 +25,10 @@ pub fn Editor() -> Element {
     let preview_html = markdown::to_html_with_options(&content, &markdown::Options::gfm())
         .unwrap_or_else(|_| markdown::to_html(&content));
     // Inject heading ids so in-page anchor links (`[Link](#heading)`) work
-    // in the live preview as well as in the rendered page view.
+    // in the live preview as well as in the rendered page view, and
+    // beautify any Freenet URLs the user has typed.
     let preview_html = super::page_view::inject_heading_ids(&preview_html);
+    let preview_html = super::page_view::finalize_anchors(&preview_html, true);
 
     // Autocomplete state
     let mut ac_query = use_signal(|| None::<String>);
