@@ -52,6 +52,16 @@ Page signatures use v2 format (`delta:page:v2:`) which covers: page_id, title, c
 
 **`updated_at` must be strictly greater than the page's current `updated_at`.** `apply_delta` and `merge` in `delta-core` dominate equal timestamps with `>=`, so an UPDATE whose `updated_at` matches what's already in state is silently dropped on the network. Any UI path that produces a page UPDATE (`save_current_page`, `rename_page`, `swap_page_order`, …) MUST route through `next_page_updated_at` in `ui/src/state.rs`, which computes `max(now_secs(), existing + 1)`. Calling `now_secs()` directly is a recurrence of the reorder bug Ivvor reported on 2026-04-29 (silent same-second collisions).
 
+**Page `order` invariants (for `swap_page_order` / `create_page` in `ui/src/state.rs`):**
+
+1. `swap_page_order` MUST sign and propagate a fresh page-UPDATE for **every** page whose order changes — not just the two pages clicked. When ANY page on the site is still at `order == 0` (legacy v1-signed pages, or pages created before the order field existed), the swap also performs a one-time site-wide migration to explicit orders `(10, 20, 30, …)` sorted by `(current_order, page_id)` to match the sidebar. Skipping the propagation step is the bug Ivvor re-reported on 2026-05-03 — the local view looked correct but unmigrated pages remained at `order = 0` on the network and clumped to the front of the sidebar after a refresh.
+
+2. `create_page` MUST assign `order = max(existing) + ORDER_STEP` via `next_create_order` (never `0`). Issuing `0` re-poisons a migrated site and re-introduces the front-of-sidebar clumping symptom.
+
+3. The orchestration helper `plan_swap` derives `pages_to_sign` from the diff between current and new orders, so a regression that re-narrows the sign set (e.g. back to "just the two clicked pages") is caught by the unit tests — not just by the lower-level `compute_swap_orders` tests.
+
+**Delegate-response routing MUST use signature verification, not `CURRENT_SITE`.** `handle_signed_page` / `handle_signed_deletion` / `handle_signed_config` in `ui/src/freenet_api/delegate.rs` look up the owning site by checking the signature against every known owner's pubkey (`find_owner_for_signed_*`). Earlier code keyed `PENDING_UPDATES` by `(CURRENT_SITE, page_id)` and consumed the entry on first response; concurrent requests for the same page silently dropped subsequent UPDATEs, and a mid-flight site switch routed a signed page into the wrong site's local state. Verification-based routing handles both correctly without a delegate WASM change.
+
 ### Page Links
 
 - `[[2]]` - renders as current page title, auto-updates on rename

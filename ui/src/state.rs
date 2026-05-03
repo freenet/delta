@@ -608,50 +608,51 @@ pub fn swap_page_order(page_a: PageId, page_b: PageId) {
         return;
     };
 
-    // Decide whether this swap also has to perform a one-time
-    // order-migration of the whole site. ANY page at `order == 0`
-    // taints the rest because the sidebar sort is `(order, id)` and
-    // 0-ordered pages always sort before pages with explicit orders;
-    // local mutations that don't propagate to the network would be
-    // visually undone on refresh.
-    let needs_migration = SITES
-        .read()
-        .get(&prefix)
-        .map(|s| s.state.pages.values().any(|p| p.order == 0))
-        .unwrap_or(false);
-
-    // Pages that need a fresh signed UPDATE on the network. In the
-    // migration case that's every page on the site (so the network
-    // state actually matches what the user just saw). In the steady
-    // state, only the two pages whose orders changed.
-    let pages_to_sign: Vec<PageId> = if needs_migration {
-        SITES
-            .read()
-            .get(&prefix)
-            .map(|s| s.state.pages.keys().copied().collect())
-            .unwrap_or_default()
-    } else {
-        vec![page_a, page_b]
+    // Single read-pass: collect everything the orchestration needs in
+    // one shot so we don't race with a network UPDATE landing between
+    // independent `SITES.read()` calls. (Single-threaded UI in
+    // practice, but cheaper to be obviously correct than to argue
+    // about it in a future refactor.)
+    let (current_orders, current_timestamps, contract_key) = {
+        let sites = SITES.read();
+        let Some(site) = sites.get(&prefix) else {
+            return;
+        };
+        let orders: Vec<(PageId, u32)> = site
+            .state
+            .pages
+            .iter()
+            .map(|(id, p)| (*id, p.order))
+            .collect();
+        let timestamps: BTreeMap<PageId, u64> = site
+            .state
+            .pages
+            .iter()
+            .map(|(id, p)| (*id, p.updated_at))
+            .collect();
+        (orders, timestamps, site.contract_key)
+    };
+    let Some(contract_key) = contract_key else {
+        return;
     };
 
-    // Compute the monotonic timestamps before mutating: each call reads
-    // the page's *current* `updated_at` so they have to be sampled
-    // BEFORE the swap writes new values. See `next_page_updated_at`
-    // for why equal timestamps would be dropped on the network.
-    let new_timestamps: BTreeMap<PageId, u64> = pages_to_sign
-        .iter()
-        .map(|&pid| (pid, next_page_updated_at(&prefix, pid)))
-        .collect();
+    let plan = plan_swap(&current_orders, page_a, page_b);
+    if plan.pages_to_sign.is_empty() {
+        return; // No-op: same-order swap, missing pages, etc.
+    }
 
-    // Compute the new order map outside the mutation so the rule is
-    // exercised by `compute_swap_orders` unit tests rather than
-    // re-derived inline here.
-    let current_orders: Vec<(PageId, u32)> = SITES
-        .read()
-        .get(&prefix)
-        .map(|s| s.state.pages.iter().map(|(id, p)| (*id, p.order)).collect())
-        .unwrap_or_default();
-    let new_orders = compute_swap_orders(&current_orders, page_a, page_b);
+    // Strict-monotonic timestamp per page, derived from the snapshot
+    // taken above so all pages observe the same `now` and the same
+    // existing values.
+    let now = now_secs();
+    let new_timestamps: BTreeMap<PageId, u64> = plan
+        .pages_to_sign
+        .iter()
+        .map(|&pid| {
+            let ts = monotonic_updated_at(now, current_timestamps.get(&pid).copied());
+            (pid, ts)
+        })
+        .collect();
 
     // Apply the new orders and timestamps in a single mutation so
     // local state never advertises the new orders alongside the
@@ -661,7 +662,7 @@ pub fn swap_page_order(page_a: PageId, page_b: PageId) {
     // which inserts pages with a zeroed signature placeholder).
     SITES.with_mut(|sites| {
         if let Some(site) = sites.get_mut(&prefix) {
-            for (&pid, &order) in &new_orders {
+            for (&pid, &order) in &plan.new_orders {
                 if let Some(p) = site.state.pages.get_mut(&pid) {
                     p.order = order;
                 }
@@ -678,16 +679,11 @@ pub fn swap_page_order(page_a: PageId, page_b: PageId) {
     // order changed. In the migration case that's all pages; in the
     // steady state it's just the two pages being swapped.
     let sites = SITES.read();
-    let site = match sites.get(&prefix) {
-        Some(s) => s,
-        None => return,
+    let Some(site) = sites.get(&prefix) else {
+        return;
     };
-    let contract_key = match site.contract_key {
-        Some(ck) => ck,
-        None => return,
-    };
-    for (&pid, &ts) in &new_timestamps {
-        if let Some(page) = site.state.pages.get(&pid) {
+    for &pid in &plan.pages_to_sign {
+        if let (Some(page), Some(&ts)) = (site.state.pages.get(&pid), new_timestamps.get(&pid)) {
             crate::freenet_api::delegate::request_sign_page(
                 &prefix,
                 contract_key,
@@ -814,20 +810,70 @@ fn monotonic_updated_at(now: u64, existing: Option<u64>) -> u64 {
     }
 }
 
+/// Step between page orders. Used by both `next_create_order` and the
+/// migration in `compute_swap_orders` so newly-created pages and
+/// migrated pages share the same grid (pages with explicit orders
+/// `10, 20, 30, ...` and a fresh page slotted in at `40`).
+const ORDER_STEP: u32 = 10;
+
 /// Pick an `order` value for a freshly-created page. The new page
 /// should sort after every existing page so the user-visible position
 /// stays stable across a refresh — issuing `0` (the previous default)
 /// caused new pages to clump at the front of the sidebar because the
 /// sort key is `(order, id)` and 0 dominates any explicit order.
-///
-/// Step is `10` to match `swap_page_order`'s migration so newly
-/// created pages line up on the same grid as migrated ones.
 fn next_create_order<I: IntoIterator<Item = u32>>(existing_orders: I) -> u32 {
     existing_orders
         .into_iter()
         .max()
-        .map(|max| max.saturating_add(10))
-        .unwrap_or(10)
+        .map(|max| max.saturating_add(ORDER_STEP))
+        .unwrap_or(ORDER_STEP)
+}
+
+/// What `swap_page_order` is going to do, computed without touching
+/// the live signal state. Returned by `plan_swap` so the orchestration
+/// rule (which pages need a fresh signature, which orders they end up
+/// with) is unit-testable end-to-end, not just at the `compute_swap_orders`
+/// step.
+#[derive(Debug, PartialEq, Eq)]
+struct SwapPlan {
+    /// New `order` value for every page on the site, keyed by
+    /// `PageId`. Pages whose order didn't change still appear here
+    /// (with their existing value) so callers don't have to merge.
+    new_orders: BTreeMap<PageId, u32>,
+    /// Pages that need a fresh signed UPDATE on the network — i.e.
+    /// whose order actually changed. Empty when the swap is a no-op
+    /// (e.g. both pages had the same order, or the swap target IDs
+    /// don't exist in `pages`).
+    pages_to_sign: Vec<PageId>,
+}
+
+/// Plan a swap end-to-end: compute the new orders AND the set of
+/// pages whose UPDATEs must be propagated to the network. Pure helper
+/// so the user-visible "every page must be signed when migrating"
+/// invariant is exercised by unit tests, not just at the
+/// `compute_swap_orders` boundary.
+fn plan_swap(pages: &[(PageId, u32)], page_a: PageId, page_b: PageId) -> SwapPlan {
+    let new_orders = compute_swap_orders(pages, page_a, page_b);
+    // Pages-to-sign = pages whose new order differs from current.
+    // In the migration case that's every page on the site; in steady
+    // state it's just the two pages being swapped. Deriving from the
+    // diff means a regression that re-narrows the migration set
+    // (e.g. someone reverts to "just the two clicked pages") is
+    // automatically caught.
+    let pages_to_sign: Vec<PageId> = pages
+        .iter()
+        .filter_map(|&(pid, current)| {
+            new_orders
+                .get(&pid)
+                .copied()
+                .filter(|&new| new != current)
+                .map(|_| pid)
+        })
+        .collect();
+    SwapPlan {
+        new_orders,
+        pages_to_sign,
+    }
 }
 
 /// Pure helper for `swap_page_order`'s order-assignment step so the
@@ -842,7 +888,10 @@ fn next_create_order<I: IntoIterator<Item = u32>>(existing_orders: I) -> u32 {
 /// swap is then applied on top.
 ///
 /// `pages` is the current `(page_id, order)` list. The output is keyed
-/// by page_id so the caller can iterate it independently of input order.
+/// by page_id so the caller can iterate it independently of input
+/// order. If either swap target is not present in `pages` the swap
+/// is skipped — the helper is otherwise a foot-gun that would clobber
+/// the present page's order to 0 via `unwrap_or(0)`.
 fn compute_swap_orders(
     pages: &[(PageId, u32)],
     page_a: PageId,
@@ -858,19 +907,23 @@ fn compute_swap_orders(
         sorted
             .iter()
             .enumerate()
-            .map(|(i, &(_, id))| (id, (i as u32 + 1) * 10))
+            .map(|(i, &(_, id))| (id, (i as u32 + 1) * ORDER_STEP))
             .collect()
     } else {
         pages.iter().copied().collect()
     };
 
-    let order_a = next.get(&page_a).copied().unwrap_or(0);
-    let order_b = next.get(&page_b).copied().unwrap_or(0);
-    if let Some(o) = next.get_mut(&page_a) {
-        *o = order_b;
-    }
-    if let Some(o) = next.get_mut(&page_b) {
-        *o = order_a;
+    // Skip the swap if either target is missing. Without this guard
+    // `unwrap_or(0)` clobbers the present page's order to 0,
+    // re-introducing the very symptom this PR is fixing.
+    if let (Some(order_a), Some(order_b)) = (next.get(&page_a).copied(), next.get(&page_b).copied())
+    {
+        if let Some(o) = next.get_mut(&page_a) {
+            *o = order_b;
+        }
+        if let Some(o) = next.get_mut(&page_b) {
+            *o = order_a;
+        }
     }
     next
 }
@@ -906,7 +959,7 @@ fn update_hash(hash: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{compute_swap_orders, monotonic_updated_at, next_create_order};
+    use super::{compute_swap_orders, monotonic_updated_at, next_create_order, plan_swap};
     use delta_core::PageId;
     use std::collections::BTreeMap;
 
@@ -1064,5 +1117,112 @@ mod tests {
         let result = compute_swap_orders(&pages(&[(1, 10), (2, 10), (3, 30)]), 1, 2);
         let expected: BTreeMap<PageId, u32> = [(1, 10), (2, 10), (3, 30)].into_iter().collect();
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn swap_skips_when_target_id_not_in_pages() {
+        // Prior implementation called `unwrap_or(0)` on the missing
+        // target's order and clobbered the present page's order to
+        // 0 — re-introducing the very symptom this PR is fixing.
+        let result = compute_swap_orders(&pages(&[(1, 10), (2, 20)]), 1, 999);
+        let expected: BTreeMap<PageId, u32> = [(1, 10), (2, 20)].into_iter().collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn swap_skips_when_neither_target_id_in_pages() {
+        let result = compute_swap_orders(&pages(&[(1, 10), (2, 20)]), 998, 999);
+        let expected: BTreeMap<PageId, u32> = [(1, 10), (2, 20)].into_iter().collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn swap_with_empty_pages_returns_empty() {
+        let result = compute_swap_orders(&pages(&[]), 1, 2);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn self_swap_is_a_no_op() {
+        // Sidebar arrow handler can't trigger this (it always picks a
+        // distinct neighbor) but defend the helper anyway.
+        let result = compute_swap_orders(&pages(&[(1, 10), (2, 20)]), 1, 1);
+        let expected: BTreeMap<PageId, u32> = [(1, 10), (2, 20)].into_iter().collect();
+        assert_eq!(result, expected);
+    }
+
+    // -- plan_swap orchestration tests --
+    //
+    // These pin the user-visible "every page must be signed when
+    // migrating" rule end-to-end. A regression that re-narrows
+    // `pages_to_sign` (e.g. back to `vec![page_a, page_b]`) is caught
+    // by these tests, not just by the lower-level
+    // `compute_swap_orders` tests.
+
+    #[test]
+    fn plan_swap_in_steady_state_signs_only_the_two_clicked_pages() {
+        // Site already migrated, every page has explicit orders. The
+        // swap should only require fresh signatures for the pages
+        // whose orders actually changed.
+        let plan = plan_swap(&pages(&[(1, 10), (2, 20), (3, 30)]), 1, 2);
+        assert_eq!(plan.pages_to_sign.to_vec(), vec![1, 2]);
+        let expected_orders: BTreeMap<PageId, u32> =
+            [(1, 20), (2, 10), (3, 30)].into_iter().collect();
+        assert_eq!(plan.new_orders, expected_orders);
+    }
+
+    #[test]
+    fn plan_swap_in_migration_signs_every_page_on_the_site() {
+        // The user-reported bug: previously only the two clicked
+        // pages got UPDATEs sent to the network. The other pages
+        // stayed at order=0 on the network and clumped to the front
+        // of the sidebar after a refresh. `plan_swap` must include
+        // every page in `pages_to_sign` whenever migration fires.
+        let plan = plan_swap(&pages(&[(1, 0), (2, 0), (3, 0), (4, 0)]), 1, 2);
+        let mut signed = plan.pages_to_sign.clone();
+        signed.sort();
+        assert_eq!(signed, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn plan_swap_in_mixed_state_signs_every_page() {
+        // Mixed-state site: some pages migrated to explicit orders,
+        // some still at 0 (the symptom #15 left behind even after
+        // PR #13's `updated_at` fix). Migration must fire and sign
+        // every page on the site.
+        let plan = plan_swap(&pages(&[(1, 0), (2, 10), (3, 0)]), 1, 3);
+        let mut signed = plan.pages_to_sign.clone();
+        signed.sort();
+        assert_eq!(signed, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn plan_swap_is_idempotent_after_a_migration_round() {
+        // After the first reorder migrates the site, the second
+        // reorder must NOT migrate again — it should just swap the
+        // two clicked pages. Without this, every reorder on a
+        // formerly-zero-order site would re-sign every page forever.
+        let migrated = pages(&[(1, 20), (2, 10), (3, 30), (4, 40)]); // post-first-swap
+        let plan = plan_swap(&migrated, 3, 4);
+        let mut signed = plan.pages_to_sign.clone();
+        signed.sort();
+        assert_eq!(signed, vec![3, 4]);
+    }
+
+    #[test]
+    fn plan_swap_returns_empty_pages_to_sign_when_swap_is_a_no_op() {
+        // No page changed order -> nothing needs signing. The
+        // orchestrator uses this signal to skip the network round-
+        // trip entirely.
+        let plan = plan_swap(&pages(&[(1, 10), (2, 10)]), 1, 2);
+        assert!(plan.pages_to_sign.is_empty());
+    }
+
+    #[test]
+    fn plan_swap_returns_empty_pages_to_sign_when_target_missing() {
+        // Same skip behaviour for missing swap targets — the
+        // orchestrator treats this as a no-op.
+        let plan = plan_swap(&pages(&[(1, 10), (2, 20)]), 1, 999);
+        assert!(plan.pages_to_sign.is_empty());
     }
 }

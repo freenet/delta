@@ -479,15 +479,56 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
 }
 
 /// After receiving a signed page from the delegate, update local state and send to network.
+///
+/// The previous implementation correlated request-to-response via
+/// `PENDING_UPDATES` keyed by `(CURRENT_SITE, page_id)`, which had two
+/// failure modes the skeptical review on PR #17 turned up:
+/// 1. Two in-flight requests for the same `(prefix, page_id)` shared
+///    a single map entry; the first response removed it, the second
+///    response silently dropped its UPDATE on the floor (this is the
+///    exact "looks correct locally, undone on refresh" symptom we
+///    just fixed for `swap_page_order`).
+/// 2. `find_pending_key` read `CURRENT_SITE`, so if the user switched
+///    sites between request and response the late-arriving signed
+///    page would be inserted into the *wrong site's* local state and
+///    the network UPDATE for the original site would be dropped.
+///
+/// Routing now derives the owning site from the page signature
+/// itself: every `Page::verify` checks against an owner pubkey, and
+/// only the owner who actually signed it will verify. This is robust
+/// to multiple in-flight requests, site switches, and out-of-order
+/// responses without requiring a delegate WASM change.
 fn handle_signed_page(page_id: PageId, page: delta_core::Page) {
-    // Find which site/contract this is for
-    let pending = PENDING_UPDATES.write().remove(&find_pending_key(page_id));
+    let Some((prefix, contract_key)) = find_owner_for_signed_page(&page, page_id) else {
+        log(&format!(
+            "Delta: signed page {page_id} doesn't verify against any known owner — dropping"
+        ));
+        return;
+    };
 
-    // Update local state
-    let prefix = state::CURRENT_SITE.read().clone();
-    if let Some(prefix) = &prefix {
+    // Don't resurrect a page the user just tombstoned. If the user
+    // deletes a page after the delegate started signing it, the
+    // signed response can race with the deletion's tombstone; without
+    // this guard the local state would silently re-add the page and
+    // a fresh page-UPDATE would compete with the deletion-UPDATE on
+    // the network. (#17 skeptical review)
+    {
+        let sites = state::SITES.read();
+        if sites
+            .get(&prefix)
+            .map(|s| s.state.deleted_pages.contains_key(&page_id))
+            .unwrap_or(false)
+        {
+            log(&format!(
+                "Delta: signed page {page_id} was tombstoned before delegate responded — dropping"
+            ));
+            return;
+        }
+    }
+
+    {
         let mut sites = state::SITES.write();
-        if let Some(site) = sites.get_mut(prefix) {
+        if let Some(site) = sites.get_mut(&prefix) {
             site.state.pages.insert(page_id, page.clone());
             if page_id >= site.state.next_page_id {
                 site.state.next_page_id = page_id + 1;
@@ -495,25 +536,30 @@ fn handle_signed_page(page_id: PageId, page: delta_core::Page) {
         }
     }
 
-    // Send UPDATE to network
-    if let Some(contract_key) = pending {
-        let mut updates = BTreeMap::new();
-        updates.insert(page_id, page);
-        let delta = delta_core::SiteStateDelta {
-            config: None,
-            page_updates: updates,
-            page_deletions: Vec::new(),
-        };
-        super::operations::update_site(&contract_key, &delta);
-    }
+    let mut updates = BTreeMap::new();
+    updates.insert(page_id, page);
+    let delta = delta_core::SiteStateDelta {
+        config: None,
+        page_updates: updates,
+        page_deletions: Vec::new(),
+    };
+    super::operations::update_site(&contract_key, &delta);
+
+    // Best-effort cleanup of the legacy correlation map. No longer
+    // load-bearing for routing — see fn doc-comment.
+    PENDING_UPDATES.write().remove(&(prefix, page_id));
 }
 
 /// After receiving a signed config, update local state and send to network.
+/// See `handle_signed_page`'s doc-comment for why routing is via
+/// signature verification rather than `CURRENT_SITE` / `PENDING_CONFIG`.
 fn handle_signed_config(signed_config: delta_core::SignedConfig) {
-    let contract_key = PENDING_CONFIG.write().take();
+    let Some((prefix, contract_key)) = find_owner_for_signed_config(&signed_config) else {
+        log("Delta: signed config doesn't verify against any known owner — dropping");
+        return;
+    };
 
-    // Update local state
-    if let Some(prefix) = state::CURRENT_SITE.read().clone() {
+    {
         let mut sites = state::SITES.write();
         if let Some(site) = sites.get_mut(&prefix) {
             site.state.config = signed_config.clone();
@@ -521,54 +567,99 @@ fn handle_signed_config(signed_config: delta_core::SignedConfig) {
         }
     }
 
-    // Send UPDATE to network
-    if let Some(ck) = contract_key {
-        let delta = delta_core::SiteStateDelta {
-            config: Some(signed_config),
-            page_updates: BTreeMap::new(),
-            page_deletions: Vec::new(),
-        };
-        super::operations::update_site(&ck, &delta);
-    }
+    let delta = delta_core::SiteStateDelta {
+        config: Some(signed_config),
+        page_updates: BTreeMap::new(),
+        page_deletions: Vec::new(),
+    };
+    super::operations::update_site(&contract_key, &delta);
+
+    // Best-effort cleanup of the legacy correlation slot.
+    PENDING_CONFIG.write().take();
+}
+
+/// Find the (prefix, contract_key) for a signed config by checking
+/// its signature against every known owner.
+fn find_owner_for_signed_config(
+    signed: &delta_core::SignedConfig,
+) -> Option<(String, ContractKey)> {
+    let sites = state::SITES.read();
+    sites.iter().find_map(|(prefix, site)| {
+        if signed.verify(&site.state.owner).is_ok() {
+            site.contract_key.map(|ck| (prefix.clone(), ck))
+        } else {
+            None
+        }
+    })
 }
 
 /// After receiving a signed deletion, update local state and send to network.
+/// See `handle_signed_page`'s doc-comment for why routing is via
+/// signature verification rather than `CURRENT_SITE`.
 fn handle_signed_deletion(deletion: delta_core::SignedPageDeletion) {
     let page_id = deletion.page_id;
     log(&format!(
         "Delta: handling signed deletion for page {page_id}"
     ));
-    let pending = PENDING_UPDATES.write().remove(&find_pending_key(page_id));
 
-    let prefix = state::CURRENT_SITE.read().clone();
-    if let Some(prefix) = &prefix {
+    let Some((prefix, contract_key)) = find_owner_for_signed_deletion(&deletion) else {
+        log(&format!(
+            "Delta: signed deletion for {page_id} doesn't verify against any known owner — dropping"
+        ));
+        return;
+    };
+
+    {
         let mut sites = state::SITES.write();
-        if let Some(site) = sites.get_mut(prefix) {
+        if let Some(site) = sites.get_mut(&prefix) {
             site.state.pages.remove(&page_id);
         }
     }
 
-    if let Some(contract_key) = pending {
-        log(&format!(
-            "Delta: sending deletion UPDATE to network for page {page_id}"
-        ));
-        let delta = delta_core::SiteStateDelta {
-            config: None,
-            page_updates: BTreeMap::new(),
-            page_deletions: vec![deletion],
-        };
-        super::operations::update_site(&contract_key, &delta);
-    } else {
-        log(&format!(
-            "Delta: no pending contract key for deletion of page {page_id} - not sent to network"
-        ));
-    }
+    log(&format!(
+        "Delta: sending deletion UPDATE to network for page {page_id}"
+    ));
+    let delta = delta_core::SiteStateDelta {
+        config: None,
+        page_updates: BTreeMap::new(),
+        page_deletions: vec![deletion],
+    };
+    super::operations::update_site(&contract_key, &delta);
+
+    PENDING_UPDATES.write().remove(&(prefix, page_id));
 }
 
-/// Find the pending key for a page_id (searches current site).
-fn find_pending_key(page_id: PageId) -> (String, PageId) {
-    let prefix = state::CURRENT_SITE.read().clone().unwrap_or_default();
-    (prefix, page_id)
+/// Find the (prefix, contract_key) for a signed page by checking its
+/// signature against every known owner. The owner who signed it will
+/// be the only one whose `Page::verify` succeeds.
+fn find_owner_for_signed_page(
+    page: &delta_core::Page,
+    page_id: PageId,
+) -> Option<(String, ContractKey)> {
+    let sites = state::SITES.read();
+    sites.iter().find_map(|(prefix, site)| {
+        if page.verify(page_id, &site.state.owner).is_ok() {
+            site.contract_key.map(|ck| (prefix.clone(), ck))
+        } else {
+            None
+        }
+    })
+}
+
+/// Find the (prefix, contract_key) for a signed deletion. Same
+/// principle as `find_owner_for_signed_page` — only the owner who
+/// signed the deletion will verify it.
+fn find_owner_for_signed_deletion(
+    deletion: &delta_core::SignedPageDeletion,
+) -> Option<(String, ContractKey)> {
+    let sites = state::SITES.read();
+    sites.iter().find_map(|(prefix, site)| {
+        if deletion.verify(&site.state.owner).is_ok() {
+            site.contract_key.map(|ck| (prefix.clone(), ck))
+        } else {
+            None
+        }
+    })
 }
 
 /// Public wrapper so export_key module can send signing-related delegate requests.
