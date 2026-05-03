@@ -120,6 +120,17 @@ pub(crate) fn classify_get_response(
 
 /// Handle an incoming response from the Freenet node.
 pub fn handle_response(response: HostResponse) {
+    // Receiving a response means the WebSocket is still alive.
+    // Self-clear a stuck `ConnectionStatus::Error` so the bottom-left
+    // indicator doesn't stay red forever after a transient transport
+    // blip — the WebApi error callback that originally set it has no
+    // counterpart that resets the status. (Ivvor, 2026-05-03)
+    let mut status = super::CONNECTION_STATUS.write();
+    if !matches!(&*status, super::ConnectionStatus::Connected) {
+        *status = super::ConnectionStatus::Connected;
+    }
+    drop(status);
+
     match response {
         HostResponse::ContractResponse(contract_response) => {
             handle_contract_response(contract_response);
