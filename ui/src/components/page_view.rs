@@ -260,20 +260,82 @@ pub(super) fn inject_heading_ids(html: &str) -> String {
     result
 }
 
-/// Strip HTML tags from a string, returning just the textual content.
+/// Strip HTML tags from a string, returning just the textual content
+/// with the common HTML entities decoded back to their characters.
 /// Used for heading-id slugification so a heading containing a link or
-/// `<em>` produces a slug from the visible text only.
+/// `<em>` produces a slug from the visible text only, and headings
+/// like `# Foo & Bar` (rendered as `Foo &amp; Bar` by the markdown
+/// crate) slugify the same way GitHub does.
 fn strip_html_tags(s: &str) -> String {
+    let stripped = {
+        let mut out = String::with_capacity(s.len());
+        let mut in_tag = false;
+        for c in s.chars() {
+            match c {
+                '<' => in_tag = true,
+                '>' => in_tag = false,
+                _ if !in_tag => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    };
+    decode_html_entities(&stripped)
+}
+
+/// Minimal HTML entity decoder covering the entities the `markdown`
+/// crate emits: `&amp;`, `&lt;`, `&gt;`, `&quot;`, `&#39;`, plus
+/// numeric character references `&#N;` and `&#xN;`. Anything unknown
+/// is passed through verbatim.
+fn decode_html_entities(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
-    let mut in_tag = false;
-    for c in s.chars() {
-        match c {
-            '<' => in_tag = true,
-            '>' => in_tag = false,
-            _ if !in_tag => out.push(c),
-            _ => {}
+    let mut rest = s;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        let after = &rest[amp..];
+        if let Some(semi) = after.find(';') {
+            let entity = &after[..=semi];
+            let decoded: Option<char> = match entity {
+                "&amp;" => Some('&'),
+                "&lt;" => Some('<'),
+                "&gt;" => Some('>'),
+                "&quot;" => Some('"'),
+                "&apos;" => Some('\''),
+                "&#39;" => Some('\''),
+                _ => {
+                    // Numeric character references: &#N; (decimal) or &#xN; (hex)
+                    let body = &entity[1..entity.len() - 1];
+                    if let Some(rest_body) = body.strip_prefix('#') {
+                        let cp = if let Some(hex) = rest_body
+                            .strip_prefix('x')
+                            .or_else(|| rest_body.strip_prefix('X'))
+                        {
+                            u32::from_str_radix(hex, 16).ok()
+                        } else {
+                            rest_body.parse::<u32>().ok()
+                        };
+                        cp.and_then(char::from_u32)
+                    } else {
+                        None
+                    }
+                }
+            };
+            if let Some(c) = decoded {
+                out.push(c);
+                rest = &after[semi + 1..];
+                continue;
+            }
+            // Unknown entity — pass the `&` through verbatim and keep
+            // scanning from the next byte so we don't infinite-loop.
+            out.push('&');
+            rest = &after[1..];
+        } else {
+            // No closing `;` — pass the rest through.
+            out.push_str(after);
+            return out;
         }
     }
+    out.push_str(rest);
     out
 }
 
@@ -612,5 +674,38 @@ mod tests {
         let html = "<h1>Café Résumé</h1>";
         let result = inject_heading_ids(html);
         assert_eq!(result, "<h1 id=\"café-résumé\">Café Résumé</h1>");
+    }
+
+    #[test]
+    fn strip_tags_decodes_common_html_entities() {
+        // The markdown crate emits `&amp;` for `&`, `&lt;` for `<`, etc.
+        // The slugifier must see the *decoded* text so a heading
+        // `# Foo & Bar` produces id="foo-bar", matching GitHub.
+        assert_eq!(strip_html_tags("Foo &amp; Bar"), "Foo & Bar");
+        assert_eq!(strip_html_tags("&lt;tag&gt;"), "<tag>");
+        assert_eq!(strip_html_tags("It&#39;s"), "It's");
+        assert_eq!(strip_html_tags("&quot;quoted&quot;"), "\"quoted\"");
+    }
+
+    #[test]
+    fn slug_for_heading_with_ampersand_matches_github() {
+        let html = "<h2>Foo &amp; Bar</h2>";
+        let result = inject_heading_ids(html);
+        assert_eq!(result, "<h2 id=\"foo-bar\">Foo &amp; Bar</h2>");
+    }
+
+    #[test]
+    fn unknown_entity_passes_through() {
+        // `&unknownEntity;` isn't decoded; the `&` is preserved verbatim
+        // so we don't lose data and the slugifier strips it as
+        // punctuation.
+        assert_eq!(strip_html_tags("foo &unknown; bar"), "foo &unknown; bar");
+    }
+
+    #[test]
+    fn stray_ampersand_without_semicolon_passes_through() {
+        // No closing `;` -> not an entity; pass the rest of the string
+        // through without trying to parse.
+        assert_eq!(strip_html_tags("foo & bar"), "foo & bar");
     }
 }
