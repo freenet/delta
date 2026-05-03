@@ -373,9 +373,14 @@ pub fn contract_key_from_prefix(prefix: &str) -> ContractKey {
 
 /// Visit an existing site by its 10-char prefix. Computes the contract key,
 /// sends GET + SUBSCRIBE.
+///
+/// Refuses inputs that don't look like a real Delta site prefix
+/// (10 base58 chars). Without this guard, the dialog and hash-replay
+/// paths would happily insert a phantom site and fire a doomed
+/// contract GET — the exact symptom #10 fixes for the URL parser.
 pub fn visit_site(input: String) {
     let prefix = input.trim().to_string();
-    if prefix.is_empty() {
+    if !is_site_prefix_shape(&prefix) {
         return;
     }
 
@@ -1082,6 +1087,23 @@ mod tests {
                 "prefix containing '{excluded}' should be rejected: {s}"
             );
         }
+    }
+
+    #[test]
+    fn is_site_prefix_shape_pins_alphabet_boundaries() {
+        // Uppercase L is INCLUDED (`'J'..='N'`), lowercase l EXCLUDED.
+        // Easy to break if someone "fixes" the alphabet ranges.
+        assert!(is_site_prefix_shape("LLLLLLLLLL"));
+        assert!(!is_site_prefix_shape("llllllllll"));
+        // J is included, I is excluded.
+        assert!(is_site_prefix_shape("JJJJJJJJJJ"));
+        assert!(!is_site_prefix_shape("IIIIIIIIII"));
+        // Lowercase i and j are both included.
+        assert!(is_site_prefix_shape("iiiiiiiiii"));
+        assert!(is_site_prefix_shape("jjjjjjjjjj"));
+        // Lowercase k and m are both included; lowercase l is the gap.
+        assert!(is_site_prefix_shape("kkkkkkkkkk"));
+        assert!(is_site_prefix_shape("mmmmmmmmmm"));
     }
 
     #[test]
