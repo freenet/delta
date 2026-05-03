@@ -138,9 +138,21 @@ pub fn PageView() -> Element {
         if *renaming.read() {
             div {
                 style: "position: absolute; inset: 0; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; z-index: 50;",
-                onclick: move |_| renaming.set(false),
+                // Close on `mousedown` rather than `click`. With `click`,
+                // a text-selection drag that starts inside the dialog
+                // and releases outside fires `click` on the backdrop
+                // (the nearest common ancestor of mousedown's input
+                // target and mouseup's backdrop target) and dismisses
+                // the dialog mid-selection. Issue #26.
+                onmousedown: move |_| renaming.set(false),
                 div {
                     class: "bg-panel rounded-xl shadow-lg w-80 p-5",
+                    // Stop the mousedown from reaching the backdrop so
+                    // text-selection inside the dialog never triggers
+                    // dismissal. The `onclick` handler is kept for
+                    // belt-and-braces safety against any future caller
+                    // re-adding onclick on the backdrop.
+                    onmousedown: move |evt| evt.stop_propagation(),
                     onclick: move |evt| evt.stop_propagation(),
                     h3 { class: "text-sm font-semibold text-text mb-3", "Rename Page" }
                     input {
