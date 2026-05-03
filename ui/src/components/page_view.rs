@@ -204,6 +204,13 @@ pub(super) fn inject_heading_ids(html: &str) -> String {
     let mut result = String::with_capacity(html.len() + 64);
     let mut id_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
     let bytes = html.as_bytes();
+    // Byte position up to which non-heading content has yet to be flushed
+    // into `result`. We accumulate ranges and slice via `html[..]` so
+    // multibyte UTF-8 characters survive the walk intact (byte-by-byte
+    // pushing-as-char would corrupt them). The byte-level pattern checks
+    // below all use ASCII bytes, which by UTF-8 invariant never collide
+    // with continuation bytes inside multibyte characters.
+    let mut copy_start = 0;
     let mut i = 0;
 
     while i < bytes.len() {
@@ -224,10 +231,13 @@ pub(super) fn inject_heading_ids(html: &str) -> String {
                 if base_slug.is_empty() {
                     // Heading with no sluggable text — leave the tag
                     // alone rather than emit `id=""`.
-                    result.push_str(&html[i..inner_start]);
                     i = inner_start;
                     continue;
                 }
+                // Flush everything up to the start of this heading
+                // (`i` points at the `<`, which is ASCII, so the slice
+                // ends on a char boundary).
+                result.push_str(&html[copy_start..i]);
                 let count = id_counts.entry(base_slug.clone()).or_insert(0);
                 let slug = if *count == 0 {
                     base_slug.clone()
@@ -238,15 +248,15 @@ pub(super) fn inject_heading_ids(html: &str) -> String {
                 result.push_str(&format!("<h{} id=\"{}\">", level as char, slug));
                 result.push_str(inner);
                 result.push_str(&close_tag);
-                i = inner_start + rel + close_tag.len();
+                let after = inner_start + rel + close_tag.len();
+                i = after;
+                copy_start = after;
                 continue;
             }
         }
-        // Not a heading tag — copy this byte. Safe because we either copy
-        // a single ASCII byte or pass through inside `inner` above.
-        result.push(bytes[i] as char);
         i += 1;
     }
+    result.push_str(&html[copy_start..]);
     result
 }
 
@@ -580,5 +590,27 @@ mod tests {
         let with_ids = inject_heading_ids(html);
         assert!(with_ids.contains("<h2 id=\"heading\">"));
         assert!(with_ids.contains("href=\"#heading\""));
+    }
+
+    #[test]
+    fn multibyte_utf8_outside_headings_is_preserved() {
+        // Regression test: an earlier draft pushed bytes one at a time
+        // via `push(bytes[i] as char)`, which corrupted multibyte UTF-8
+        // sequences in non-heading content (e.g. `é` -> `Ã©`).
+        let html = "<p>Café was open</p><h1>Title</h1><p>Naïve</p>";
+        let result = inject_heading_ids(html);
+        assert!(
+            result.contains("Café"),
+            "Café was corrupted in non-heading content: {result}"
+        );
+        assert!(result.contains("Naïve"), "Naïve was corrupted: {result}");
+        assert!(result.contains("<h1 id=\"title\">"));
+    }
+
+    #[test]
+    fn multibyte_utf8_inside_headings_survives_and_slugifies() {
+        let html = "<h1>Café Résumé</h1>";
+        let result = inject_heading_ids(html);
+        assert_eq!(result, "<h1 id=\"café-résumé\">Café Résumé</h1>");
     }
 }
