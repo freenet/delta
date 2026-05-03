@@ -32,8 +32,11 @@ pub fn Editor() -> Element {
     // web/...` path in `dx serve` previews where there's no gateway
     // behind Delta to resolve it.
     let preview_html = super::page_view::inject_heading_ids(&preview_html);
-    let preview_html =
-        super::page_view::finalize_anchors(&preview_html, super::page_view::behind_gateway());
+    let preview_html = super::page_view::finalize_anchors(
+        &preview_html,
+        super::page_view::behind_gateway(),
+        super::page_view::own_contract_id().as_deref(),
+    );
 
     // Autocomplete state
     let mut ac_query = use_signal(|| None::<String>);
