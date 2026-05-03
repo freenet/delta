@@ -439,6 +439,13 @@ pub fn create_page(title: String) {
     let now = now_secs();
     let contract_key = site.contract_key;
     let is_owner = site.role == SiteRole::Owner;
+    // Assign an order strictly greater than any existing page so the
+    // new page sorts after the others. The previous default (0)
+    // caused new pages to land at the front of the sidebar (sort key
+    // is `(order, id)` and 0 dominates any explicit order), and on
+    // refresh the page would be visually relocated to a position the
+    // user did not pick. See issue #15.
+    let next_order = next_create_order(site.state.pages.values().map(|p| p.order));
     drop(sites);
 
     if is_owner {
@@ -451,7 +458,7 @@ pub fn create_page(title: String) {
                 title.clone(),
                 String::new(),
                 now,
-                0,
+                next_order,
             );
             // Optimistically add to local state with placeholder sig
             let mut sites = SITES.write();
@@ -461,7 +468,7 @@ pub fn create_page(title: String) {
                     content: String::new(),
                     updated_at: now,
                     signature: Signature::from_bytes(&[0u8; 64]),
-                    order: 0,
+                    order: next_order,
                 };
                 site.state.pages.insert(id, page);
                 site.state.next_page_id = id + 1;
@@ -475,7 +482,7 @@ pub fn create_page(title: String) {
                     content: String::new(),
                     updated_at: now,
                     signature: Signature::from_bytes(&[0u8; 64]),
-                    order: 0,
+                    order: next_order,
                 };
                 site.state.pages.insert(id, page);
                 site.state.next_page_id = id + 1;
@@ -587,20 +594,66 @@ pub fn rename_page(page_id: PageId, new_title: String) {
 }
 
 /// Swap the order of two pages. Used for move up/down.
-/// Assigns explicit order values to all pages first if they're all 0.
+///
+/// If any page on the site still has `order == 0` (legacy pages signed
+/// before the order field existed, or new pages created before issue
+/// #15 was fixed), this also migrates **every** page to an explicit
+/// order and signs+propagates each one. The local-only fallback used
+/// previously left the unmigrated pages at `order = 0` on the network
+/// so they clumped to the front of the sidebar after a refresh, even
+/// though the local view looked correct. See PR description for the
+/// concrete scenario.
 pub fn swap_page_order(page_a: PageId, page_b: PageId) {
     let Some(prefix) = (*CURRENT_SITE.read()).clone() else {
         return;
+    };
+
+    // Decide whether this swap also has to perform a one-time
+    // order-migration of the whole site. ANY page at `order == 0`
+    // taints the rest because the sidebar sort is `(order, id)` and
+    // 0-ordered pages always sort before pages with explicit orders;
+    // local mutations that don't propagate to the network would be
+    // visually undone on refresh.
+    let needs_migration = SITES
+        .read()
+        .get(&prefix)
+        .map(|s| s.state.pages.values().any(|p| p.order == 0))
+        .unwrap_or(false);
+
+    // Pages that need a fresh signed UPDATE on the network. In the
+    // migration case that's every page on the site (so the network
+    // state actually matches what the user just saw). In the steady
+    // state, only the two pages whose orders changed.
+    let pages_to_sign: Vec<PageId> = if needs_migration {
+        SITES
+            .read()
+            .get(&prefix)
+            .map(|s| s.state.pages.keys().copied().collect())
+            .unwrap_or_default()
+    } else {
+        vec![page_a, page_b]
     };
 
     // Compute the monotonic timestamps before mutating: each call reads
     // the page's *current* `updated_at` so they have to be sampled
     // BEFORE the swap writes new values. See `next_page_updated_at`
     // for why equal timestamps would be dropped on the network.
-    let new_ts_a = next_page_updated_at(&prefix, page_a);
-    let new_ts_b = next_page_updated_at(&prefix, page_b);
+    let new_timestamps: BTreeMap<PageId, u64> = pages_to_sign
+        .iter()
+        .map(|&pid| (pid, next_page_updated_at(&prefix, pid)))
+        .collect();
 
-    // Apply the swap and the new timestamps in a single mutation so
+    // Compute the new order map outside the mutation so the rule is
+    // exercised by `compute_swap_orders` unit tests rather than
+    // re-derived inline here.
+    let current_orders: Vec<(PageId, u32)> = SITES
+        .read()
+        .get(&prefix)
+        .map(|s| s.state.pages.iter().map(|(id, p)| (*id, p.order)).collect())
+        .unwrap_or_default();
+    let new_orders = compute_swap_orders(&current_orders, page_a, page_b);
+
+    // Apply the new orders and timestamps in a single mutation so
     // local state never advertises the new orders alongside the
     // previous timestamps. The signature on disk is still the old one
     // until the delegate echoes back a fresh signed page; that is the
@@ -608,32 +661,22 @@ pub fn swap_page_order(page_a: PageId, page_b: PageId) {
     // which inserts pages with a zeroed signature placeholder).
     SITES.with_mut(|sites| {
         if let Some(site) = sites.get_mut(&prefix) {
-            // If all pages have order 0, assign sequential orders first.
-            let all_zero = site.state.pages.values().all(|p| p.order == 0);
-            if all_zero {
-                let mut sorted: Vec<_> = site.state.pages.keys().copied().collect();
-                sorted.sort();
-                for (i, id) in sorted.iter().enumerate() {
-                    if let Some(p) = site.state.pages.get_mut(id) {
-                        p.order = (i as u32 + 1) * 10;
-                    }
+            for (&pid, &order) in &new_orders {
+                if let Some(p) = site.state.pages.get_mut(&pid) {
+                    p.order = order;
                 }
             }
-
-            let order_a = site.state.pages.get(&page_a).map(|p| p.order).unwrap_or(0);
-            let order_b = site.state.pages.get(&page_b).map(|p| p.order).unwrap_or(0);
-            if let Some(pa) = site.state.pages.get_mut(&page_a) {
-                pa.order = order_b;
-                pa.updated_at = new_ts_a;
-            }
-            if let Some(pb) = site.state.pages.get_mut(&page_b) {
-                pb.order = order_a;
-                pb.updated_at = new_ts_b;
+            for (&pid, &ts) in &new_timestamps {
+                if let Some(p) = site.state.pages.get_mut(&pid) {
+                    p.updated_at = ts;
+                }
             }
         }
     });
 
-    // Order is part of the v2 signature, so re-sign both pages.
+    // Order is part of the v2 signature, so re-sign every page whose
+    // order changed. In the migration case that's all pages; in the
+    // steady state it's just the two pages being swapped.
     let sites = SITES.read();
     let site = match sites.get(&prefix) {
         Some(s) => s,
@@ -643,7 +686,7 @@ pub fn swap_page_order(page_a: PageId, page_b: PageId) {
         Some(ck) => ck,
         None => return,
     };
-    for (pid, ts) in [(page_a, new_ts_a), (page_b, new_ts_b)] {
+    for (&pid, &ts) in &new_timestamps {
         if let Some(page) = site.state.pages.get(&pid) {
             crate::freenet_api::delegate::request_sign_page(
                 &prefix,
@@ -771,6 +814,67 @@ fn monotonic_updated_at(now: u64, existing: Option<u64>) -> u64 {
     }
 }
 
+/// Pick an `order` value for a freshly-created page. The new page
+/// should sort after every existing page so the user-visible position
+/// stays stable across a refresh — issuing `0` (the previous default)
+/// caused new pages to clump at the front of the sidebar because the
+/// sort key is `(order, id)` and 0 dominates any explicit order.
+///
+/// Step is `10` to match `swap_page_order`'s migration so newly
+/// created pages line up on the same grid as migrated ones.
+fn next_create_order<I: IntoIterator<Item = u32>>(existing_orders: I) -> u32 {
+    existing_orders
+        .into_iter()
+        .max()
+        .map(|max| max.saturating_add(10))
+        .unwrap_or(10)
+}
+
+/// Pure helper for `swap_page_order`'s order-assignment step so the
+/// migration + swap logic can be unit-tested without spinning up the
+/// Dioxus signal layer.
+///
+/// Returns the new `order` value for every page on the site after a
+/// swap of `page_a` and `page_b`. If any page is currently at
+/// `order == 0` (legacy / pre-#15 state), the entire site is first
+/// migrated to explicit orders by `(current_order, page_id)` sort key
+/// so the migration preserves the user's visible page sequence; the
+/// swap is then applied on top.
+///
+/// `pages` is the current `(page_id, order)` list. The output is keyed
+/// by page_id so the caller can iterate it independently of input order.
+fn compute_swap_orders(
+    pages: &[(PageId, u32)],
+    page_a: PageId,
+    page_b: PageId,
+) -> BTreeMap<PageId, u32> {
+    let needs_migration = pages.iter().any(|(_, o)| *o == 0);
+
+    let mut next: BTreeMap<PageId, u32> = if needs_migration {
+        // Sort by `(order, id)` — same key the sidebar uses — so the
+        // migration matches what the user is currently looking at.
+        let mut sorted: Vec<(u32, PageId)> = pages.iter().map(|&(id, o)| (o, id)).collect();
+        sorted.sort();
+        sorted
+            .iter()
+            .enumerate()
+            .map(|(i, &(_, id))| (id, (i as u32 + 1) * 10))
+            .collect()
+    } else {
+        pages.iter().copied().collect()
+    };
+
+    let order_a = next.get(&page_a).copied().unwrap_or(0);
+    let order_b = next.get(&page_b).copied().unwrap_or(0);
+    if let Some(o) = next.get_mut(&page_a) {
+        *o = order_b;
+    }
+    if let Some(o) = next.get_mut(&page_b) {
+        *o = order_a;
+    }
+    next
+}
+
 /// Update the browser tab title: "Page — Site — Delta"
 fn update_document_title(site_name: Option<&str>, page_title: Option<&str>) {
     let title = match (page_title, site_name) {
@@ -802,7 +906,9 @@ fn update_hash(hash: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::monotonic_updated_at;
+    use super::{compute_swap_orders, monotonic_updated_at, next_create_order};
+    use delta_core::PageId;
+    use std::collections::BTreeMap;
 
     #[test]
     fn returns_now_for_brand_new_page() {
@@ -852,5 +958,111 @@ mod tests {
         assert!(t2 > t1);
         assert!(t3 > t2);
         assert_eq!((t1, t2, t3), (now + 1, now + 2, now + 3));
+    }
+
+    #[test]
+    fn next_create_order_on_empty_site_starts_at_step() {
+        // First page on a brand-new site gets order=10 instead of 0
+        // so when a SECOND page is created we don't fall into the
+        // "all zero" all-pages-have-the-same-order bucket.
+        assert_eq!(next_create_order(std::iter::empty()), 10);
+    }
+
+    #[test]
+    fn next_create_order_with_zero_only_pages_still_picks_step() {
+        // Legacy v1-signed pages all live at order=0. A new page on
+        // such a site MUST sort after them, so it has to skip past 0.
+        assert_eq!(next_create_order([0, 0, 0]), 10);
+    }
+
+    #[test]
+    fn next_create_order_picks_strictly_greater_than_existing_max() {
+        // Steady-state case: pages have orders 10, 20, 30. New page
+        // gets 40 so it sorts at the end of the sidebar.
+        assert_eq!(next_create_order([10, 20, 30]), 40);
+    }
+
+    #[test]
+    fn next_create_order_handles_unsorted_input() {
+        // Iterator order is whatever BTreeMap::values() produces; the
+        // helper must compute max regardless.
+        assert_eq!(next_create_order([30, 10, 20]), 40);
+    }
+
+    #[test]
+    fn next_create_order_saturates_at_u32_max() {
+        // Pathological — would take >400 million page creations. The
+        // helper must not panic.
+        assert_eq!(next_create_order([u32::MAX]), u32::MAX);
+    }
+
+    fn pages(entries: &[(PageId, u32)]) -> Vec<(PageId, u32)> {
+        entries.to_vec()
+    }
+
+    #[test]
+    fn swap_with_all_explicit_orders_just_swaps_the_two() {
+        // Steady-state: every page has an explicit order. No migration
+        // needed; the swap only touches the two pages clicked.
+        let result = compute_swap_orders(&pages(&[(1, 10), (2, 20), (3, 30)]), 1, 2);
+        let expected: BTreeMap<PageId, u32> = [(1, 20), (2, 10), (3, 30)].into_iter().collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn swap_with_all_zero_orders_migrates_every_page() {
+        // The user-reported bug: a site with all legacy pages at
+        // order=0 used to mutate orders only locally. The pure helper
+        // must produce explicit orders for *every* page so the caller
+        // can sign and propagate them all to the network — otherwise
+        // the unmigrated pages stay at 0 on the network and clump to
+        // the front on refresh.
+        let result = compute_swap_orders(&pages(&[(1, 0), (2, 0), (3, 0), (4, 0)]), 1, 2);
+        // Sorted by (order=0, id): 1, 2, 3, 4 -> assigned 10, 20, 30, 40.
+        // Then swap pages 1 and 2: page 1 gets 2's order (20), page 2 gets 1's (10).
+        // Pages 3 and 4 keep their migrated orders.
+        let expected: BTreeMap<PageId, u32> =
+            [(1, 20), (2, 10), (3, 30), (4, 40)].into_iter().collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn swap_with_mixed_zero_and_explicit_orders_migrates_everyone() {
+        // After issue #15 was filed but before it was fixed, a site
+        // could have a mix of legacy pages at order=0 and newly-
+        // created pages at order=10/20/.... Migrating only the all-
+        // zero subset would leave the explicit-order pages
+        // overlapping the migrated grid — the helper migrates the
+        // whole site whenever ANY page is still at 0.
+        let result = compute_swap_orders(&pages(&[(1, 0), (2, 0), (3, 10)]), 1, 3);
+        // Sorted by (order, id): (0,1), (0,2), (10,3) -> migrated to
+        // 10, 20, 30 respectively. Then swap pages 1 and 3: page 1
+        // gets 30, page 3 gets 10.
+        let expected: BTreeMap<PageId, u32> = [(1, 30), (2, 20), (3, 10)].into_iter().collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn migration_sort_key_matches_sidebar_sort_key() {
+        // The sidebar sorts pages by `(order, id)`. The migration must
+        // use the same key so the post-migration sequence visually
+        // matches what the user clicked. Here pages 5 and 1 share
+        // order=0 — the sort tiebreaker by id puts 1 before 5.
+        let result = compute_swap_orders(&pages(&[(5, 0), (1, 0), (3, 5)]), 5, 1);
+        // Sorted: (0,1), (0,5), (5,3) -> migrated 10, 20, 30.
+        // Then swap pages 5 and 1: page 5 (was 20) gets 10, page 1
+        // (was 10) gets 20.
+        let expected: BTreeMap<PageId, u32> = [(1, 20), (5, 10), (3, 30)].into_iter().collect();
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn swap_is_a_no_op_when_pages_share_an_order_after_migration() {
+        // Defensive: if both swap targets happen to land on the same
+        // migrated order (impossible in normal flow but cheap to
+        // pin), the result is a no-op rather than corruption.
+        let result = compute_swap_orders(&pages(&[(1, 10), (2, 10), (3, 30)]), 1, 2);
+        let expected: BTreeMap<PageId, u32> = [(1, 10), (2, 10), (3, 30)].into_iter().collect();
+        assert_eq!(result, expected);
     }
 }
