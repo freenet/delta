@@ -194,7 +194,7 @@ fn render_markdown(content: &str) -> String {
     let html = markdown::to_html_with_options(&resolved, &markdown::Options::gfm())
         .unwrap_or_else(|_| markdown::to_html(&resolved));
     let html = inject_heading_ids(&html);
-    finalize_anchors(&html, behind_gateway())
+    finalize_anchors(&html, behind_gateway(), own_contract_id().as_deref())
 }
 
 /// True when Delta is currently being served from a path under
@@ -223,12 +223,47 @@ pub(super) fn behind_gateway() -> bool {
     true
 }
 
+/// The contract ID Delta is currently being served under, extracted
+/// from `window.location.pathname`. Returns `None` outside of the
+/// gateway-hosted path layout (e.g. `dx serve`, native tests).
+///
+/// Used by `finalize_anchors` so a Freenet URL pointing at *our own*
+/// contract — e.g. one the user copied from the Share button — is
+/// treated as an internal link rather than an external one. Without
+/// that, clicking it would open in a new tab instead of doing the
+/// in-iframe hashchange navigation the URL was intended to trigger.
+#[cfg(target_arch = "wasm32")]
+pub(super) fn own_contract_id() -> Option<String> {
+    let pathname = web_sys::window().and_then(|w| w.location().pathname().ok())?;
+    let after_marker = pathname.strip_prefix("/v1/contract/web/")?;
+    let id_end = after_marker
+        .find(|c: char| !is_freenet_base58_char(c))
+        .unwrap_or(after_marker.len());
+    if matches!(id_end, 43 | 44) {
+        Some(after_marker[..id_end].to_string())
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn own_contract_id() -> Option<String> {
+    None
+}
+
 /// Walk anchor tags in the rendered HTML and:
 ///
-/// - Add `target="_blank" rel="noopener noreferrer"` to every external
-///   anchor (anything whose href doesn't start with `#` — internal
-///   hash-route navigation MUST stay in-iframe so it doesn't open a
-///   new tab on every page click).
+/// - Add `target="_blank" rel="noopener noreferrer"` to every truly
+///   external anchor. An anchor is considered internal — and
+///   therefore left to navigate in-iframe — if any of:
+///     1. The href starts with `#` (hash-only: heading anchors,
+///        Delta's `[[id|title]]` page links).
+///     2. The href is a Freenet web-contract URL whose contract ID
+///        equals our own iframe's contract ID, e.g. a URL the user
+///        copied from the Share button. Without this, clicking such
+///        a link would open a new tab instead of triggering the
+///        in-iframe hashchange navigation that the URL was designed
+///        to drive. (Ivvor, 2026-05-03 11:55)
 /// - When `rewrite_freenet_hrefs` is true, rewrite Freenet web-contract
 ///   URLs to a same-origin absolute path so the link works for any
 ///   reader regardless of which gateway they're connected to.
@@ -237,9 +272,12 @@ pub(super) fn behind_gateway() -> bool {
 ///   regardless of hosting. User-supplied `[label](url)` text is kept.
 ///
 /// Ported from River (`river/main/ui/src/components/conversation.rs`),
-/// adapted to leave hash-only anchors alone — Delta uses them for
-/// `[[id|title]]` page links and heading-id anchors.
-pub(super) fn finalize_anchors(html: &str, rewrite_freenet_hrefs: bool) -> String {
+/// adapted for Delta's in-iframe page link / heading anchor model.
+pub(super) fn finalize_anchors(
+    html: &str,
+    rewrite_freenet_hrefs: bool,
+    own_contract_id: Option<&str>,
+) -> String {
     let mut out = String::with_capacity(html.len() + 32);
     let mut rest = html;
     while let Some(pos) = rest.find("<a ") {
@@ -259,14 +297,20 @@ pub(super) fn finalize_anchors(html: &str, rewrite_freenet_hrefs: bool) -> Strin
         let tail = &after_open[close_pos + 4..];
 
         let original_href = extract_href(opening);
-        let is_internal_hash = original_href
+        let parsed_freenet = original_href.as_deref().and_then(parse_freenet_web_url);
+        let starts_with_hash = original_href
             .as_deref()
             .map(|h| h.starts_with('#'))
             .unwrap_or(true);
+        let is_same_contract = match (own_contract_id, &parsed_freenet) {
+            (Some(own), Some(parsed)) => own == parsed.contract_id,
+            _ => false,
+        };
+        let is_internal = starts_with_hash || is_same_contract;
 
         // Inject `target="_blank" rel="noopener noreferrer"` on
-        // external links only. Internal `#…` anchors stay in-iframe.
-        let opening = if is_internal_hash {
+        // truly external links only. Internal links stay in-iframe.
+        let opening = if is_internal {
             opening.to_string()
         } else {
             opening.replacen(
@@ -276,7 +320,13 @@ pub(super) fn finalize_anchors(html: &str, rewrite_freenet_hrefs: bool) -> Strin
             )
         };
 
-        let opening = if rewrite_freenet_hrefs && !is_internal_hash {
+        // Rewrite Freenet hrefs to same-origin paths regardless of
+        // whether the link is internal or external — both benefit
+        // from being host/port-agnostic. (Internal same-contract
+        // links also need this so the hashchange they trigger lands
+        // on the current iframe, not a freshly-loaded one at the
+        // sender's hard-coded origin.)
+        let opening = if rewrite_freenet_hrefs {
             match original_href.as_deref().and_then(rewrite_freenet_href) {
                 Some(new_href) => {
                     let orig = original_href.as_deref().unwrap();
@@ -293,7 +343,7 @@ pub(super) fn finalize_anchors(html: &str, rewrite_freenet_hrefs: bool) -> Strin
         };
 
         let new_inner = match original_href.as_deref() {
-            Some(h) if !is_internal_hash && h == inner => {
+            Some(h) if !starts_with_hash && h == inner => {
                 beautify_freenet_label(h).unwrap_or_else(|| inner.to_string())
             }
             _ => inner.to_string(),
@@ -1075,7 +1125,7 @@ mod tests {
     #[test]
     fn finalize_anchors_adds_target_blank_to_external_links() {
         let html = "<a href=\"https://example.com\">Example</a>";
-        let result = finalize_anchors(html, true);
+        let result = finalize_anchors(html, true, None);
         assert!(result.contains("target=\"_blank\""));
         assert!(result.contains("rel=\"noopener noreferrer\""));
     }
@@ -1086,7 +1136,7 @@ mod tests {
         // and must NOT get target="_blank" — that would open in a new
         // tab on every page click.
         let html = "<a href=\"#AmcVD92D3U/2/page-2\">Page 2</a>";
-        let result = finalize_anchors(html, true);
+        let result = finalize_anchors(html, true, None);
         assert!(!result.contains("target=\"_blank\""));
         assert!(result.contains("href=\"#AmcVD92D3U/2/page-2\""));
     }
@@ -1095,7 +1145,7 @@ mod tests {
     fn finalize_anchors_rewrites_freenet_href_under_gateway() {
         let html =
             format!("<a href=\"http://127.0.0.1:7509/v1/contract/web/{DELTA_ID}/\">visit</a>");
-        let result = finalize_anchors(&html, true);
+        let result = finalize_anchors(&html, true, None);
         assert!(result.contains(&format!("href=\"/v1/contract/web/{DELTA_ID}/\"")));
     }
 
@@ -1105,7 +1155,7 @@ mod tests {
         // rewrite to a same-origin path that won't resolve.
         let html =
             format!("<a href=\"http://127.0.0.1:7509/v1/contract/web/{DELTA_ID}/\">visit</a>");
-        let result = finalize_anchors(&html, false);
+        let result = finalize_anchors(&html, false, None);
         assert!(result.contains(&format!(
             "href=\"http://127.0.0.1:7509/v1/contract/web/{DELTA_ID}/\""
         )));
@@ -1119,7 +1169,7 @@ mod tests {
         let html = format!(
             "<a href=\"http://gw/v1/contract/web/{RIVER_ID}/\">http://gw/v1/contract/web/{RIVER_ID}/</a>"
         );
-        let result = finalize_anchors(&html, false);
+        let result = finalize_anchors(&html, false, None);
         assert!(result.contains(">freenet:raAqMhMG</a>"));
     }
 
@@ -1128,7 +1178,7 @@ mod tests {
         // `[my link](url)` markdown gives anchor inner != href; keep
         // the user's label.
         let html = format!("<a href=\"http://gw/v1/contract/web/{RIVER_ID}/\">My Custom Label</a>");
-        let result = finalize_anchors(&html, false);
+        let result = finalize_anchors(&html, false, None);
         assert!(result.contains(">My Custom Label</a>"));
         assert!(!result.contains("freenet:"));
     }
@@ -1146,10 +1196,48 @@ mod tests {
         let html = format!(
             "<a href=\"http://gw/v1/contract/web/{RIVER_ID}/?a=1&amp;b=2\">http://gw/v1/contract/web/{RIVER_ID}/?a=1&amp;b=2</a>"
         );
-        let result = finalize_anchors(&html, false);
+        let result = finalize_anchors(&html, false, None);
         assert!(
             result.contains(">freenet:raAqMhMG/?a=1&amp;b=2</a>"),
             "expected beautified label with `&amp;amp;` preserved; got: {result}"
+        );
+    }
+
+    #[test]
+    fn finalize_anchors_treats_same_contract_url_as_internal() {
+        // Regression test for Ivvor's 2026-05-03 11:55 report:
+        // clicking a Delta-to-Delta link copied from the Share button
+        // (which produces a full Freenet URL ending in `#prefix/id/slug`)
+        // was opening a new tab instead of doing the in-iframe
+        // hashchange navigation. When the URL points at our own
+        // contract, treat it as internal so `target="_blank"` is NOT
+        // added.
+        let html = format!(
+            "<a href=\"http://gw/v1/contract/web/{DELTA_ID}/#AmcVD92D3U/2/page-2\">jump</a>"
+        );
+        let result = finalize_anchors(&html, true, Some(DELTA_ID));
+        assert!(
+            !result.contains("target=\"_blank\""),
+            "same-contract URL must not get target=_blank: {result}"
+        );
+        // The href is still rewritten to a same-origin path so
+        // hashchange lands on the current iframe.
+        assert!(result.contains(&format!(
+            "href=\"/v1/contract/web/{DELTA_ID}/#AmcVD92D3U/2/page-2\""
+        )));
+    }
+
+    #[test]
+    fn finalize_anchors_treats_different_contract_url_as_external() {
+        // The other half of the rule: a URL pointing at a *different*
+        // contract IS external — it would navigate the iframe to a
+        // different contract's WASM, which is fundamentally a tab-
+        // level transition.
+        let html = format!("<a href=\"http://gw/v1/contract/web/{RIVER_ID}/foo\">elsewhere</a>");
+        let result = finalize_anchors(&html, true, Some(DELTA_ID));
+        assert!(
+            result.contains("target=\"_blank\""),
+            "cross-contract URL should get target=_blank: {result}"
         );
     }
 
@@ -1159,7 +1247,7 @@ mod tests {
             "<p>See <a href=\"http://gw/v1/contract/web/{RIVER_ID}/\">http://gw/v1/contract/web/{RIVER_ID}/</a> \
              or <a href=\"https://example.com\">Example</a> or <a href=\"#section\">jump</a>.</p>"
         );
-        let result = finalize_anchors(&html, true);
+        let result = finalize_anchors(&html, true, None);
         // Freenet beautification.
         assert!(result.contains(">freenet:raAqMhMG</a>"));
         // External link gets target=_blank.
