@@ -391,14 +391,25 @@ struct FreenetWebUrl<'a> {
 /// into `/foo` on the reader's local gateway, redirecting the click to
 /// the victim's gateway instead of the attacker's host.
 fn parse_freenet_web_url(url: &str) -> Option<FreenetWebUrl<'_>> {
-    let scheme_end = url.find("://")?;
-    let scheme = &url[..scheme_end];
-    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+    // Either an absolute URL (http://host/v1/contract/web/...) or a
+    // path-relative URL (/v1/contract/web/...) — both are valid in
+    // user-authored markdown. Ivvor 2026-05-03 12:10 reported using
+    // the relative form; without this the relative href slipped past
+    // same-contract detection and got `target="_blank"` despite
+    // pointing at our own contract.
+    let path = if let Some(scheme_end) = url.find("://") {
+        let scheme = &url[..scheme_end];
+        if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+            return None;
+        }
+        let after_scheme = &url[scheme_end + 3..];
+        let path_offset = after_scheme.find('/')?;
+        &after_scheme[path_offset..]
+    } else if url.starts_with('/') {
+        url
+    } else {
         return None;
-    }
-    let after_scheme = &url[scheme_end + 3..];
-    let path_offset = after_scheme.find('/')?;
-    let path = &after_scheme[path_offset..];
+    };
     let after_marker = path.strip_prefix("/v1/contract/web/")?;
 
     let id_end = after_marker
@@ -1201,6 +1212,53 @@ mod tests {
             result.contains(">freenet:raAqMhMG/?a=1&amp;b=2</a>"),
             "expected beautified label with `&amp;amp;` preserved; got: {result}"
         );
+    }
+
+    #[test]
+    fn parse_freenet_web_url_accepts_relative_path() {
+        // Ivvor 2026-05-03 12:10: `[David's Place](/v1/contract/web/<id>/#prefix/page/about)`
+        // — relative-path markdown link (no scheme/host). Without
+        // this, the relative href fell through `parse_freenet_web_url`,
+        // missed the same-contract check, and got `target="_blank"`.
+        let url = format!("/v1/contract/web/{DELTA_ID}/#Fe5jaFmRnp/1/about");
+        let parsed = parse_freenet_web_url(&url).expect("relative URL should parse");
+        assert_eq!(parsed.contract_id, DELTA_ID);
+        assert_eq!(parsed.suffix, "/#Fe5jaFmRnp/1/about");
+        assert_eq!(parsed.absolute_path, url);
+    }
+
+    #[test]
+    fn parse_freenet_web_url_rejects_path_relative_non_contract() {
+        // Path-relative URL that doesn't hit the marker is not a
+        // Freenet URL.
+        assert!(parse_freenet_web_url("/some/other/path").is_none());
+        assert!(parse_freenet_web_url("/v1/contract/web/").is_none());
+    }
+
+    #[test]
+    fn parse_freenet_web_url_rejects_unrooted_path_without_scheme() {
+        // No scheme AND no leading `/` — could be a fragment, a
+        // relative path, anything. Don't try to parse.
+        assert!(parse_freenet_web_url("v1/contract/web/abc").is_none());
+        assert!(parse_freenet_web_url("foo").is_none());
+    }
+
+    #[test]
+    fn finalize_anchors_treats_relative_same_contract_url_as_internal() {
+        // The exact reproduction of Ivvor's case: relative-path
+        // markdown link to the same contract. Must not get
+        // `target="_blank"` and must keep the relative href intact.
+        let html = format!(
+            "<a href=\"/v1/contract/web/{DELTA_ID}/#Fe5jaFmRnp/1/about\">David's Place</a>"
+        );
+        let result = finalize_anchors(&html, true, Some(DELTA_ID));
+        assert!(
+            !result.contains("target=\"_blank\""),
+            "relative same-contract URL must not get target=_blank: {result}"
+        );
+        assert!(result.contains(&format!(
+            "href=\"/v1/contract/web/{DELTA_ID}/#Fe5jaFmRnp/1/about\""
+        )));
     }
 
     #[test]
