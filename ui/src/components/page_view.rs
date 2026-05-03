@@ -184,14 +184,248 @@ pub fn PageView() -> Element {
     }
 }
 
-/// Render markdown to HTML, resolving `[[id|text]]` page links as hash links
-/// and injecting `id="..."` attributes on headings so in-page anchor links
-/// (`[Link to Heading](#heading)`) work natively.
+/// Render markdown to HTML, resolving `[[id|text]]` page links as hash links,
+/// injecting `id="..."` attributes on headings so in-page anchor links
+/// (`[Link to Heading](#heading)`) work natively, and beautifying bare
+/// Freenet web-contract URLs (`http://gateway/v1/contract/web/<id>/...`)
+/// into `freenet:<id-prefix>[/path]` labels with same-origin hrefs.
 fn render_markdown(content: &str) -> String {
     let resolved = resolve_page_links(content);
     let html = markdown::to_html_with_options(&resolved, &markdown::Options::gfm())
         .unwrap_or_else(|_| markdown::to_html(&resolved));
-    inject_heading_ids(&html)
+    let html = inject_heading_ids(&html);
+    finalize_anchors(&html, behind_gateway())
+}
+
+/// True when Delta is currently being served from a path under
+/// `/v1/contract/web/`, which is what gateway hosting looks like to the
+/// browser. Returning false suppresses the host-stripping href rewrite
+/// for `dx serve` and other dev flows where the rewritten same-origin
+/// path would have no gateway behind it.
+///
+/// Exposed at module level so the editor live-preview honors the same
+/// flag — without that the preview shows a same-origin path for
+/// Freenet URLs in dev mode while the rendered page view doesn't,
+/// which surprises authors during `dx serve` iteration.
+#[cfg(target_arch = "wasm32")]
+pub(super) fn behind_gateway() -> bool {
+    web_sys::window()
+        .and_then(|w| w.location().pathname().ok())
+        .map(|p| p.starts_with("/v1/contract/web/"))
+        .unwrap_or(false)
+}
+
+/// Native test builds: default to true so existing tests verify the
+/// production (gateway-hosted) behavior. Tests covering the dev-mode
+/// path call `finalize_anchors` with an explicit `false` flag.
+#[cfg(not(target_arch = "wasm32"))]
+pub(super) fn behind_gateway() -> bool {
+    true
+}
+
+/// Walk anchor tags in the rendered HTML and:
+///
+/// - Add `target="_blank" rel="noopener noreferrer"` to every external
+///   anchor (anything whose href doesn't start with `#` — internal
+///   hash-route navigation MUST stay in-iframe so it doesn't open a
+///   new tab on every page click).
+/// - When `rewrite_freenet_hrefs` is true, rewrite Freenet web-contract
+///   URLs to a same-origin absolute path so the link works for any
+///   reader regardless of which gateway they're connected to.
+/// - For bare Freenet web URLs (where the visible text equals the
+///   original href), shorten the label to `freenet:<id-prefix>[/<path>]`
+///   regardless of hosting. User-supplied `[label](url)` text is kept.
+///
+/// Ported from River (`river/main/ui/src/components/conversation.rs`),
+/// adapted to leave hash-only anchors alone — Delta uses them for
+/// `[[id|title]]` page links and heading-id anchors.
+pub(super) fn finalize_anchors(html: &str, rewrite_freenet_hrefs: bool) -> String {
+    let mut out = String::with_capacity(html.len() + 32);
+    let mut rest = html;
+    while let Some(pos) = rest.find("<a ") {
+        out.push_str(&rest[..pos]);
+        let tag = &rest[pos..];
+        let Some(open_end) = tag.find('>') else {
+            out.push_str(tag);
+            return out;
+        };
+        let opening = &tag[..=open_end];
+        let after_open = &tag[open_end + 1..];
+        let Some(close_pos) = after_open.find("</a>") else {
+            out.push_str(tag);
+            return out;
+        };
+        let inner = &after_open[..close_pos];
+        let tail = &after_open[close_pos + 4..];
+
+        let original_href = extract_href(opening);
+        let is_internal_hash = original_href
+            .as_deref()
+            .map(|h| h.starts_with('#'))
+            .unwrap_or(true);
+
+        // Inject `target="_blank" rel="noopener noreferrer"` on
+        // external links only. Internal `#…` anchors stay in-iframe.
+        let opening = if is_internal_hash {
+            opening.to_string()
+        } else {
+            opening.replacen(
+                "<a href=\"",
+                "<a target=\"_blank\" rel=\"noopener noreferrer\" href=\"",
+                1,
+            )
+        };
+
+        let opening = if rewrite_freenet_hrefs && !is_internal_hash {
+            match original_href.as_deref().and_then(rewrite_freenet_href) {
+                Some(new_href) => {
+                    let orig = original_href.as_deref().unwrap();
+                    opening.replacen(
+                        &format!("href=\"{orig}\""),
+                        &format!("href=\"{new_href}\""),
+                        1,
+                    )
+                }
+                None => opening,
+            }
+        } else {
+            opening
+        };
+
+        let new_inner = match original_href.as_deref() {
+            Some(h) if !is_internal_hash && h == inner => {
+                beautify_freenet_label(h).unwrap_or_else(|| inner.to_string())
+            }
+            _ => inner.to_string(),
+        };
+
+        out.push_str(&opening);
+        out.push_str(&new_inner);
+        out.push_str("</a>");
+        rest = tail;
+    }
+    out.push_str(rest);
+    out
+}
+
+fn extract_href(opening_tag: &str) -> Option<String> {
+    let start = opening_tag.find("href=\"")? + "href=\"".len();
+    let end = opening_tag[start..].find('"')?;
+    Some(opening_tag[start..start + end].to_string())
+}
+
+/// Parsed shape of a Freenet web-contract URL.
+struct FreenetWebUrl<'a> {
+    /// The contract ID — base58-encoded 32-byte BLAKE3 hash (43 or 44 chars).
+    contract_id: &'a str,
+    /// Anything after the contract ID: leading slash + path, query, fragment.
+    /// `""` for `/v1/contract/web/<id>` with nothing after.
+    suffix: &'a str,
+    /// Same-origin absolute path including the marker:
+    /// `/v1/contract/web/<id><suffix>`. Used as a host/port-agnostic href.
+    absolute_path: &'a str,
+}
+
+/// Parse a Freenet web-contract URL, validating the contract ID looks
+/// like a real base58-encoded 32-byte BLAKE3 hash. Rejects same-prefix
+/// paths whose ID segment is too short or contains visual-confusion
+/// chars (`0`, `O`, `I`, `l`) that a real contract ID can never have.
+///
+/// The URL must use `http` or `https` (defense in depth — `[label](url)`
+/// markdown can in theory carry other schemes; we don't want to rewrite
+/// `javascript:`-flavored input even though the rewrite would defang it).
+///
+/// The suffix must not contain `..` path segments. Without this guard a
+/// pasted `http://attacker/v1/contract/web/<valid-shape-id>/../../foo`
+/// would be rewritten to a same-origin path that the browser normalizes
+/// into `/foo` on the reader's local gateway, redirecting the click to
+/// the victim's gateway instead of the attacker's host.
+fn parse_freenet_web_url(url: &str) -> Option<FreenetWebUrl<'_>> {
+    let scheme_end = url.find("://")?;
+    let scheme = &url[..scheme_end];
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return None;
+    }
+    let after_scheme = &url[scheme_end + 3..];
+    let path_offset = after_scheme.find('/')?;
+    let path = &after_scheme[path_offset..];
+    let after_marker = path.strip_prefix("/v1/contract/web/")?;
+
+    let id_end = after_marker
+        .find(|c: char| !is_freenet_base58_char(c))
+        .unwrap_or(after_marker.len());
+    if !matches!(id_end, 43 | 44) {
+        return None;
+    }
+    let suffix = &after_marker[id_end..];
+    if suffix_has_dotdot_segment(suffix) {
+        return None;
+    }
+    Some(FreenetWebUrl {
+        contract_id: &after_marker[..id_end],
+        suffix,
+        absolute_path: path,
+    })
+}
+
+/// True if any path segment in `suffix` is exactly `..`. Path segments
+/// are the `/`-separated components before any `?` query or `#` fragment.
+fn suffix_has_dotdot_segment(suffix: &str) -> bool {
+    let path_only = suffix
+        .split_once(['?', '#'])
+        .map(|(p, _)| p)
+        .unwrap_or(suffix);
+    path_only.split('/').any(|seg| seg == "..")
+}
+
+/// Bitcoin-style base58 alphabet: digits and letters minus the visually
+/// ambiguous `0`, `O`, `I`, `l`. Identical to the alphabet used in
+/// `state::is_base58_char` but kept local because the contract-ID parser
+/// only cares about chars-in-this-set, not "exactly 10 of them".
+fn is_freenet_base58_char(c: char) -> bool {
+    matches!(
+        c,
+        '1'..='9' | 'A'..='H' | 'J'..='N' | 'P'..='Z' | 'a'..='k' | 'm'..='z'
+    )
+}
+
+/// Rewrite a Freenet web-contract URL's href to a same-origin absolute
+/// path, stripping the scheme + host + port. Returns None for non-Freenet
+/// URLs so the caller leaves the original href untouched.
+///
+/// `http://127.0.0.1:7509/v1/contract/web/<id>/foo` -> `/v1/contract/web/<id>/foo`
+/// `https://gw.example/v1/contract/web/<id>/#hash`  -> `/v1/contract/web/<id>/#hash`
+///
+/// The browser resolves the absolute path against the current page's
+/// origin, so the rewritten link points at whichever gateway Delta is
+/// loaded from — fixing pasted links that hard-code the sender's local
+/// gateway address.
+fn rewrite_freenet_href(url: &str) -> Option<String> {
+    Some(parse_freenet_web_url(url)?.absolute_path.to_string())
+}
+
+/// If `url` is a Freenet web-contract URL, return a beautified label
+/// like `freenet:UDzGbcWr` or `freenet:UDzGbcWr/index.html`. Returns
+/// None for any other URL so the caller falls back to the original
+/// link text.
+fn beautify_freenet_label(url: &str) -> Option<String> {
+    let parsed = parse_freenet_web_url(url)?;
+    // Defense in depth: refuse to beautify if the suffix carries raw
+    // HTML metacharacters. The markdown crate URL-encodes these today,
+    // but the label is rendered via dangerous_inner_html with no
+    // further escaping, so we'd rather skip the rewrite than risk
+    // smuggling markup.
+    if parsed.suffix.contains(['<', '>', '"']) {
+        return None;
+    }
+    // A bare trailing slash adds no information; drop it.
+    let suffix = if parsed.suffix == "/" {
+        ""
+    } else {
+        parsed.suffix
+    };
+    let id_prefix = &parsed.contract_id[..8];
+    Some(format!("freenet:{id_prefix}{suffix}"))
 }
 
 /// Walk the rendered HTML and inject GFM-style `id="slug"` attributes on
@@ -518,7 +752,10 @@ fn format_timestamp(ts: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{inject_heading_ids, slugify_heading, strip_html_tags};
+    use super::{
+        beautify_freenet_label, finalize_anchors, inject_heading_ids, parse_freenet_web_url,
+        rewrite_freenet_href, slugify_heading, strip_html_tags, suffix_has_dotdot_segment,
+    };
 
     #[test]
     fn slugify_simple_heading() {
@@ -707,5 +944,227 @@ mod tests {
         // No closing `;` -> not an entity; pass the rest of the string
         // through without trying to parse.
         assert_eq!(strip_html_tags("foo & bar"), "foo & bar");
+    }
+
+    // -- Freenet URL formatter (ported from River) --
+
+    // 43-char Bitcoin-base58 contract IDs. Real River contract ID, used
+    // verbatim in the river test suite.
+    const RIVER_ID: &str = "raAqMhMG7KUpXBU2SxgCQ3Vh4PYjttxdSWd9ftV7RLv";
+    // Real Delta contract ID — 43 chars too.
+    const DELTA_ID: &str = "EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr";
+
+    #[test]
+    fn parse_freenet_web_url_accepts_real_id() {
+        let url = format!("http://127.0.0.1:7509/v1/contract/web/{DELTA_ID}/");
+        let parsed = parse_freenet_web_url(&url).expect("should parse");
+        assert_eq!(parsed.contract_id, DELTA_ID);
+        assert_eq!(parsed.suffix, "/");
+        assert_eq!(
+            parsed.absolute_path,
+            format!("/v1/contract/web/{DELTA_ID}/")
+        );
+    }
+
+    #[test]
+    fn parse_freenet_web_url_accepts_https_and_subpath() {
+        let url = format!("https://gw.example.com/v1/contract/web/{RIVER_ID}/index.html");
+        let parsed = parse_freenet_web_url(&url).expect("should parse");
+        assert_eq!(parsed.contract_id, RIVER_ID);
+        assert_eq!(parsed.suffix, "/index.html");
+    }
+
+    #[test]
+    fn parse_freenet_web_url_accepts_query_and_fragment() {
+        let url = format!("http://gw/v1/contract/web/{RIVER_ID}/?invite=abc#hash");
+        let parsed = parse_freenet_web_url(&url).expect("should parse");
+        assert_eq!(parsed.suffix, "/?invite=abc#hash");
+    }
+
+    #[test]
+    fn parse_freenet_web_url_rejects_non_http_scheme() {
+        let url = format!("javascript:/v1/contract/web/{RIVER_ID}/");
+        assert!(parse_freenet_web_url(&url).is_none());
+        let url = format!("ftp://gw/v1/contract/web/{RIVER_ID}/");
+        assert!(parse_freenet_web_url(&url).is_none());
+    }
+
+    #[test]
+    fn parse_freenet_web_url_rejects_short_or_long_id() {
+        // 9-char prefix is too short.
+        assert!(parse_freenet_web_url("http://gw/v1/contract/web/short/").is_none());
+        // 50-char prefix is too long.
+        assert!(parse_freenet_web_url(
+            "http://gw/v1/contract/web/12345678901234567890123456789012345678901234567890/"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parse_freenet_web_url_rejects_visual_confusion_chars_in_id() {
+        // `0`, `O`, `I`, `l` aren't in the bitcoin base58 alphabet —
+        // a real contract ID can never contain them.
+        let url = format!("http://gw/v1/contract/web/0{}/", &RIVER_ID[1..]);
+        assert!(parse_freenet_web_url(&url).is_none());
+    }
+
+    #[test]
+    fn parse_freenet_web_url_rejects_dotdot_in_path() {
+        // Path-traversal protection: even with a valid-shape ID, refuse
+        // to rewrite if the suffix has `..` segments — the rewritten
+        // same-origin path would be normalized by the browser into a
+        // path the attacker chose on the *reader's* gateway.
+        let url = format!("http://attacker/v1/contract/web/{RIVER_ID}/../../foo");
+        assert!(parse_freenet_web_url(&url).is_none());
+    }
+
+    #[test]
+    fn suffix_dotdot_helper() {
+        assert!(suffix_has_dotdot_segment("/foo/../bar"));
+        assert!(suffix_has_dotdot_segment("/.."));
+        // `..` only as a path segment, not as part of a name.
+        assert!(!suffix_has_dotdot_segment("/foo..bar"));
+        // `..` after `?` is in the query string, not a path segment.
+        assert!(!suffix_has_dotdot_segment("/foo?x=..&y=..&"));
+    }
+
+    #[test]
+    fn rewrite_freenet_href_strips_host_and_port() {
+        let url = format!("http://127.0.0.1:7509/v1/contract/web/{DELTA_ID}/foo");
+        assert_eq!(
+            rewrite_freenet_href(&url).as_deref(),
+            Some(format!("/v1/contract/web/{DELTA_ID}/foo").as_str())
+        );
+    }
+
+    #[test]
+    fn beautify_freenet_label_shortens_to_id_prefix() {
+        let url = format!("http://gw/v1/contract/web/{RIVER_ID}");
+        assert_eq!(
+            beautify_freenet_label(&url).as_deref(),
+            Some("freenet:raAqMhMG")
+        );
+    }
+
+    #[test]
+    fn beautify_freenet_label_drops_bare_trailing_slash() {
+        let url = format!("http://gw/v1/contract/web/{RIVER_ID}/");
+        assert_eq!(
+            beautify_freenet_label(&url).as_deref(),
+            Some("freenet:raAqMhMG")
+        );
+    }
+
+    #[test]
+    fn beautify_freenet_label_keeps_subpath() {
+        let url = format!("http://gw/v1/contract/web/{RIVER_ID}/index.html");
+        assert_eq!(
+            beautify_freenet_label(&url).as_deref(),
+            Some("freenet:raAqMhMG/index.html")
+        );
+    }
+
+    #[test]
+    fn beautify_freenet_label_refuses_html_metachars_in_suffix() {
+        // Defense in depth: the label is rendered via dangerous_inner_html
+        // with no further escaping, so refuse smuggled markup.
+        let url = format!("http://gw/v1/contract/web/{RIVER_ID}/path?x=<script>alert(1)</script>");
+        assert_eq!(beautify_freenet_label(&url), None);
+    }
+
+    #[test]
+    fn finalize_anchors_adds_target_blank_to_external_links() {
+        let html = "<a href=\"https://example.com\">Example</a>";
+        let result = finalize_anchors(html, true);
+        assert!(result.contains("target=\"_blank\""));
+        assert!(result.contains("rel=\"noopener noreferrer\""));
+    }
+
+    #[test]
+    fn finalize_anchors_leaves_internal_hash_links_alone() {
+        // [[id|title]] page links and heading anchors all start with `#`
+        // and must NOT get target="_blank" — that would open in a new
+        // tab on every page click.
+        let html = "<a href=\"#AmcVD92D3U/2/page-2\">Page 2</a>";
+        let result = finalize_anchors(html, true);
+        assert!(!result.contains("target=\"_blank\""));
+        assert!(result.contains("href=\"#AmcVD92D3U/2/page-2\""));
+    }
+
+    #[test]
+    fn finalize_anchors_rewrites_freenet_href_under_gateway() {
+        let html =
+            format!("<a href=\"http://127.0.0.1:7509/v1/contract/web/{DELTA_ID}/\">visit</a>");
+        let result = finalize_anchors(&html, true);
+        assert!(result.contains(&format!("href=\"/v1/contract/web/{DELTA_ID}/\"")));
+    }
+
+    #[test]
+    fn finalize_anchors_skips_href_rewrite_when_not_behind_gateway() {
+        // dx serve / dev mode: there's no gateway behind us, so don't
+        // rewrite to a same-origin path that won't resolve.
+        let html =
+            format!("<a href=\"http://127.0.0.1:7509/v1/contract/web/{DELTA_ID}/\">visit</a>");
+        let result = finalize_anchors(&html, false);
+        assert!(result.contains(&format!(
+            "href=\"http://127.0.0.1:7509/v1/contract/web/{DELTA_ID}/\""
+        )));
+    }
+
+    #[test]
+    fn finalize_anchors_beautifies_bare_url_label() {
+        // Markdown's `<URL>` autolink syntax produces an anchor where
+        // the visible text equals the href. Beautify these to
+        // `freenet:<id-prefix>` regardless of hosting.
+        let html = format!(
+            "<a href=\"http://gw/v1/contract/web/{RIVER_ID}/\">http://gw/v1/contract/web/{RIVER_ID}/</a>"
+        );
+        let result = finalize_anchors(&html, false);
+        assert!(result.contains(">freenet:raAqMhMG</a>"));
+    }
+
+    #[test]
+    fn finalize_anchors_keeps_user_label_for_freenet_link() {
+        // `[my link](url)` markdown gives anchor inner != href; keep
+        // the user's label.
+        let html = format!("<a href=\"http://gw/v1/contract/web/{RIVER_ID}/\">My Custom Label</a>");
+        let result = finalize_anchors(&html, false);
+        assert!(result.contains(">My Custom Label</a>"));
+        assert!(!result.contains("freenet:"));
+    }
+
+    #[test]
+    fn finalize_anchors_beautifies_autolink_with_ampersand_in_query() {
+        // Regression test for the `&amp;`-encoding concern raised in the
+        // PR #22 skeptical review: GFM autolinks emit the SAME
+        // entity-encoded form in both `href="..."` and the visible
+        // text, so the byte-exact comparison `href == inner` still
+        // holds and beautification fires. Without this test, a future
+        // markdown crate bump that changes the encoding asymmetry
+        // would silently skip beautification on URLs with `&` in the
+        // query string.
+        let html = format!(
+            "<a href=\"http://gw/v1/contract/web/{RIVER_ID}/?a=1&amp;b=2\">http://gw/v1/contract/web/{RIVER_ID}/?a=1&amp;b=2</a>"
+        );
+        let result = finalize_anchors(&html, false);
+        assert!(
+            result.contains(">freenet:raAqMhMG/?a=1&amp;b=2</a>"),
+            "expected beautified label with `&amp;amp;` preserved; got: {result}"
+        );
+    }
+
+    #[test]
+    fn finalize_anchors_handles_multiple_anchors_in_one_pass() {
+        let html = format!(
+            "<p>See <a href=\"http://gw/v1/contract/web/{RIVER_ID}/\">http://gw/v1/contract/web/{RIVER_ID}/</a> \
+             or <a href=\"https://example.com\">Example</a> or <a href=\"#section\">jump</a>.</p>"
+        );
+        let result = finalize_anchors(&html, true);
+        // Freenet beautification.
+        assert!(result.contains(">freenet:raAqMhMG</a>"));
+        // External link gets target=_blank.
+        assert!(result.matches("target=\"_blank\"").count() == 2); // freenet + example
+                                                                   // Internal hash anchor untouched.
+        assert!(result.contains("href=\"#section\">jump</a>"));
     }
 }
