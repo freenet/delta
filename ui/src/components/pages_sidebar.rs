@@ -7,7 +7,7 @@ use crate::state::SiteRole;
 pub fn PagesSidebar() -> Element {
     let Some(site) = state::current_site() else {
         return rsx! {
-            aside { class: "w-52 flex flex-col h-full bg-bg-warm border-r border-border",
+            aside { class: "w-40 md:w-52 flex flex-col h-full bg-bg-warm border-r border-border",
                 div { class: "flex items-center justify-center h-full",
                     p { class: "text-sm text-text-muted italic", "Select a site" }
                 }
@@ -22,7 +22,7 @@ pub fn PagesSidebar() -> Element {
     sorted_pages.sort_by(|(id_a, a), (id_b, b)| a.order.cmp(&b.order).then(id_a.cmp(id_b)));
 
     rsx! {
-        aside { class: "w-52 flex flex-col h-full bg-bg-warm border-r border-border",
+        aside { class: "w-40 md:w-52 flex flex-col h-full bg-bg-warm border-r border-border",
             // Site name header - click to edit (owner only)
             {
                 let mut editing_name = use_signal(|| false);

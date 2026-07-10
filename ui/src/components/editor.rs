@@ -127,9 +127,11 @@ pub fn Editor() -> Element {
     rsx! {
         div { class: "flex flex-col h-full bg-panel",
             // Toolbar
-            div { class: "flex items-center gap-3 px-6 py-3 border-b border-border-light",
+            div { class: "flex items-center gap-2 md:gap-3 px-4 md:px-6 py-3 border-b border-border-light",
                 input {
-                    class: "text-xl bg-transparent border-none outline-none flex-1 text-text placeholder-text-muted-light font-semibold",
+                    // `min-w-0` lets the title shrink so the Save/Cancel
+                    // buttons stay visible on narrow (mobile) screens.
+                    class: "text-xl bg-transparent border-none outline-none flex-1 min-w-0 text-text placeholder-text-muted-light font-semibold",
                     r#type: "text",
                     value: "{title}",
                     placeholder: "Page title",
@@ -138,12 +140,12 @@ pub fn Editor() -> Element {
                     },
                 }
                 button {
-                    class: "px-4 py-1.5 text-sm text-accent border border-accent hover:bg-accent hover:text-text-inverse rounded-lg transition-colors font-medium",
+                    class: "px-3 md:px-4 py-1.5 text-sm text-accent border border-accent hover:bg-accent hover:text-text-inverse rounded-lg transition-colors font-medium flex-shrink-0",
                     onclick: move |_| state::save_current_page(),
                     "Save"
                 }
                 button {
-                    class: "px-4 py-1.5 text-sm text-text-muted hover:text-text transition-colors rounded",
+                    class: "px-3 md:px-4 py-1.5 text-sm text-text-muted hover:text-text transition-colors rounded flex-shrink-0",
                     onclick: move |_| {
                         *state::EDITING.write() = false;
                     },
@@ -151,12 +153,11 @@ pub fn Editor() -> Element {
                 }
             }
 
-            // Editor + Preview split
-            div { class: "flex flex-1 overflow-hidden",
+            // Editor + Preview split — side by side on desktop, stacked on mobile
+            div { class: "flex flex-col md:flex-row flex-1 overflow-hidden",
                 // Editor pane
                 div {
-                    class: "relative flex flex-col border-r border-border-light",
-                    style: "width: 60%; min-width: 400px;",
+                    class: "relative flex flex-col min-h-0 flex-1 md:flex-none w-full md:w-[60%] md:min-w-[400px] border-b md:border-b-0 md:border-r border-border-light",
                     div { class: "flex items-center justify-between px-4 py-2 border-b border-border-light bg-panel-warm",
                         span { class: "text-[10px] font-semibold text-text-muted-light uppercase tracking-[0.1em]",
                             "Markdown"
@@ -295,8 +296,7 @@ pub fn Editor() -> Element {
 
                 // Preview pane
                 div {
-                    class: "flex flex-col bg-panel min-w-0 overflow-hidden",
-                    style: "flex: 1;",
+                    class: "flex flex-col flex-1 min-h-0 min-w-0 bg-panel overflow-hidden",
                     div { class: "px-4 py-2 text-[10px] font-semibold text-text-muted-light border-b border-border-light uppercase tracking-[0.1em] bg-panel-warm",
                         "Preview"
                     }

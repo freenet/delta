@@ -41,11 +41,9 @@ pub fn PageView() -> Element {
     let mut rename_input = use_signal(|| page.title.clone());
 
     rsx! {
-        div { class: "max-w-4xl mx-auto px-10 py-12",
-            // Page header
-            div { class: "flex items-start justify-between mb-2",
-                div { class: "flex-1 min-w-0" }
-                div { class: "flex items-center gap-1 ml-4 flex-shrink-0",
+        div { class: "max-w-4xl mx-auto px-5 md:px-10 py-8 md:py-12",
+            // Page header — actions wrap on narrow screens instead of overflowing
+            div { class: "flex flex-wrap items-center justify-end gap-1 mb-2",
                     // All actions as uniform quiet text buttons — content is the star
                     button {
                         class: "px-3 py-1.5 text-xs text-text-muted hover:text-accent transition-colors rounded",
@@ -109,7 +107,6 @@ pub fn PageView() -> Element {
                             }
                         }
                     }
-                }
             }
 
             // Content - rendered or source
@@ -146,7 +143,7 @@ pub fn PageView() -> Element {
                 // the dialog mid-selection. Issue #26.
                 onmousedown: move |_| renaming.set(false),
                 div {
-                    class: "bg-panel rounded-xl shadow-lg w-80 p-5",
+                    class: "bg-panel rounded-xl shadow-lg w-80 max-w-[90vw] p-5",
                     // Stop the mousedown from reaching the backdrop so
                     // text-selection inside the dialog never triggers
                     // dismissal. The `onclick` handler is kept for

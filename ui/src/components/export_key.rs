@@ -140,7 +140,7 @@ pub fn ExportKeyModal() -> Element {
             onclick: move |_| *SHOW_EXPORT.write() = false,
             // Modal content
             div {
-                class: "bg-panel rounded-xl shadow-lg w-96 p-6",
+                class: "bg-panel rounded-xl shadow-lg w-96 max-w-[90vw] p-6",
                 onclick: move |evt| evt.stop_propagation(),
                 h2 { class: "text-lg font-semibold text-text mb-1", "Export Site Key" }
                 if let Some(err) = &error {
