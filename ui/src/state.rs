@@ -35,6 +35,9 @@ pub static CURRENT_SITE: GlobalSignal<Option<String>> = GlobalSignal::new(|| Non
 pub static CURRENT_PAGE: GlobalSignal<Option<PageId>> = GlobalSignal::new(|| None);
 pub static EDITING: GlobalSignal<bool> = GlobalSignal::new(|| false);
 pub static SHOW_ADD_SITE: GlobalSignal<bool> = GlobalSignal::new(|| false);
+/// Whether the sidebar drawer is open on small (mobile) screens.
+/// Ignored on `md:` and larger, where the sidebars are always visible.
+pub static MOBILE_NAV_OPEN: GlobalSignal<bool> = GlobalSignal::new(|| false);
 pub static EDITOR_TITLE: GlobalSignal<String> = GlobalSignal::new(String::new);
 pub static EDITOR_CONTENT: GlobalSignal<String> = GlobalSignal::new(String::new);
 
@@ -134,6 +137,8 @@ pub fn select_site(prefix: &str) {
     *EDITING.write() = false;
     *SHOW_ADD_SITE.write() = false;
     *CURRENT_SITE.write() = Some(prefix.to_string());
+    // Keep the drawer open on mobile: picking a site reveals its page list,
+    // which lives in the same drawer. Picking a page is what closes it.
 
     let sites = SITES.read();
     if let Some(site) = sites.get(prefix) {
@@ -170,6 +175,7 @@ pub fn select_site(prefix: &str) {
 
 pub fn show_add_site_prompt() {
     *SHOW_ADD_SITE.write() = true;
+    *MOBILE_NAV_OPEN.write() = false;
 }
 
 /// Rename a site. Updates local state, signs new config via delegate,
@@ -445,6 +451,7 @@ pub fn current_page() -> Option<(PageId, Page)> {
 pub fn select_page(page_id: PageId) {
     *EDITING.write() = false;
     *CURRENT_PAGE.write() = Some(page_id);
+    *MOBILE_NAV_OPEN.write() = false;
 
     if let Some(prefix) = &*CURRENT_SITE.read() {
         let sites = SITES.read();

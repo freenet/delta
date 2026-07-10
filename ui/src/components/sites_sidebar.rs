@@ -21,7 +21,7 @@ pub fn SitesSidebar() -> Element {
     visited.sort_by_key(|(_, s)| s.name.to_lowercase());
 
     rsx! {
-        aside { class: "w-56 flex flex-col h-full bg-bg border-r border-border",
+        aside { class: "w-40 md:w-56 flex flex-col h-full bg-bg border-r border-border",
 
             // Logo header
             div { class: "px-4 py-4 border-b border-border",

@@ -32,48 +32,126 @@ pub fn App() -> Element {
     let show_add_site = *state::SHOW_ADD_SITE.read();
     let has_sites = !state::SITES.read().is_empty();
     let has_current = state::CURRENT_SITE.read().is_some();
+    let mobile_nav_open = *state::MOBILE_NAV_OPEN.read();
+
+    // The pages sidebar only exists once a site is selected and we're not in
+    // the add-site / welcome states.
+    let show_pages_sidebar = !show_add_site && has_sites && has_current;
+
+    // Drawer slides in from the left on small screens and is a static column
+    // from `md:` up. `absolute` (not `fixed`) satisfies the gateway iframe
+    // constraint documented in AGENTS.md.
+    let drawer_class = format!(
+        "absolute inset-y-0 left-0 z-40 flex shadow-2xl transition-transform duration-200 ease-out \
+         md:static md:z-auto md:shadow-none md:translate-x-0 {}",
+        if mobile_nav_open { "translate-x-0" } else { "-translate-x-full" }
+    );
 
     rsx! {
         document::Link { rel: "icon", href: asset!("/assets/favicon.svg") }
         export_key::ExportKeyModal {}
-        div { class: "flex h-screen bg-bg text-text",
-            sites_sidebar::SitesSidebar {}
-            if show_add_site {
-                main { class: "flex-1 overflow-y-auto bg-panel",
-                    add_site_dialog::AddSiteDialog {}
+        div { class: "relative flex h-screen bg-bg text-text overflow-hidden",
+            // Backdrop dims the content behind the open drawer (mobile only).
+            if mobile_nav_open {
+                div {
+                    class: "absolute inset-0 z-30 bg-black/40 md:hidden",
+                    onclick: move |_| *state::MOBILE_NAV_OPEN.write() = false,
                 }
-            } else if !has_sites || !has_current {
-                // Welcome screen — no sites yet
-                main { class: "flex-1 overflow-y-auto bg-panel",
-                    div { class: "flex items-center justify-center h-full",
-                        div { class: "text-center max-w-md mx-8",
-                            span { class: "delta-mark inline-flex mb-6 w-16 h-16 text-[32px] rounded-2xl", "\u{0394}" }
-                            h1 { class: "text-2xl font-semibold text-text mb-2", "Welcome to Delta" }
-                            p { class: "text-sm text-text-muted-light mb-8 leading-relaxed",
-                                "Decentralized publishing on Freenet. Create your own site or visit one using a site code."
-                            }
-                            div { class: "flex gap-3 justify-center",
-                                button {
-                                    class: "btn-primary px-6 py-3 text-sm",
-                                    onclick: move |_| state::show_add_site_prompt(),
-                                    "Get Started"
+            }
+            // Sidebar drawer: site list + (optional) page list.
+            div { class: "{drawer_class}",
+                sites_sidebar::SitesSidebar {}
+                if show_pages_sidebar {
+                    pages_sidebar::PagesSidebar {}
+                }
+            }
+            // Main column: mobile header + content.
+            div { class: "flex flex-1 flex-col min-w-0",
+                MobileHeader {}
+                if show_add_site {
+                    main { class: "flex-1 overflow-y-auto bg-panel",
+                        add_site_dialog::AddSiteDialog {}
+                    }
+                } else if !has_sites || !has_current {
+                    // Welcome screen — no sites yet
+                    main { class: "flex-1 overflow-y-auto bg-panel",
+                        div { class: "flex items-center justify-center h-full",
+                            div { class: "text-center max-w-md mx-8",
+                                span { class: "delta-mark inline-flex mb-6 w-16 h-16 text-[32px] rounded-2xl", "\u{0394}" }
+                                h1 { class: "text-2xl font-semibold text-text mb-2", "Welcome to Delta" }
+                                p { class: "text-sm text-text-muted-light mb-8 leading-relaxed",
+                                    "Decentralized publishing on Freenet. Create your own site or visit one using a site code."
+                                }
+                                div { class: "flex gap-3 justify-center",
+                                    button {
+                                        class: "btn-primary px-6 py-3 text-sm",
+                                        onclick: move |_| state::show_add_site_prompt(),
+                                        "Get Started"
+                                    }
                                 }
                             }
                         }
                     }
-                }
-            } else {
-                pages_sidebar::PagesSidebar {}
-                main { class: "flex-1 overflow-y-auto bg-panel",
-                    {
-                        if *state::EDITING.read() {
-                            rsx! { editor::Editor {} }
-                        } else {
-                            rsx! { page_view::PageView {} }
+                } else {
+                    main { class: "flex-1 overflow-y-auto bg-panel",
+                        {
+                            if *state::EDITING.read() {
+                                rsx! { editor::Editor {} }
+                            } else {
+                                rsx! { page_view::PageView {} }
+                            }
                         }
                     }
                 }
             }
+        }
+    }
+}
+
+/// Top bar shown only on small screens (`md:hidden`). Holds the hamburger
+/// button that toggles the sidebar drawer, plus the current context label so
+/// the user knows where they are once the drawer closes.
+#[component]
+fn MobileHeader() -> Element {
+    // Derive a short title: current page title if any, else the site name,
+    // else the app name.
+    let title = {
+        let current = state::CURRENT_SITE.read().clone();
+        let page = *state::CURRENT_PAGE.read();
+        current
+            .as_ref()
+            .and_then(|prefix| {
+                let sites = state::SITES.read();
+                sites.get(prefix).map(|site| {
+                    page.and_then(|pid| site.state.pages.get(&pid).map(|p| p.title.clone()))
+                        .unwrap_or_else(|| site.name.clone())
+                })
+            })
+            .unwrap_or_else(|| "Delta".to_string())
+    };
+
+    rsx! {
+        div { class: "md:hidden flex items-center gap-3 px-4 py-3 border-b border-border bg-bg flex-shrink-0",
+            button {
+                class: "flex items-center justify-center w-9 h-9 -ml-1 rounded-lg text-text hover:bg-surface-hover transition-colors flex-shrink-0",
+                aria_label: "Toggle navigation",
+                onclick: move |_| {
+                    let open = *state::MOBILE_NAV_OPEN.read();
+                    *state::MOBILE_NAV_OPEN.write() = !open;
+                },
+                svg {
+                    class: "w-5 h-5",
+                    view_box: "0 0 24 24",
+                    fill: "none",
+                    stroke: "currentColor",
+                    stroke_width: "2",
+                    stroke_linecap: "round",
+                    stroke_linejoin: "round",
+                    path { d: "M4 6h16M4 12h16M4 18h16" }
+                }
+            }
+            span { class: "delta-mark flex-shrink-0", "\u{0394}" }
+            span { class: "text-sm font-semibold text-text-light truncate", "{title}" }
         }
     }
 }
