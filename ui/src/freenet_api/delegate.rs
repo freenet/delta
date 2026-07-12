@@ -71,10 +71,14 @@ pub fn register_delegate() {
             let delegate = Delegate::from((&delegate_code, &params));
             let container = DelegateContainer::Wasm(DelegateWasmAPIVersion::V1(delegate));
 
+            // stdlib 0.8 removed the world-known `DEFAULT_CIPHER` / `DEFAULT_NONCE`
+            // constants; supply a per-install random cipher/nonce instead. See
+            // `site_delegate_cipher_material` for the full rationale.
+            let (cipher, nonce) = site_delegate_cipher_material();
             let request = ClientRequest::DelegateOp(StdlibDelegateRequest::RegisterDelegate {
                 delegate: container,
-                cipher: StdlibDelegateRequest::DEFAULT_CIPHER,
-                nonce: StdlibDelegateRequest::DEFAULT_NONCE,
+                cipher,
+                nonce,
             });
 
             let mut api = super::connection::WEB_API.write();
@@ -96,6 +100,125 @@ pub fn register_delegate() {
                 }
             }
         });
+    }
+}
+
+/// localStorage keys for the persisted per-install site-delegate registration
+/// cipher/nonce (base58-encoded). See [`site_delegate_cipher_material`].
+#[cfg(target_arch = "wasm32")]
+const SITE_DELEGATE_CIPHER_KEY: &str = "delta_site_delegate_cipher_v1";
+#[cfg(target_arch = "wasm32")]
+const SITE_DELEGATE_NONCE_KEY: &str = "delta_site_delegate_nonce_v1";
+
+/// The (cipher, nonce) to register the site delegate with.
+///
+/// stdlib 0.8 removed the world-known `DelegateRequest::DEFAULT_CIPHER` /
+/// `DEFAULT_NONCE` constants Delta previously passed here. They were a PUBLIC
+/// 32-byte key + 24-byte nonce baked into stdlib, so every node encrypted its
+/// delegate secrets at rest under a key anyone could reproduce. We replace
+/// them with a random 32-byte cipher + 24-byte nonce generated once and kept
+/// STABLE, so:
+///
+///   * Stability: `register_delegate()` fires on every (re)connect. Registering
+///     the SAME delegate with DIFFERENT material would, on a node that still
+///     honors the client-supplied cipher, make it unable to decrypt the previous
+///     registration's secrets — bricking a site's stored signing keys / known
+///     sites / state backups. A stable value avoids that.
+///   * Confidentiality: the at-rest key becomes a per-install secret instead of
+///     a world-known constant.
+///
+/// Where the material lives depends on the browser context:
+///
+///   * `localStorage` available (normal top-level origin): persisted there, so it
+///     is stable ACROSS reloads and restarts, per browser profile.
+///   * `localStorage` unavailable — the production gateway iframe runs with an
+///     opaque origin, so `window.localStorage` THROWS and both load/persist
+///     silently no-op. In that case we fall back to a page-lifetime in-memory
+///     value ([`in_memory_cipher_material`]) so the delegate re-registers with
+///     identical material on every reconnect within the page's lifetime (it is
+///     not stable across a full page RELOAD there).
+///
+/// NOTE — on a node built against stdlib-0.8 core, this cipher/nonce are IGNORED
+/// server-side: the node derives a per-delegate DEK from its own KEK, and
+/// decrypts pre-0.8 secrets written under the old world-known cipher via a
+/// built-in legacy fallback. So migration of OLD delegate secrets does NOT
+/// depend on Delta supplying any particular key, and cross-reload rotation of
+/// the client value is harmless on the 0.8 fleet. The client cipher only still
+/// matters on a pre-0.8 node that honors the client-supplied value — see the
+/// equivalent River analysis (freenet/river#394) for the full assessment.
+#[cfg(target_arch = "wasm32")]
+fn site_delegate_cipher_material() -> ([u8; 32], [u8; 24]) {
+    // 1. Prefer localStorage where available — it survives reloads/restarts.
+    if let Some((cipher, nonce)) = load_persisted_cipher_material() {
+        return (cipher, nonce);
+    }
+    // 2. localStorage missing or unreadable (e.g. the sandboxed gateway iframe).
+    //    Use a page-stable process-memory value instead of generating a fresh
+    //    one every call, so the delegate re-registers with identical material on
+    //    every reconnect within the page's lifetime.
+    let (cipher, nonce) = in_memory_cipher_material();
+    // 3. Write through to localStorage when it IS available (a harmless no-op in
+    //    the iframe) so a subsequent reload can recover the same value.
+    persist_cipher_material(&cipher, &nonce);
+    (cipher, nonce)
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    /// Process-memory fallback for the site-delegate cipher/nonce. `None` until
+    /// first use; see [`in_memory_cipher_material`]. wasm is single-threaded, so
+    /// this thread-local is effectively process-global for the page lifetime.
+    static IN_MEMORY_CIPHER_MATERIAL: std::cell::RefCell<Option<([u8; 32], [u8; 24])>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Page-stable process-memory cipher/nonce, used when `localStorage` is
+/// unavailable (the sandboxed gateway iframe). Generated once on first use and
+/// returned unchanged thereafter.
+#[cfg(target_arch = "wasm32")]
+fn in_memory_cipher_material() -> ([u8; 32], [u8; 24]) {
+    IN_MEMORY_CIPHER_MATERIAL.with(|cell| {
+        *cell
+            .borrow_mut()
+            .get_or_insert_with(generate_cipher_material)
+    })
+}
+
+/// Generate a fresh random (cipher, nonce). `OsRng` routes through the UI's
+/// `getrandom` backend (`window.crypto.getRandomValues` on wasm; the OS entropy
+/// pool natively), so this is a CSPRNG on every target.
+#[cfg(any(target_arch = "wasm32", test))]
+fn generate_cipher_material() -> ([u8; 32], [u8; 24]) {
+    use rand::RngCore;
+    let mut cipher = [0u8; 32];
+    let mut nonce = [0u8; 24];
+    let mut rng = rand::rngs::OsRng;
+    rng.fill_bytes(&mut cipher);
+    rng.fill_bytes(&mut nonce);
+    (cipher, nonce)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn load_persisted_cipher_material() -> Option<([u8; 32], [u8; 24])> {
+    let window = web_sys::window()?;
+    let storage = window.local_storage().ok()??;
+    let cipher_b58 = storage.get_item(SITE_DELEGATE_CIPHER_KEY).ok()??;
+    let nonce_b58 = storage.get_item(SITE_DELEGATE_NONCE_KEY).ok()??;
+    let cipher: [u8; 32] = bs58::decode(&cipher_b58).into_vec().ok()?.try_into().ok()?;
+    let nonce: [u8; 24] = bs58::decode(&nonce_b58).into_vec().ok()?.try_into().ok()?;
+    Some((cipher, nonce))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn persist_cipher_material(cipher: &[u8; 32], nonce: &[u8; 24]) {
+    if let Some(window) = web_sys::window() {
+        if let Ok(Some(storage)) = window.local_storage() {
+            let _ = storage.set_item(
+                SITE_DELEGATE_CIPHER_KEY,
+                &bs58::encode(cipher).into_string(),
+            );
+            let _ = storage.set_item(SITE_DELEGATE_NONCE_KEY, &bs58::encode(nonce).into_string());
+        }
     }
 }
 
@@ -1054,6 +1177,21 @@ mod tests {
 
     fn tomb(prefix: &str) -> delta_core::KnownSiteRecord {
         delta_core::KnownSiteRecord::tombstone(prefix)
+    }
+
+    /// The old stdlib `DEFAULT_CIPHER`/`DEFAULT_NONCE` were world-known
+    /// constants. After the 0.8 bump we generate a per-install random value;
+    /// pin that it is non-trivial (not all-zero) and actually random (two
+    /// generations differ) so a regression can't silently re-introduce a
+    /// world-known at-rest key.
+    #[test]
+    fn generate_cipher_material_is_random_and_nonzero() {
+        let (c1, n1) = generate_cipher_material();
+        let (c2, n2) = generate_cipher_material();
+        assert_ne!(c1, [0u8; 32], "cipher must not be all-zero");
+        assert_ne!(n1, [0u8; 24], "nonce must not be all-zero");
+        assert_ne!(c1, c2, "two generations must differ (CSPRNG)");
+        assert_ne!(n1, n2, "two generations must differ (CSPRNG)");
     }
 
     #[test]

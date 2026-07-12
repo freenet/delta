@@ -44,3 +44,9 @@ version = "C4"
 description = "Before freenet-stdlib 0.6.0 bump"
 date = "2026-04-15"
 code_hash = "6837a66d8ba5481a6256300368d25caa2250b3a586db372a938e65c2f06b6346"
+
+[[entry]]
+version = "C5"
+description = "Before freenet-stdlib 0.8.3 bump"
+date = "2026-07-12"
+code_hash = "8e36f95d436899960cf31afd76586837a3bf9f91483dcd09d26483ad02823c53"
