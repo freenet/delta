@@ -75,3 +75,10 @@ description = "Before freenet-stdlib 0.6.0 bump (non_exhaustive hardening + Mess
 date = "2026-04-15"
 delegate_key = "c1fbb764babe708f558636427e1d019554dda9ee9d7f0050c7cdc7b3a1915945"
 code_hash = "b7179907eb526754148c60fe9281070c4d8e629a824281455511881b3ee4c807"
+
+[[entry]]
+version = "V10"
+description = "Before freenet-stdlib 0.8.3 bump (inbound-WS FileReader leak fix; DEFAULT_CIPHER/NONCE removed)"
+date = "2026-07-12"
+delegate_key = "a23b26940bc806503744c0181226d1a49516dac79d098dfac6e471571749496f"
+code_hash = "4d576358229eed2ea567d8c3275776f584a0a66f41b4b05058644da4d4fc56aa"
