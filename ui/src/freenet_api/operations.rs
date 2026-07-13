@@ -58,12 +58,6 @@ pub fn mark_prefix_migrating(prefix: &str) {
     });
 }
 
-/// True iff the given prefix is currently in its initial-capture
-/// window (see `MIGRATING_PREFIXES`).
-fn is_prefix_migrating(prefix: &str) -> bool {
-    MIGRATING_PREFIXES.read().contains(prefix)
-}
-
 /// Classification of an incoming GET response as determined by the
 /// (prefix, key, pending-migrations, migrating-prefixes) tuple. Exposed
 /// for unit testing the state machine in isolation from Dioxus signals
@@ -165,7 +159,7 @@ fn handle_contract_response(response: ContractResponse) {
                     // Clear this one entry up front so the classifier
                     // doesn't re-fire for the same key on a duplicate
                     // delivery. Sibling probes for the same prefix are
-                    // cleared below on success.
+                    // left in PENDING_MIGRATIONS on purpose (see below).
                     PENDING_MIGRATIONS.write().remove(&key_b58);
 
                     if state_bytes.is_empty() {
@@ -174,26 +168,35 @@ fn handle_contract_response(response: ContractResponse) {
                         ));
                         return;
                     }
-                    if !is_prefix_migrating(&prefix) {
-                        // Some other probe already captured fresh
-                        // state for this prefix and removed it from
-                        // the migrating set. Drop the late arrival —
-                        // it would otherwise last-write-wins clobber
-                        // whatever we already captured.
-                        log(&format!(
-                            "Delta: dropping late migration response for {prefix} \
-                             (prefix already captured)"
-                        ));
-                        return;
-                    }
-                    log(&format!(
-                        "Delta: migrating state for site {prefix} from old key to new key"
-                    ));
+                    // Recency-aware capture: route this legacy generation's
+                    // state through `handle_site_state`, which adopts it
+                    // ONLY if it is strictly newer than what we already
+                    // hold (or we hold nothing yet). The previous
+                    // "first non-empty wins / drop late arrivals" logic let
+                    // an OLDER generation win purely by arriving first —
+                    // the "rolled back to April" data-loss bug. We do NOT
+                    // drop late responses and do NOT cancel sibling probes,
+                    // so a still-newer generation can also win.
                     let new_key = state::contract_key_from_prefix(&prefix);
-                    handle_site_state(new_key, &state_bytes);
-                    migrate_state_to_new_key(&prefix, &state_bytes);
-                    super::delegate::save_known_sites();
-                    finalize_prefix_capture(&prefix);
+                    if handle_site_state(new_key, &state_bytes) {
+                        log(&format!(
+                            "Delta: adopted newer generation for site {prefix}; \
+                             migrating it to the current contract key"
+                        ));
+                        migrate_state_to_new_key(&prefix, &state_bytes);
+                        super::delegate::save_known_sites();
+                    } else {
+                        log(&format!(
+                            "Delta: legacy generation for site {prefix} is not newer \
+                             than captured state; ignored"
+                        ));
+                    }
+                    // Initial capture has progressed for this prefix; a
+                    // subsequent current-key GET now flows through the
+                    // LiveUpdate path (still recency-guarded).
+                    MIGRATING_PREFIXES.with_mut(|set| {
+                        set.remove(&prefix);
+                    });
                 }
                 GetClassification::InitialCurrentKey { prefix } => {
                     if state_bytes.is_empty() {
@@ -206,20 +209,22 @@ fn handle_contract_response(response: ContractResponse) {
                         ));
                         return;
                     }
-                    log(&format!(
-                        "Delta: captured fresh state for site {prefix} from current contract key"
-                    ));
-                    handle_site_state(key, &state_bytes);
-                    finalize_prefix_capture(&prefix);
+                    if handle_site_state(key, &state_bytes) {
+                        log(&format!(
+                            "Delta: captured state for site {prefix} from current contract key"
+                        ));
+                    }
+                    // Do NOT cancel the legacy-generation probes: one of
+                    // them may hold a NEWER generation that must still be
+                    // able to win via the recency guard (self-heal for
+                    // users whose current key holds a stale generation from
+                    // a prior broken migration).
+                    MIGRATING_PREFIXES.with_mut(|set| {
+                        set.remove(&prefix);
+                    });
                     subscribe_to_site_by_id(&key.id().clone());
                 }
-                GetClassification::LiveUpdate => {
-                    if !state_bytes.is_empty() {
-                        handle_site_state(key, &state_bytes);
-                    }
-                    subscribe_to_site(&key);
-                }
-                GetClassification::Unknown => {
+                GetClassification::LiveUpdate | GetClassification::Unknown => {
                     if !state_bytes.is_empty() {
                         handle_site_state(key, &state_bytes);
                     }
@@ -278,17 +283,65 @@ fn handle_contract_response(response: ContractResponse) {
     }
 }
 
+/// Recency of a full site-state snapshot, used to pick the newest of two
+/// generations for the same site during migration/capture. Higher tuple =
+/// newer: `(max page updated_at, config version)`. `updated_at` is the
+/// primary signal because the reported data-loss symptom is page content
+/// "rolling back" to an older generation; config version is the tiebreak so
+/// a rename-only change (which bumps version but not any page timestamp) is
+/// still recognized as newer.
+fn state_recency(s: &SiteState) -> (u64, u32) {
+    let max_ts = s.pages.values().map(|p| p.updated_at).max().unwrap_or(0);
+    (max_ts, s.config.config.version)
+}
+
+/// Whether `incoming` should replace `existing`. A default/placeholder
+/// `existing` is always replaced (first capture); otherwise `incoming` must
+/// be strictly newer by [`state_recency`]. This is the guard that stops an
+/// OLDER generation's full state from clobbering a newer one — the
+/// "rolled back to April" migration bug.
+pub(crate) fn should_adopt_state(incoming: &SiteState, existing: &SiteState) -> bool {
+    if *existing == SiteState::default() {
+        return true;
+    }
+    state_recency(incoming) > state_recency(existing)
+}
+
+/// Combined tombstone + recency gate for adopting a migrated/received full
+/// state. Never resurrects a removed (tombstoned) site, and never lets an
+/// older generation overwrite a newer one. Pure so the multi-generation
+/// selection rule is unit-testable in isolation from the Dioxus signals.
+pub(crate) fn should_adopt_migrated_state(
+    prefix: &str,
+    incoming: &SiteState,
+    existing: Option<&SiteState>,
+    removed_prefixes: &[String],
+) -> bool {
+    if removed_prefixes.iter().any(|p| p == prefix) {
+        return false;
+    }
+    match existing {
+        None => true,
+        Some(cur) => should_adopt_state(incoming, cur),
+    }
+}
+
 /// Process a full site state received from GET or full state update.
-fn handle_site_state(key: ContractKey, state_bytes: &[u8]) {
+///
+/// Returns `true` iff the state was actually adopted (i.e. it was newer than
+/// what we held, or the site was previously empty/unknown). Callers use this
+/// to decide whether to PUT-migrate the state to the current contract key,
+/// so that only the NEWEST generation is persisted forward.
+fn handle_site_state(key: ContractKey, state_bytes: &[u8]) -> bool {
     if state_bytes.is_empty() {
-        return;
+        return false;
     }
 
     let site_state: SiteState = match from_reader(state_bytes) {
         Ok(s) => s,
         Err(e) => {
             log(&format!("Delta: failed to deserialize site state: {e}"));
-            return;
+            return false;
         }
     };
 
@@ -306,12 +359,20 @@ fn handle_site_state(key: ContractKey, state_bytes: &[u8]) {
         prefix_from_pubkey
     };
 
-    // Don't re-add sites the user explicitly removed
-    if state::REMOVED_PREFIXES.read().contains(&prefix) {
+    // Tombstone + recency gate. Blocks re-adding a removed site AND blocks
+    // an older generation from overwriting a newer one.
+    let removed_prefixes: Vec<String> = state::REMOVED_PREFIXES.read().clone();
+    let adopt = should_adopt_migrated_state(
+        &prefix,
+        &site_state,
+        state::SITES.read().get(&prefix).map(|s| &s.state),
+        &removed_prefixes,
+    );
+    if !adopt {
         log(&format!(
-            "Delta: blocked re-add of removed site {prefix} from network response"
+            "Delta: state for {prefix} ignored (removed, or not newer than captured state)"
         ));
-        return;
+        return false;
     }
 
     let mut sites = state::SITES.write();
@@ -352,6 +413,7 @@ fn handle_site_state(key: ContractKey, state_bytes: &[u8]) {
             });
         }
     }
+    true
 }
 
 /// Process a delta update for a site.
@@ -510,6 +572,39 @@ pub fn get_for_migration(old_key_b58: &str, prefix: &str) {
     });
 }
 
+/// The instance ID of the NEWEST legacy contract generation (the WASM hash
+/// immediately preceding the current one) for `prefix`, or `None` when the
+/// only legacy hash is the current key itself. `legacy_contracts.toml` is
+/// ordered oldest→newest, so the newest legacy hash is the last entry.
+fn newest_legacy_contract_id_for_prefix(prefix: &str, current_id_b58: &str) -> Option<String> {
+    LEGACY_CONTRACT_HASHES
+        .iter()
+        .rev()
+        .map(|hash| contract_id_for_prefix_with_hash(prefix, hash))
+        .find(|id| id != current_id_b58)
+}
+
+/// Self-heal probe: re-GET the NEWEST legacy contract generation for a site
+/// even when the delegate-stored `contract_key_b58` matches the current WASM
+/// (so the generic legacy sweep is skipped).
+///
+/// A prior BROKEN migration can leave a user's real current content stranded
+/// under the immediately-preceding contract generation while a stale/empty
+/// state sits under the current key AND the delegate-stored key already
+/// points at the current WASM. Such users would never re-probe the old
+/// generation and would be permanently "rolled back". Always re-probing the
+/// newest legacy generation, combined with the recency guard in
+/// `handle_site_state`, lets them self-heal on reload: if the old generation
+/// is newer it wins and is migrated forward; if it is not, it is ignored.
+pub fn fire_newest_legacy_contract_migration(prefix: &str, current_key_b58: &str) {
+    if let Some(newest) = newest_legacy_contract_id_for_prefix(prefix, current_key_b58) {
+        log(&format!(
+            "Delta: self-heal re-probing newest legacy contract generation for site {prefix}"
+        ));
+        get_for_migration(&newest, prefix);
+    }
+}
+
 /// Fire migration GETs for every historical contract WASM hash recorded
 /// in `legacy_contracts.toml`. Called for sites with a missing or stale
 /// `contract_key_b58` so that state stored under any past contract key
@@ -526,27 +621,6 @@ pub fn fire_legacy_contract_migrations(prefix: &str, current_key_b58: &str) {
     for old_b58 in legacy_ids {
         get_for_migration(&old_b58, prefix);
     }
-}
-
-/// Drop every pending migration entry whose target is `prefix`. Called
-/// after one migration GET resolves successfully, so that subsequent
-/// responses from probes for the same prefix (racing older contract
-/// hashes) can't overwrite the just-migrated state with stale data.
-/// Mark a prefix's initial capture as complete: cancel any remaining
-/// legacy-hash probes for it and remove it from `MIGRATING_PREFIXES`
-/// so that later responses take the `LiveUpdate` path and can't
-/// overwrite the captured state with stale data.
-fn finalize_prefix_capture(prefix: &str) {
-    clear_pending_migrations_for_prefix(prefix);
-    MIGRATING_PREFIXES.with_mut(|set| {
-        set.remove(prefix);
-    });
-}
-
-fn clear_pending_migrations_for_prefix(prefix: &str) {
-    PENDING_MIGRATIONS.with_mut(|pending| {
-        pending.retain(|_, p| p != prefix);
-    });
 }
 
 /// Migrate state from old contract to new contract key.
@@ -857,6 +931,139 @@ mod tests {
             "legacy-probe key derivation must match state::contract_key_from_prefix; \
              freenet-stdlib may have changed ContractKey::from_params_and_code"
         );
+    }
+
+    /// Build a `SiteState` with a given config version and a set of
+    /// `(page_id, updated_at)` pages. Signatures are placeholders — the
+    /// recency helpers only read `updated_at` and `config.version`, never
+    /// verify — so this keeps the multi-generation tests independent of the
+    /// signing machinery.
+    fn state_with(config_version: u32, pages: &[(delta_core::PageId, u64)]) -> SiteState {
+        let mut page_map = std::collections::BTreeMap::new();
+        for (id, ts) in pages {
+            page_map.insert(
+                *id,
+                delta_core::Page {
+                    title: "p".into(),
+                    content: "c".into(),
+                    updated_at: *ts,
+                    signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
+                    order: 0,
+                },
+            );
+        }
+        SiteState {
+            config: delta_core::SignedConfig {
+                config: delta_core::SiteConfig {
+                    version: config_version,
+                    name: "t".into(),
+                    description: String::new(),
+                },
+                signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
+            },
+            pages: page_map,
+            ..SiteState::default()
+        }
+    }
+
+    #[test]
+    fn migration_selects_newest_generation_and_honors_tombstones() {
+        // Bug 1 ("read rolled back to April"): migration must adopt the
+        // NEWEST generation of a site's state, not merely the first
+        // non-empty one to arrive. Model an old (April, V9) generation and
+        // the true-current (V10) generation of the same site.
+        let april = state_with(2, &[(1, 1_000)]); // older content
+        let current = state_with(3, &[(1, 5_000)]); // newer content
+
+        // Newest generation wins over the older one.
+        assert!(should_adopt_migrated_state(
+            "abcdef1234",
+            &current,
+            Some(&april),
+            &[]
+        ));
+        // The older generation must NOT overwrite the newer one — this is
+        // the exact regression: an April backup/generation arriving after
+        // the current one previously last-write-wins clobbered it.
+        assert!(!should_adopt_migrated_state(
+            "abcdef1234",
+            &april,
+            Some(&current),
+            &[]
+        ));
+        // First capture (nothing held yet, or only the empty placeholder)
+        // always adopts.
+        assert!(should_adopt_migrated_state("abcdef1234", &april, None, &[]));
+        assert!(should_adopt_migrated_state(
+            "abcdef1234",
+            &april,
+            Some(&SiteState::default()),
+            &[]
+        ));
+        // Identical recency is not re-adopted (avoids a needless re-PUT
+        // loop between sibling probes returning the same generation).
+        assert!(!should_adopt_migrated_state(
+            "abcdef1234",
+            &current,
+            Some(&current.clone()),
+            &[]
+        ));
+
+        // Honor tombstones: a removed site is never resurrected, even by a
+        // strictly-newer generation from a legacy delegate.
+        let removed = vec!["abcdef1234".to_string()];
+        assert!(!should_adopt_migrated_state(
+            "abcdef1234",
+            &current,
+            None,
+            &removed
+        ));
+        assert!(!should_adopt_migrated_state(
+            "abcdef1234",
+            &current,
+            Some(&april),
+            &removed
+        ));
+        // A different, non-removed prefix is unaffected.
+        assert!(should_adopt_migrated_state(
+            "zzzzzzzzzz",
+            &current,
+            Some(&april),
+            &removed
+        ));
+    }
+
+    #[test]
+    fn recency_prefers_higher_page_timestamp_then_config_version() {
+        // updated_at is the primary signal (the rollback symptom is page
+        // content reverting); config version is only the tiebreak.
+        let low_ts_high_ver = state_with(9, &[(1, 100)]);
+        let high_ts_low_ver = state_with(1, &[(1, 200)]);
+        assert!(should_adopt_state(&high_ts_low_ver, &low_ts_high_ver));
+        assert!(!should_adopt_state(&low_ts_high_ver, &high_ts_low_ver));
+
+        // Same max timestamp: higher config version (e.g. a rename) wins.
+        let renamed = state_with(4, &[(1, 100)]);
+        let unrenamed = state_with(3, &[(1, 100)]);
+        assert!(should_adopt_state(&renamed, &unrenamed));
+        assert!(!should_adopt_state(&unrenamed, &renamed));
+    }
+
+    #[test]
+    fn newest_legacy_contract_id_is_the_last_entry_and_excludes_current() {
+        // The self-heal re-probe must target the newest legacy generation
+        // (last entry in legacy_contracts.toml), and must never re-probe
+        // the current key itself.
+        let prefix = "abcdef1234";
+        let newest_hash = LEGACY_CONTRACT_HASHES.last().copied().unwrap();
+        let expected = contract_id_for_prefix_with_hash(prefix, &newest_hash);
+        let got = newest_legacy_contract_id_for_prefix(prefix, "some_other_current_key").unwrap();
+        assert_eq!(got, expected);
+
+        // If the newest legacy hash IS the current key, fall through to the
+        // next-newest rather than re-probing the current key.
+        let got2 = newest_legacy_contract_id_for_prefix(prefix, &expected);
+        assert_ne!(got2.as_deref(), Some(expected.as_str()));
     }
 
     #[test]

@@ -56,6 +56,12 @@ static OWNER_PREFIXES: GlobalSignal<Vec<String>> = GlobalSignal::new(Vec::new);
 /// deleted sites.
 static LEGACY_MIGRATION_FIRED: GlobalSignal<bool> = GlobalSignal::new(|| false);
 
+/// Owned prefixes for which we've already fired the per-prefix signing-key
+/// migration this session. Prevents re-probing every legacy delegate for the
+/// same prefix on each `KnownSites` response within one page load.
+static PER_PREFIX_KEY_MIGRATION_ATTEMPTED: GlobalSignal<std::collections::HashSet<String>> =
+    GlobalSignal::new(std::collections::HashSet::new);
+
 // Tombstones let us persist removed prefixes across refreshes WITHOUT
 // changing the delegate WASM schema — the delegate just stores/returns
 // the Vec<KnownSiteRecord> as-is; the UI interprets sentinel entries via
@@ -500,14 +506,21 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                         });
                     }
 
-                    if is_legacy && *CURRENT_SITES_LOADED.read() {
-                        // Current delegate is the source of truth. Ignore
-                        // legacy real records to respect site removals.
-                        log(&format!(
-                            "Delta: skipping {} legacy known site(s) (current is authoritative)",
-                            real_records.len()
-                        ));
-                    } else {
+                    // UNION of known sites across current + ALL legacy
+                    // delegates (Bug 1 / data-loss defense). We no longer
+                    // blanket-skip legacy real records when the current
+                    // delegate is authoritative: a site that lives ONLY in a
+                    // legacy delegate (created under an old delegate and never
+                    // migrated) must still be restored. `restore_known_sites`
+                    // self-filters `REMOVED_PREFIXES` (so a site the user
+                    // removed stays removed) and already-live prefixes (so a
+                    // stale legacy record can't clobber the live one), so the
+                    // union only ADDS sites the current delegate is missing —
+                    // it cannot resurrect a removed site. Tombstone
+                    // application is unchanged (see filter_applicable_tombstones):
+                    // legacy tombstones are still dropped once the current
+                    // delegate is authoritative.
+                    {
                         log(&format!(
                             "Delta: loaded {} known site(s) from delegate{}",
                             real_records.len(),
@@ -548,11 +561,11 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                         };
                         restore_known_sites(real_records);
                         // If legacy contributed ANY state — real records OR
-                        // tombstones — persist to the current delegate so
-                        // the merged view survives a refresh. Without this,
-                        // a legacy delegate holding ONLY tombstones would
-                        // leak those tombstones back out of REMOVED_PREFIXES
-                        // on next load and resurrect removed sites.
+                        // tombstones — persist the merged view to the current
+                        // delegate so it survives a refresh. Without this, a
+                        // legacy delegate holding ONLY tombstones would leak
+                        // those tombstones back out of REMOVED_PREFIXES on
+                        // next load and resurrect removed sites.
                         if is_legacy && (has_real || has_tombstones) {
                             save_known_sites();
                             *CURRENT_SITES_LOADED.write() = true;
@@ -560,9 +573,9 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                             // delegate. If the network GETs all fail (state
                             // GC'd, node offline, etc.), the delegate backup
                             // is the only remaining copy of the user's data.
-                            // handle_restored_site_state only overwrites
-                            // default (empty) state, so a successful network
-                            // GET always wins over a stale backup.
+                            // handle_restored_site_state is recency-guarded,
+                            // so a successful (newer) network GET always wins
+                            // over a stale backup regardless of arrival order.
                             for prefix in &legacy_prefixes {
                                 let req = delta_core::DelegateRequest::GetSiteState {
                                     prefix: prefix.clone(),
@@ -908,6 +921,14 @@ fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
             continue;
         }
 
+        // Bug 2 fix: for owned sites, rescue the per-site signing key from
+        // legacy delegates. Runs even if the site is already loaded (the
+        // site can be restored while its key is still stranded in a legacy
+        // delegate after a delegate WASM upgrade). Deduplicated per session.
+        if delta_core::is_site_owned(record.is_owner, &prefix, &OWNER_PREFIXES.read()) {
+            migrate_per_prefix_signing_key(&prefix);
+        }
+
         // Skip if already loaded (e.g. from hash route), but still fix owner role
         if state::SITES.read().contains_key(&prefix) {
             if delta_core::is_site_owned(record.is_owner, &prefix, &OWNER_PREFIXES.read()) {
@@ -969,17 +990,24 @@ fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
             }
         }
 
-        // Only fire the generic legacy-hash sweep when the stored
-        // contract key is either absent or demonstrably stale. In the
-        // steady state where the delegate-persisted
-        // `contract_key_b58` matches the current WASM, there is no
-        // release-era before the current one whose state could live
-        // on the network under this prefix — the site was created
-        // under the current contract WASM. Skipping the sweep avoids
-        // a startup thundering herd: N sites × M legacy hashes of
-        // redundant GETs that will all NotFound.
+        // Fire the generic legacy-hash sweep when the stored contract key
+        // is absent or demonstrably stale (state could live under any past
+        // generation). Otherwise fire only a single self-heal probe of the
+        // NEWEST legacy generation.
+        //
+        // The self-heal probe is Bug 1's fix for ALREADY-corrupted users: a
+        // prior broken migration can leave the real current content stranded
+        // under the immediately-preceding contract generation while the
+        // delegate-stored key already points at the current WASM (so the
+        // stale-key sweep never fires and the current key holds an older
+        // generation). Always re-probing the newest legacy generation, plus
+        // the recency guard in `handle_site_state`, lets them recover on
+        // reload. It is a single extra GET per site (not the N×M sweep), so
+        // it avoids a startup thundering herd.
         if old_key_b58.is_none() || stored_key_is_stale {
             super::operations::fire_legacy_contract_migrations(&prefix, &new_key_b58);
+        } else {
+            super::operations::fire_newest_legacy_contract_migration(&prefix, &new_key_b58);
         }
     }
 
@@ -1056,6 +1084,63 @@ fn fire_legacy_migration() {
     }
 }
 
+/// The delegate request that rescues an owned site's per-SITE signing key
+/// from a legacy delegate. Pure so the "migration actually asks for the
+/// per-prefix key" invariant is unit-testable.
+///
+/// Bug 2 was that the legacy-migration path only ever sent prefix-BLIND
+/// `GetPublicKey` / `GetSigningKey`, which read the legacy single-key slot
+/// (`delta:signing_key`) and never a per-prefix key
+/// (`delta:signing_key:{prefix}`). Sites created under delegate V6+
+/// (~2026-04-09+) store their key per-prefix only, so their key was never
+/// migrated after a delegate WASM upgrade and `SignPage` failed with "no
+/// signing key stored".
+fn per_prefix_key_migration_request(prefix: &str) -> delta_core::DelegateRequest {
+    delta_core::DelegateRequest::GetSigningKeyForPrefix {
+        prefix: prefix.to_string(),
+    }
+}
+
+/// Rescue an owned site's per-site signing key from legacy delegates (Bug 2).
+///
+/// Sends `GetSigningKeyForPrefix{prefix}` to every legacy delegate. Only V7+
+/// delegate WASMs can deserialize that variant; older ones simply error the
+/// probe (harmless — they had no per-prefix storage). The `SigningKey`
+/// response handler derives the prefix from the returned key and re-stores it
+/// under the CURRENT delegate via `store_signing_key`, so a subsequent
+/// `SignPage` routes to the current delegate and succeeds.
+///
+/// Deduplicated per session so we don't re-probe every legacy delegate for
+/// the same prefix on each `KnownSites` response.
+fn migrate_per_prefix_signing_key(prefix: &str) {
+    if PER_PREFIX_KEY_MIGRATION_ATTEMPTED.read().contains(prefix) {
+        return;
+    }
+    PER_PREFIX_KEY_MIGRATION_ATTEMPTED.with_mut(|s| {
+        s.insert(prefix.to_string());
+    });
+
+    #[cfg(target_arch = "wasm32")]
+    {
+        if LEGACY_DELEGATES.is_empty() {
+            return;
+        }
+        let request = per_prefix_key_migration_request(prefix);
+        for (key_bytes, code_hash_bytes) in LEGACY_DELEGATES.iter() {
+            let legacy_delegate_key = DelegateKey::new(*key_bytes, CodeHash::new(*code_hash_bytes));
+            send_to_delegate_key(&request, legacy_delegate_key);
+        }
+        log(&format!(
+            "Delta: probing {} legacy delegate(s) for the per-site signing key of {prefix}",
+            LEGACY_DELEGATES.len()
+        ));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = per_prefix_key_migration_request(prefix);
+    }
+}
+
 /// Back up a site's state to the delegate for resilience against network drops.
 pub fn backup_site_state(prefix: &str, site_state: &delta_core::SiteState) {
     let mut state_bytes = Vec::new();
@@ -1104,7 +1189,12 @@ fn handle_restored_site_state(prefix: &str, state_bytes: &[u8]) {
 
     let mut sites = state::SITES.write();
     if let Some(site) = sites.get_mut(prefix) {
-        if site.state == delta_core::SiteState::default() {
+        // Recency-guarded: adopt the backup only if the site is still empty
+        // OR the backup is strictly newer than what we hold. This stops a
+        // stale delegate backup (e.g. an old April generation) from
+        // clobbering a newer generation we already captured from the
+        // network, regardless of which arrives first.
+        if super::operations::should_adopt_state(&site_state, &site.state) {
             log(&format!(
                 "Delta: restoring site {prefix} from backup ({} pages)",
                 site_state.pages.len()
@@ -1192,6 +1282,27 @@ mod tests {
         assert_ne!(n1, [0u8; 24], "nonce must not be all-zero");
         assert_ne!(c1, c2, "two generations must differ (CSPRNG)");
         assert_ne!(n1, n2, "two generations must differ (CSPRNG)");
+    }
+
+    #[test]
+    fn per_prefix_key_migration_asks_for_the_prefix_specific_key() {
+        // Bug 2 regression guard. The migration MUST ask each legacy
+        // delegate for the per-PREFIX signing key. The pre-fix path only
+        // ever sent prefix-blind GetPublicKey / GetSigningKey, which read
+        // `delta:signing_key` (the legacy single-key slot) and never
+        // `delta:signing_key:{prefix}` — so keys for sites created under
+        // delegate V6+ were never migrated and edits failed with "no
+        // signing key stored". If this ever regresses to a prefix-blind
+        // request, per-prefix keys silently stop migrating again.
+        let req = per_prefix_key_migration_request("abcdef1234");
+        match req {
+            delta_core::DelegateRequest::GetSigningKeyForPrefix { prefix } => {
+                assert_eq!(prefix, "abcdef1234");
+            }
+            other => {
+                panic!("per-prefix key migration must send GetSigningKeyForPrefix, got {other:?}")
+            }
+        }
     }
 
     #[test]

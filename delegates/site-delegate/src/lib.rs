@@ -278,6 +278,35 @@ mod tests {
     }
 
     #[test]
+    fn per_prefix_only_key_is_missed_by_blind_probe_but_found_by_prefix_probe() {
+        // End-to-end reproduction of Bug 2 at the delegate boundary. A site
+        // created under delegate V6+ stores its signing key ONLY in the
+        // per-prefix slot `delta:signing_key:{prefix}`; the legacy
+        // single-key slot `delta:signing_key` is empty.
+        let sk_bytes = vec![7u8; 32];
+        let sk = SigningKey::from_bytes(&<[u8; 32]>::try_from(sk_bytes.as_slice()).unwrap());
+        let prefix = delta_core::pubkey_to_prefix(&sk.verifying_key());
+        let store = store(&[(signing_key_for_prefix(&prefix).as_str(), sk_bytes.clone())]);
+
+        // The OLD migration path probed prefix-blind (prefix = None), which
+        // reads only the legacy single-key slot -> finds nothing. This is
+        // exactly why the key was never migrated and SignPage later failed.
+        assert_eq!(
+            select_key_bytes(None, |name| store.get(name).cloned()),
+            None,
+            "prefix-blind probe must miss a per-prefix-only key (the bug)"
+        );
+
+        // The FIX asks by prefix (GetSigningKeyForPrefix / SignPage{prefix}),
+        // which finds the key so it can be migrated forward and used to sign.
+        assert_eq!(
+            select_key_bytes(Some(&prefix), |name| store.get(name).cloned()),
+            Some(sk_bytes),
+            "prefix-aware probe must recover the per-prefix key"
+        );
+    }
+
+    #[test]
     fn returns_none_when_nothing_stored() {
         let empty: HashMap<String, Vec<u8>> = HashMap::new();
         assert_eq!(
