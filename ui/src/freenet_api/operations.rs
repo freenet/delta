@@ -313,7 +313,12 @@ pub(crate) fn reconcile_into(existing: &mut SiteState, incoming: &SiteState) -> 
         return false; // nothing real to adopt
     }
     if *existing == SiteState::default() {
-        *existing = incoming.clone(); // first capture
+        // First capture. TODO(follow-up): this adopts `incoming` without a
+        // signature check (pre-existing behavior — the old `handle_site_state`
+        // never verified either). Consider verifying `incoming.verify(&params)`
+        // here too so a corrupt/forged first state can't seed a placeholder.
+        // Left as a separate change per review (not part of these fixes).
+        *existing = incoming.clone();
         return true;
     }
     // Never blend two different owners (a prefix collision, or an incoming
