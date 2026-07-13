@@ -168,32 +168,39 @@ fn handle_contract_response(response: ContractResponse) {
                         ));
                         return;
                     }
-                    // Recency-aware capture: route this legacy generation's
-                    // state through `handle_site_state`, which adopts it
-                    // ONLY if it is strictly newer than what we already
-                    // hold (or we hold nothing yet). The previous
-                    // "first non-empty wins / drop late arrivals" logic let
-                    // an OLDER generation win purely by arriving first —
-                    // the "rolled back to April" data-loss bug. We do NOT
-                    // drop late responses and do NOT cancel sibling probes,
-                    // so a still-newer generation can also win.
+                    // Reconcile this legacy generation into local state via a
+                    // tombstone-aware merge (see `reconcile_into`): only genuinely
+                    // new data is adopted, deletions on either side are preserved,
+                    // and an older/dominated generation is a no-op. We do NOT drop
+                    // late responses and do NOT cancel sibling probes, so a
+                    // still-newer generation can also contribute. If the merge
+                    // changed anything, PUT the RECONCILED local state (not the raw
+                    // incoming bytes) forward to the current contract key so a
+                    // deletion the merge preserved isn't undone on the current key.
                     let new_key = state::contract_key_from_prefix(&prefix);
                     if handle_site_state(new_key, &state_bytes) {
                         log(&format!(
-                            "Delta: adopted newer generation for site {prefix}; \
-                             migrating it to the current contract key"
+                            "Delta: merged newer data for site {prefix}; \
+                             migrating reconciled state to the current contract key"
                         ));
-                        migrate_state_to_new_key(&prefix, &state_bytes);
+                        if let Some(merged) =
+                            state::SITES.read().get(&prefix).map(|s| s.state.clone())
+                        {
+                            let params = delta_core::SiteParameters {
+                                prefix: prefix.clone(),
+                            };
+                            put_site(&params, &merged);
+                        }
                         super::delegate::save_known_sites();
                     } else {
                         log(&format!(
-                            "Delta: legacy generation for site {prefix} is not newer \
-                             than captured state; ignored"
+                            "Delta: legacy generation for site {prefix} added no new \
+                             data (dominated by current); ignored"
                         ));
                     }
                     // Initial capture has progressed for this prefix; a
                     // subsequent current-key GET now flows through the
-                    // LiveUpdate path (still recency-guarded).
+                    // LiveUpdate path (still merge-guarded).
                     MIGRATING_PREFIXES.with_mut(|set| {
                         set.remove(&prefix);
                     });
@@ -283,55 +290,54 @@ fn handle_contract_response(response: ContractResponse) {
     }
 }
 
-/// Recency of a full site-state snapshot, used to pick the newest of two
-/// generations for the same site during migration/capture. Higher tuple =
-/// newer: `(max page updated_at, config version)`. `updated_at` is the
-/// primary signal because the reported data-loss symptom is page content
-/// "rolling back" to an older generation; config version is the tiebreak so
-/// a rename-only change (which bumps version but not any page timestamp) is
-/// still recognized as newer.
-fn state_recency(s: &SiteState) -> (u64, u32) {
-    let max_ts = s.pages.values().map(|p| p.updated_at).max().unwrap_or(0);
-    (max_ts, s.config.config.version)
-}
-
-/// Whether `incoming` should replace `existing`. A default/placeholder
-/// `existing` is always replaced (first capture); otherwise `incoming` must
-/// be strictly newer by [`state_recency`]. This is the guard that stops an
-/// OLDER generation's full state from clobbering a newer one — the
-/// "rolled back to April" migration bug.
-pub(crate) fn should_adopt_state(incoming: &SiteState, existing: &SiteState) -> bool {
+/// Reconcile an incoming full state into `existing` WITHOUT losing data.
+///
+/// This replaces the earlier scalar-"recency" wholesale replace, which was
+/// itself a data-loss bug of the SAME class as the incident: deleting the
+/// newest page REMOVES it from `pages`, which LOWERS `max(updated_at)`, so a
+/// pre-deletion snapshot out-ranked the true post-deletion state and the
+/// self-heal probe resurrected the deleted page. Instead we use delta-core's
+/// commutative, tombstone-aware [`SiteState::merge`] — the SAME merge the
+/// contract applies — which honors `deleted_pages` on BOTH sides and keeps
+/// the newer of each page by `updated_at`. A delete can therefore never be
+/// lost, regardless of which generation arrives or in what order.
+///
+/// First capture (existing is the empty placeholder) adopts `incoming`
+/// wholesale: there is nothing to merge into, and the old code accepted the
+/// first state without a signature check, so we preserve that. For a
+/// non-empty existing state we merge, which verifies `incoming` against the
+/// site params and rejects a state that fails verification (keeping what we
+/// have). Returns whether `existing` changed.
+pub(crate) fn reconcile_into(existing: &mut SiteState, incoming: &SiteState) -> bool {
+    if *incoming == SiteState::default() {
+        return false; // nothing real to adopt
+    }
     if *existing == SiteState::default() {
+        *existing = incoming.clone(); // first capture
         return true;
     }
-    state_recency(incoming) > state_recency(existing)
-}
-
-/// Combined tombstone + recency gate for adopting a migrated/received full
-/// state. Never resurrects a removed (tombstoned) site, and never lets an
-/// older generation overwrite a newer one. Pure so the multi-generation
-/// selection rule is unit-testable in isolation from the Dioxus signals.
-pub(crate) fn should_adopt_migrated_state(
-    prefix: &str,
-    incoming: &SiteState,
-    existing: Option<&SiteState>,
-    removed_prefixes: &[String],
-) -> bool {
-    if removed_prefixes.iter().any(|p| p == prefix) {
+    // Never blend two different owners (a prefix collision, or an incoming
+    // state resolved to this entry via a contract key): merging would corrupt
+    // both sites. The merge below also rejects an owner/params mismatch, but
+    // guard explicitly so the intent is clear.
+    if existing.owner != incoming.owner {
         return false;
     }
-    match existing {
-        None => true,
-        Some(cur) => should_adopt_state(incoming, cur),
+    let params = delta_core::SiteParameters::from_owner(&incoming.owner);
+    let before = existing.clone();
+    if existing.merge(&params, incoming).is_err() {
+        // incoming failed verification — keep what we have.
+        return false;
     }
+    *existing != before
 }
 
 /// Process a full site state received from GET or full state update.
 ///
-/// Returns `true` iff the state was actually adopted (i.e. it was newer than
-/// what we held, or the site was previously empty/unknown). Callers use this
-/// to decide whether to PUT-migrate the state to the current contract key,
-/// so that only the NEWEST generation is persisted forward.
+/// Returns `true` iff local state actually changed (new pages, a newer
+/// config, or a newly-applied deletion). Callers use this to decide whether
+/// to PUT the reconciled state forward to the current contract key, so an
+/// unchanged (dominated) generation triggers no write.
 fn handle_site_state(key: ContractKey, state_bytes: &[u8]) -> bool {
     if state_bytes.is_empty() {
         return false;
@@ -359,44 +365,50 @@ fn handle_site_state(key: ContractKey, state_bytes: &[u8]) -> bool {
         prefix_from_pubkey
     };
 
-    // Tombstone + recency gate. Blocks re-adding a removed site AND blocks
-    // an older generation from overwriting a newer one.
-    let removed_prefixes: Vec<String> = state::REMOVED_PREFIXES.read().clone();
-    let adopt = should_adopt_migrated_state(
-        &prefix,
-        &site_state,
-        state::SITES.read().get(&prefix).map(|s| &s.state),
-        &removed_prefixes,
-    );
-    if !adopt {
+    // Don't re-add sites the user explicitly removed.
+    if state::REMOVED_PREFIXES.read().contains(&prefix) {
         log(&format!(
-            "Delta: state for {prefix} ignored (removed, or not newer than captured state)"
+            "Delta: blocked re-add of removed site {prefix} from network response"
         ));
         return false;
     }
 
-    let mut sites = state::SITES.write();
-    if let Some(existing) = sites.get_mut(&prefix) {
-        existing.state = site_state;
-        existing.name = name;
-        existing.owner_pubkey = owner_pubkey;
-        if existing.contract_key.is_none() {
-            existing.contract_key = Some(key);
+    let changed = {
+        let mut sites = state::SITES.write();
+        if let Some(existing) = sites.get_mut(&prefix) {
+            // Tombstone-aware merge: an older generation / stale backup can
+            // never overwrite newer data, and a deletion is never lost.
+            let c = reconcile_into(&mut existing.state, &site_state);
+            if c {
+                existing.name = existing.state.config.config.name.clone();
+                existing.owner_pubkey = existing.state.owner.to_bytes();
+                if existing.contract_key.is_none() {
+                    existing.contract_key = Some(key);
+                }
+            }
+            c
+        } else {
+            sites.insert(
+                prefix.clone(),
+                KnownSite {
+                    name,
+                    prefix: prefix.clone(),
+                    role: SiteRole::Visitor,
+                    state: site_state,
+                    owner_pubkey,
+                    contract_key: Some(key),
+                },
+            );
+            true
         }
-    } else {
-        sites.insert(
-            prefix.clone(),
-            KnownSite {
-                name,
-                prefix: prefix.clone(),
-                role: SiteRole::Visitor,
-                state: site_state,
-                owner_pubkey,
-                contract_key: Some(key),
-            },
-        );
+    };
+
+    if !changed {
+        log(&format!(
+            "Delta: state for {prefix} had no new data after merge; keeping current"
+        ));
+        return false;
     }
-    drop(sites);
 
     // Back up state to delegate for resilience
     if let Some(site) = state::SITES.read().get(&prefix) {
@@ -621,42 +633,6 @@ pub fn fire_legacy_contract_migrations(prefix: &str, current_key_b58: &str) {
     for old_b58 in legacy_ids {
         get_for_migration(&old_b58, prefix);
     }
-}
-
-/// Migrate state from old contract to new contract key.
-/// PUTs the raw state bytes with the new WASM + params.
-fn migrate_state_to_new_key(prefix: &str, state_bytes: &[u8]) {
-    let params = delta_core::SiteParameters {
-        prefix: prefix.to_string(),
-    };
-    let mut params_buf = Vec::new();
-    ciborium::ser::into_writer(&params, &mut params_buf).expect("CBOR params");
-
-    let state_buf = state_bytes.to_vec();
-
-    log(&format!(
-        "Delta: PUT migrated state ({} bytes) to new contract for site {prefix}",
-        state_buf.len()
-    ));
-
-    send(move |api| {
-        Box::pin(async move {
-            let contract_code = ContractCode::from(SITE_CONTRACT_WASM);
-            let contract_container = ContractContainer::from(ContractWasmAPIVersion::V1(
-                WrappedContract::new(Arc::new(contract_code), Parameters::from(params_buf)),
-            ));
-            let wrapped_state = WrappedState::new(state_buf);
-
-            let request = ClientRequest::ContractOp(ContractRequest::Put {
-                contract: contract_container,
-                state: wrapped_state,
-                related_contracts: Default::default(),
-                subscribe: true,
-                blocking_subscribe: false,
-            });
-            api.send(request).await
-        })
-    });
 }
 
 /// PUT (create) a site contract with full state.
@@ -933,120 +909,99 @@ mod tests {
         );
     }
 
-    /// Build a `SiteState` with a given config version and a set of
-    /// `(page_id, updated_at)` pages. Signatures are placeholders — the
-    /// recency helpers only read `updated_at` and `config.version`, never
-    /// verify — so this keeps the multi-generation tests independent of the
-    /// signing machinery.
-    fn state_with(config_version: u32, pages: &[(delta_core::PageId, u64)]) -> SiteState {
-        let mut page_map = std::collections::BTreeMap::new();
-        for (id, ts) in pages {
-            page_map.insert(
-                *id,
-                delta_core::Page {
-                    title: "p".into(),
-                    content: "c".into(),
-                    updated_at: *ts,
-                    signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
-                    order: 0,
-                },
-            );
+    fn key(seed: u8) -> ed25519_dalek::SigningKey {
+        ed25519_dalek::SigningKey::from_bytes(&[seed; 32])
+    }
+
+    /// Build a real, fully-signed `SiteState` with the given pages
+    /// (`(page_id, content, updated_at)`). Real signatures are required
+    /// because `reconcile_into`'s merge verifies the incoming state.
+    fn signed_state(owner: &ed25519_dalek::SigningKey, pages: &[(u64, &str, u64)]) -> SiteState {
+        let mut s = SiteState::new(delta_core::SiteConfig::default(), owner);
+        for (id, content, ts) in pages {
+            let p = delta_core::Page::new(*id, "t".into(), content.to_string(), *ts, owner);
+            s.upsert_page(*id, p, &owner.verifying_key()).unwrap();
         }
-        SiteState {
-            config: delta_core::SignedConfig {
-                config: delta_core::SiteConfig {
-                    version: config_version,
-                    name: "t".into(),
-                    description: String::new(),
-                },
-                signature: ed25519_dalek::Signature::from_bytes(&[0u8; 64]),
-            },
-            pages: page_map,
-            ..SiteState::default()
-        }
+        s
     }
 
     #[test]
-    fn migration_selects_newest_generation_and_honors_tombstones() {
-        // Bug 1 ("read rolled back to April"): migration must adopt the
-        // NEWEST generation of a site's state, not merely the first
-        // non-empty one to arrive. Model an old (April, V9) generation and
-        // the true-current (V10) generation of the same site.
-        let april = state_with(2, &[(1, 1_000)]); // older content
-        let current = state_with(3, &[(1, 5_000)]); // newer content
+    fn reconcile_adopts_newer_content_but_not_older() {
+        // Bug 1 ("read rolled back to April"): the newer generation's content
+        // must win, and an OLDER generation must NOT clobber it — regardless
+        // of arrival order.
+        let owner = key(1);
+        let older = signed_state(&owner, &[(1, "april", 1_000)]);
+        let newer = signed_state(&owner, &[(1, "current", 5_000)]);
 
-        // Newest generation wins over the older one.
-        assert!(should_adopt_migrated_state(
-            "abcdef1234",
-            &current,
-            Some(&april),
-            &[]
-        ));
-        // The older generation must NOT overwrite the newer one — this is
-        // the exact regression: an April backup/generation arriving after
-        // the current one previously last-write-wins clobbered it.
-        assert!(!should_adopt_migrated_state(
-            "abcdef1234",
-            &april,
-            Some(&current),
-            &[]
-        ));
-        // First capture (nothing held yet, or only the empty placeholder)
-        // always adopts.
-        assert!(should_adopt_migrated_state("abcdef1234", &april, None, &[]));
-        assert!(should_adopt_migrated_state(
-            "abcdef1234",
-            &april,
-            Some(&SiteState::default()),
-            &[]
-        ));
-        // Identical recency is not re-adopted (avoids a needless re-PUT
-        // loop between sibling probes returning the same generation).
-        assert!(!should_adopt_migrated_state(
-            "abcdef1234",
-            &current,
-            Some(&current.clone()),
-            &[]
-        ));
+        // Older-then-newer: newer wins and the state changes.
+        let mut s = older.clone();
+        assert!(reconcile_into(&mut s, &newer));
+        assert_eq!(s.pages[&1].content, "current");
 
-        // Honor tombstones: a removed site is never resurrected, even by a
-        // strictly-newer generation from a legacy delegate.
-        let removed = vec!["abcdef1234".to_string()];
-        assert!(!should_adopt_migrated_state(
-            "abcdef1234",
-            &current,
-            None,
-            &removed
-        ));
-        assert!(!should_adopt_migrated_state(
-            "abcdef1234",
-            &current,
-            Some(&april),
-            &removed
-        ));
-        // A different, non-removed prefix is unaffected.
-        assert!(should_adopt_migrated_state(
-            "zzzzzzzzzz",
-            &current,
-            Some(&april),
-            &removed
-        ));
+        // Newer-then-older: the older generation adds nothing (no clobber).
+        let mut s = newer.clone();
+        assert!(!reconcile_into(&mut s, &older));
+        assert_eq!(s.pages[&1].content, "current");
     }
 
     #[test]
-    fn recency_prefers_higher_page_timestamp_then_config_version() {
-        // updated_at is the primary signal (the rollback symptom is page
-        // content reverting); config version is only the tiebreak.
-        let low_ts_high_ver = state_with(9, &[(1, 100)]);
-        let high_ts_low_ver = state_with(1, &[(1, 200)]);
-        assert!(should_adopt_state(&high_ts_low_ver, &low_ts_high_ver));
-        assert!(!should_adopt_state(&low_ts_high_ver, &high_ts_low_ver));
+    fn reconcile_preserves_deletion_of_newest_page() {
+        // MUST-FIX (review): deleting the NEWEST page lowers max(updated_at),
+        // so a scalar-recency wholesale replace would let a pre-deletion
+        // snapshot out-rank (and resurrect) the true post-deletion state.
+        // The tombstone-aware merge must keep the deletion in BOTH orders.
+        let owner = key(2);
+        let mut pre_delete = signed_state(&owner, &[(1, "home", 100), (2, "newest", 200)]);
+        // Post-delete state: page 2 (the newest) deleted, leaving page 1.
+        let mut post_delete = pre_delete.clone();
+        let deletion = delta_core::SignedPageDeletion::new(2, 300, &owner);
+        post_delete
+            .delete_page(&deletion, &owner.verifying_key())
+            .unwrap();
 
-        // Same max timestamp: higher config version (e.g. a rename) wins.
-        let renamed = state_with(4, &[(1, 100)]);
-        let unrenamed = state_with(3, &[(1, 100)]);
-        assert!(should_adopt_state(&renamed, &unrenamed));
-        assert!(!should_adopt_state(&unrenamed, &renamed));
+        // pre-delete state reconciled INTO post-delete: page 2 stays deleted.
+        let mut s = post_delete.clone();
+        assert!(
+            !reconcile_into(&mut s, &pre_delete),
+            "resurrecting a deleted page must be a no-op"
+        );
+        assert!(!s.pages.contains_key(&2), "deleted page must not reappear");
+
+        // Reverse order (post-delete reconciled INTO pre-delete): the delete
+        // propagates and page 2 is removed.
+        assert!(reconcile_into(&mut pre_delete, &post_delete));
+        assert!(
+            !pre_delete.pages.contains_key(&2),
+            "delete must propagate through merge"
+        );
+    }
+
+    #[test]
+    fn reconcile_first_capture_and_empty() {
+        let owner = key(3);
+        let real = signed_state(&owner, &[(1, "x", 100)]);
+
+        // First capture: empty placeholder adopts the incoming wholesale.
+        let mut s = SiteState::default();
+        assert!(reconcile_into(&mut s, &real));
+        assert_eq!(s.pages[&1].content, "x");
+
+        // An empty incoming never changes a non-empty state.
+        let mut s = real.clone();
+        assert!(!reconcile_into(&mut s, &SiteState::default()));
+    }
+
+    #[test]
+    fn reconcile_rejects_different_owner() {
+        // Two different owners must never be blended (prefix collision / a
+        // contract-key-resolved mismatch) — that would corrupt both sites.
+        let owner_a = key(4);
+        let owner_b = key(5);
+        let mut a = signed_state(&owner_a, &[(1, "a", 100)]);
+        let b = signed_state(&owner_b, &[(1, "b", 999)]);
+        assert!(!reconcile_into(&mut a, &b));
+        assert_eq!(a.pages[&1].content, "a");
     }
 
     #[test]

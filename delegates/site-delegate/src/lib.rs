@@ -307,6 +307,39 @@ mod tests {
     }
 
     #[test]
+    fn v6_v7_style_delegate_signs_with_per_prefix_key_only() {
+        // MUST-FIX cohort (review): a V6/V7 delegate holds a per-prefix key
+        // but predates GetSigningKeyForPrefix, so the key can't be discovered/
+        // migrated. It CAN still sign: a SignPage{prefix} loads the key via
+        // `load_signing_key(Some(prefix))` == `select_key_bytes(Some(prefix))`,
+        // which finds the per-prefix key even with an EMPTY legacy single
+        // slot. This is exactly what the UI's SignPage-to-legacy broadcast
+        // fallback relies on to make a V6/V7-stranded key usable. Here we
+        // recover the key the way the sign path does and confirm it produces
+        // a page that verifies against the site owner.
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let prefix = delta_core::pubkey_to_prefix(&sk.verifying_key());
+        // Only a per-prefix key is stored; the legacy single slot is empty.
+        let store = store(&[(
+            signing_key_for_prefix(&prefix).as_str(),
+            sk.to_bytes().to_vec(),
+        )]);
+
+        // The sign path (prefix-aware) recovers the key...
+        let key_bytes = select_key_bytes(Some(&prefix), |n| store.get(n).cloned())
+            .expect("per-prefix key must be recoverable when signing");
+        let recovered = parse_signing_key(&key_bytes).unwrap();
+        let page = Page::new_with_order(1, "Home".into(), "hello".into(), 100, 0, &recovered);
+        page.verify(1, &sk.verifying_key())
+            .expect("page signed by the recovered per-prefix key must verify against the owner");
+
+        // ...while prefix-BLIND discovery (what key migration uses) misses it,
+        // which is precisely why the key is stranded and the sign-time
+        // fallback is needed.
+        assert!(select_key_bytes(None, |n| store.get(n).cloned()).is_none());
+    }
+
+    #[test]
     fn returns_none_when_nothing_stored() {
         let empty: HashMap<String, Vec<u8>> = HashMap::new();
         assert_eq!(
