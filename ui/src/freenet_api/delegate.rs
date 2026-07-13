@@ -630,31 +630,73 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
     }
 }
 
+/// Among the site prefixes the user has an OUTSTANDING signing request for on
+/// `page_id`, return the first whose owner the signed object verifies against.
+/// `verifies_against_owner_of(prefix)` reports whether the object's signature
+/// checks out against that site's owner key.
+///
+/// Constraining to REQUESTED prefixes (rather than "any known owner") is the
+/// fix for broadcast cross-site mis-signing: `send_signing_request` may
+/// broadcast a `SignPage`/`SignPageDeletion` for site A to every legacy
+/// delegate. A legacy delegate that lacks A's per-prefix key falls back to its
+/// legacy single slot and signs A's content with a DIFFERENT site B's key,
+/// producing an object that verifies against B. Applying it to B would corrupt
+/// a site the user never touched. B is not among the sites the user requested
+/// a signature for, so it is dropped. This keeps the request↔response
+/// robustness of verification-based routing (concurrent requests, site
+/// switches, out-of-order responses) while refusing to apply a signature to a
+/// site that was not the target.
+fn resolve_requested_owner(
+    requested: &[String],
+    verifies_against_owner_of: impl Fn(&str) -> bool,
+) -> Option<String> {
+    requested
+        .iter()
+        .find(|p| verifies_against_owner_of(p))
+        .cloned()
+}
+
+/// The site prefixes with an outstanding signing request for `page_id`.
+fn requested_prefixes_for_page(page_id: PageId) -> Vec<String> {
+    PENDING_UPDATES
+        .read()
+        .keys()
+        .filter(|(_, pid)| *pid == page_id)
+        .map(|(prefix, _)| prefix.clone())
+        .collect()
+}
+
 /// After receiving a signed page from the delegate, update local state and send to network.
 ///
-/// The previous implementation correlated request-to-response via
-/// `PENDING_UPDATES` keyed by `(CURRENT_SITE, page_id)`, which had two
-/// failure modes the skeptical review on PR #17 turned up:
-/// 1. Two in-flight requests for the same `(prefix, page_id)` shared
-///    a single map entry; the first response removed it, the second
-///    response silently dropped its UPDATE on the floor (this is the
-///    exact "looks correct locally, undone on refresh" symptom we
-///    just fixed for `swap_page_order`).
-/// 2. `find_pending_key` read `CURRENT_SITE`, so if the user switched
-///    sites between request and response the late-arriving signed
-///    page would be inserted into the *wrong site's* local state and
-///    the network UPDATE for the original site would be dropped.
-///
-/// Routing now derives the owning site from the page signature
-/// itself: every `Page::verify` checks against an owner pubkey, and
-/// only the owner who actually signed it will verify. This is robust
-/// to multiple in-flight requests, site switches, and out-of-order
-/// responses without requiring a delegate WASM change.
+/// Routing derives the owning site from the page signature — but ONLY among
+/// the sites the user actually requested a signature for on this page_id (see
+/// `resolve_requested_owner`), so a broadcast-signed page that verifies against
+/// an unrelated site's key cannot be misapplied to it. This preserves the
+/// robustness of verification-based routing (multiple in-flight requests, site
+/// switches, out-of-order responses) without a delegate WASM change.
 fn handle_signed_page(page_id: PageId, page: delta_core::Page) {
-    let Some((prefix, contract_key)) = find_owner_for_signed_page(&page, page_id) else {
+    let requested = requested_prefixes_for_page(page_id);
+    let matched = {
+        let sites = state::SITES.read();
+        resolve_requested_owner(&requested, |prefix| {
+            sites
+                .get(prefix)
+                .map(|s| page.verify(page_id, &s.state.owner).is_ok())
+                .unwrap_or(false)
+        })
+    };
+    let Some(prefix) = matched else {
         log(&format!(
-            "Delta: signed page {page_id} doesn't verify against any known owner — dropping"
+            "Delta: signed page {page_id} doesn't verify against any REQUESTED owner — \
+             dropping (guards against cross-site broadcast mis-sign)"
         ));
+        return;
+    };
+    let Some(contract_key) = state::SITES
+        .read()
+        .get(&prefix)
+        .and_then(|s| s.contract_key)
+    else {
         return;
     };
 
@@ -697,17 +739,33 @@ fn handle_signed_page(page_id: PageId, page: delta_core::Page) {
     };
     super::operations::update_site(&contract_key, &delta);
 
-    // Best-effort cleanup of the legacy correlation map. No longer
-    // load-bearing for routing — see fn doc-comment.
-    PENDING_UPDATES.write().remove(&(prefix, page_id));
+    // NOTE: we deliberately do NOT remove the (prefix, page_id) entry from
+    // PENDING_UPDATES here. It is the correlation source that constrains
+    // routing (above), and a broadcast produces multiple responses per
+    // request; eagerly removing it would drop a concurrent second edit of the
+    // same page (the #17 regression). The map is keyed by (prefix, page_id),
+    // so re-editing a page overwrites rather than grows it.
 }
 
 /// After receiving a signed config, update local state and send to network.
-/// See `handle_signed_page`'s doc-comment for why routing is via
-/// signature verification rather than `CURRENT_SITE` / `PENDING_CONFIG`.
+///
+/// Constrained to the site whose config-signature was actually REQUESTED
+/// (tracked by contract key in `PENDING_CONFIG`), so a broadcast-signed config
+/// that verifies against an unrelated site's key can't be misapplied to it.
 fn handle_signed_config(signed_config: delta_core::SignedConfig) {
-    let Some((prefix, contract_key)) = find_owner_for_signed_config(&signed_config) else {
-        log("Delta: signed config doesn't verify against any known owner — dropping");
+    let requested_ck = *PENDING_CONFIG.read();
+    let matched = requested_ck.and_then(|ck| {
+        let sites = state::SITES.read();
+        sites.iter().find_map(|(prefix, site)| {
+            if site.contract_key == Some(ck) && signed_config.verify(&site.state.owner).is_ok() {
+                Some((prefix.clone(), ck))
+            } else {
+                None
+            }
+        })
+    });
+    let Some((prefix, contract_key)) = matched else {
+        log("Delta: signed config doesn't verify against the REQUESTED owner — dropping (guards against cross-site broadcast mis-sign)");
         return;
     };
 
@@ -725,39 +783,39 @@ fn handle_signed_config(signed_config: delta_core::SignedConfig) {
         page_deletions: Vec::new(),
     };
     super::operations::update_site(&contract_key, &delta);
-
-    // Best-effort cleanup of the legacy correlation slot.
-    PENDING_CONFIG.write().take();
-}
-
-/// Find the (prefix, contract_key) for a signed config by checking
-/// its signature against every known owner.
-fn find_owner_for_signed_config(
-    signed: &delta_core::SignedConfig,
-) -> Option<(String, ContractKey)> {
-    let sites = state::SITES.read();
-    sites.iter().find_map(|(prefix, site)| {
-        if signed.verify(&site.state.owner).is_ok() {
-            site.contract_key.map(|ck| (prefix.clone(), ck))
-        } else {
-            None
-        }
-    })
 }
 
 /// After receiving a signed deletion, update local state and send to network.
-/// See `handle_signed_page`'s doc-comment for why routing is via
-/// signature verification rather than `CURRENT_SITE`.
+/// Routing is constrained to REQUESTED sites (see `resolve_requested_owner`),
+/// so a broadcast-signed deletion can't delete a page on an unrelated site.
 fn handle_signed_deletion(deletion: delta_core::SignedPageDeletion) {
     let page_id = deletion.page_id;
     log(&format!(
         "Delta: handling signed deletion for page {page_id}"
     ));
 
-    let Some((prefix, contract_key)) = find_owner_for_signed_deletion(&deletion) else {
+    let requested = requested_prefixes_for_page(page_id);
+    let matched = {
+        let sites = state::SITES.read();
+        resolve_requested_owner(&requested, |prefix| {
+            sites
+                .get(prefix)
+                .map(|s| deletion.verify(&s.state.owner).is_ok())
+                .unwrap_or(false)
+        })
+    };
+    let Some(prefix) = matched else {
         log(&format!(
-            "Delta: signed deletion for {page_id} doesn't verify against any known owner — dropping"
+            "Delta: signed deletion for {page_id} doesn't verify against any REQUESTED owner — \
+             dropping (guards against cross-site broadcast mis-sign)"
         ));
+        return;
+    };
+    let Some(contract_key) = state::SITES
+        .read()
+        .get(&prefix)
+        .and_then(|s| s.contract_key)
+    else {
         return;
     };
 
@@ -777,41 +835,8 @@ fn handle_signed_deletion(deletion: delta_core::SignedPageDeletion) {
         page_deletions: vec![deletion],
     };
     super::operations::update_site(&contract_key, &delta);
-
-    PENDING_UPDATES.write().remove(&(prefix, page_id));
-}
-
-/// Find the (prefix, contract_key) for a signed page by checking its
-/// signature against every known owner. The owner who signed it will
-/// be the only one whose `Page::verify` succeeds.
-fn find_owner_for_signed_page(
-    page: &delta_core::Page,
-    page_id: PageId,
-) -> Option<(String, ContractKey)> {
-    let sites = state::SITES.read();
-    sites.iter().find_map(|(prefix, site)| {
-        if page.verify(page_id, &site.state.owner).is_ok() {
-            site.contract_key.map(|ck| (prefix.clone(), ck))
-        } else {
-            None
-        }
-    })
-}
-
-/// Find the (prefix, contract_key) for a signed deletion. Same
-/// principle as `find_owner_for_signed_page` — only the owner who
-/// signed the deletion will verify it.
-fn find_owner_for_signed_deletion(
-    deletion: &delta_core::SignedPageDeletion,
-) -> Option<(String, ContractKey)> {
-    let sites = state::SITES.read();
-    sites.iter().find_map(|(prefix, site)| {
-        if deletion.verify(&site.state.owner).is_ok() {
-            site.contract_key.map(|ck| (prefix.clone(), ck))
-        } else {
-            None
-        }
-    })
+    // PENDING_UPDATES entry kept as the routing correlation source (see
+    // handle_signed_page for why we don't eagerly remove it).
 }
 
 /// Public wrapper so export_key module can send signing-related delegate requests.
@@ -1333,6 +1358,58 @@ mod tests {
         assert_ne!(n1, [0u8; 24], "nonce must not be all-zero");
         assert_ne!(c1, c2, "two generations must differ (CSPRNG)");
         assert_ne!(n1, n2, "two generations must differ (CSPRNG)");
+    }
+
+    #[test]
+    fn signed_object_only_applies_to_the_requested_site() {
+        // BLOCKER (review): the SignPage-to-legacy broadcast can make a legacy
+        // delegate sign site A's content with a DIFFERENT site B's legacy-slot
+        // key (the delegate's per-prefix->legacy-slot fallback), producing a
+        // page that verifies against B. Routing must only apply it to a site
+        // the user REQUESTED a signature for — not whichever owner happens to
+        // verify — or it silently corrupts site B.
+        let owner_a = ed25519_dalek::SigningKey::from_bytes(&[10u8; 32]);
+        let owner_b = ed25519_dalek::SigningKey::from_bytes(&[11u8; 32]);
+        let prefix_a = delta_core::pubkey_to_prefix(&owner_a.verifying_key());
+        let prefix_b = delta_core::pubkey_to_prefix(&owner_b.verifying_key());
+
+        // A page carrying A's content but signed by B's key (the mis-sign).
+        let page = delta_core::Page::new(1, "A title".into(), "A content".into(), 100, &owner_b);
+        let verifies = |p: &str| {
+            if p == prefix_a {
+                page.verify(1, &owner_a.verifying_key()).is_ok()
+            } else if p == prefix_b {
+                page.verify(1, &owner_b.verifying_key()).is_ok()
+            } else {
+                false
+            }
+        };
+
+        // The user requested a signature for A only (edited A, never touched B).
+        // A's content signed by B's key does NOT verify against A -> dropped.
+        assert_eq!(
+            resolve_requested_owner(std::slice::from_ref(&prefix_a), verifies),
+            None,
+            "a page signed by a non-requested site's key must be dropped"
+        );
+
+        // Non-tautological revert-check: WITHOUT the requested-constraint (the
+        // old find-over-all-sites routing, modeled here by making B a
+        // candidate) the mis-signed page WOULD match B and corrupt it.
+        assert_eq!(
+            resolve_requested_owner(&[prefix_a.clone(), prefix_b.clone()], verifies),
+            Some(prefix_b.clone()),
+            "unconstrained routing would misapply A's content to B"
+        );
+
+        // A correctly-signed page (A's own key) still applies to A.
+        let good = delta_core::Page::new(1, "t".into(), "c".into(), 100, &owner_a);
+        let verifies_good =
+            |p: &str| p == prefix_a && good.verify(1, &owner_a.verifying_key()).is_ok();
+        assert_eq!(
+            resolve_requested_owner(std::slice::from_ref(&prefix_a), verifies_good),
+            Some(prefix_a)
+        );
     }
 
     #[test]
