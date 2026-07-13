@@ -334,6 +334,12 @@ pub(crate) fn reconcile_into(existing: &mut SiteState, incoming: &SiteState) -> 
         // incoming failed verification — keep what we have.
         return false;
     }
+    // F3: preserve the highest id counter across the merge. `SiteState::merge`
+    // advances `next_page_id` only when it INSERTS a live page, so an incoming
+    // generation whose highest ids were created-then-deleted — possibly
+    // leaving NO tombstone (a pre-tombstone-era deletion) — would otherwise
+    // lose its counter, letting `create_page` reuse a since-deleted id.
+    existing.next_page_id = existing.next_page_id.max(incoming.next_page_id);
     *existing != before
 }
 
@@ -995,6 +1001,28 @@ mod tests {
         // An empty incoming never changes a non-empty state.
         let mut s = real.clone();
         assert!(!reconcile_into(&mut s, &SiteState::default()));
+    }
+
+    #[test]
+    fn reconcile_preserves_higher_next_page_id() {
+        // F3 (review): `SiteState::merge` advances next_page_id only on live
+        // inserts, so a merge with a generation whose highest page was
+        // created-then-deleted (possibly leaving NO tombstone, pre-tombstone
+        // era) would lose the counter and let `create_page` reuse a deleted id.
+        // reconcile_into must carry the higher counter forward.
+        let owner = key(7);
+        let mut existing = signed_state(&owner, &[(1, "home", 100)]); // next_page_id = 2
+        let mut incoming = signed_state(&owner, &[(1, "home", 100)]);
+        // incoming knew about ids up to 8 (highest created-then-deleted, no
+        // tombstone), so its counter is ahead even though it has no new pages.
+        incoming.next_page_id = 9;
+
+        reconcile_into(&mut existing, &incoming);
+        assert!(
+            existing.next_page_id >= 9,
+            "the higher id counter must be preserved across the merge (got {})",
+            existing.next_page_id
+        );
     }
 
     #[test]
