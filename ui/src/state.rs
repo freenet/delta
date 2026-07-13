@@ -477,7 +477,15 @@ pub fn create_page(title: String) {
         return;
     };
 
-    let id = site.state.next_page_id;
+    // Allocate an id strictly greater than every id ever used on this site —
+    // live pages AND tombstoned (deleted) pages — not just `next_page_id`.
+    // A tombstone-aware `delta-core::merge` can advance the live set without
+    // advancing `next_page_id` (merge only bumps the counter when it INSERTS
+    // a live page), so a stale `next_page_id` may point at/below a tombstoned
+    // id. Reusing a tombstoned id makes `handle_signed_page` drop the new
+    // page (`deleted_pages.contains_key`), silently losing it. See
+    // `next_free_page_id`.
+    let id = next_free_page_id(&site.state);
     let now = now_secs();
     let contract_key = site.contract_key;
     let is_owner = site.role == SiteRole::Owner;
@@ -858,6 +866,23 @@ fn monotonic_updated_at(now: u64, existing: Option<u64>) -> u64 {
 /// `10, 20, 30, ...` and a fresh page slotted in at `40`).
 const ORDER_STEP: u32 = 10;
 
+/// The next free page id: strictly greater than `next_page_id` AND every
+/// live and TOMBSTONED page id. A tombstone-aware merge can advance the live
+/// or deleted set without advancing `next_page_id`, so `next_page_id` alone
+/// is not a safe allocator — reusing a tombstoned id makes the delegate's
+/// signed page get dropped by the `deleted_pages` guard, silently losing the
+/// new page. Pure so the allocation rule is unit-testable.
+fn next_free_page_id(state: &SiteState) -> PageId {
+    let highest_used = state
+        .pages
+        .keys()
+        .chain(state.deleted_pages.keys())
+        .copied()
+        .max();
+    let used_ceiling = highest_used.map(|h| h.saturating_add(1)).unwrap_or(0);
+    state.next_page_id.max(used_ceiling)
+}
+
 /// Pick an `order` value for a freshly-created page. The new page
 /// should sort after every existing page so the user-visible position
 /// stays stable across a refresh — issuing `0` (the previous default)
@@ -1003,10 +1028,58 @@ fn update_hash(hash: &str) {
 mod tests {
     use super::{
         compute_swap_orders, is_site_prefix_shape, monotonic_updated_at, next_create_order,
-        parse_hash_route, plan_swap,
+        next_free_page_id, parse_hash_route, plan_swap,
     };
     use delta_core::PageId;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn next_free_page_id_skips_tombstoned_ids() {
+        // BLOCKER (review): a tombstone-aware `merge` can advance the deleted
+        // set without advancing `next_page_id`, leaving `next_page_id`
+        // pointing at/below a TOMBSTONED id. Allocating that id makes
+        // `handle_signed_page` drop the new page (`deleted_pages` guard),
+        // silently losing it. `create_page` must allocate above every id ever
+        // used — live OR tombstoned.
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let mut state = delta_core::SiteState::new(delta_core::SiteConfig::default(), &owner);
+        let home = delta_core::Page::new(1, "Home".into(), "c".into(), 100, &owner);
+        state.upsert_page(1, home, &owner.verifying_key()).unwrap();
+        // High ids 2 and 3 were created then deleted (tombstoned)...
+        state
+            .deleted_pages
+            .insert(2, delta_core::SignedPageDeletion::new(2, 200, &owner));
+        state
+            .deleted_pages
+            .insert(3, delta_core::SignedPageDeletion::new(3, 200, &owner));
+        // ...but a merge left the counter stale, pointing at a tombstoned id.
+        state.next_page_id = 2;
+
+        let id = next_free_page_id(&state);
+        assert_eq!(
+            id, 4,
+            "must allocate strictly above the highest tombstoned id"
+        );
+        assert!(!state.pages.contains_key(&id));
+        assert!(!state.deleted_pages.contains_key(&id));
+        // Revert-check: the OLD allocator (`next_page_id`) returns a tombstoned
+        // id, which would silently drop the new page.
+        assert!(
+            state.deleted_pages.contains_key(&state.next_page_id),
+            "the stale next_page_id must be a tombstoned id for this test to be meaningful"
+        );
+    }
+
+    #[test]
+    fn next_free_page_id_normal_case_uses_counter() {
+        // With a healthy counter and no tombstones, allocation is unchanged.
+        let owner = ed25519_dalek::SigningKey::from_bytes(&[2u8; 32]);
+        let mut state = delta_core::SiteState::new(delta_core::SiteConfig::default(), &owner);
+        let home = delta_core::Page::new(1, "Home".into(), "c".into(), 100, &owner);
+        state.upsert_page(1, home, &owner.verifying_key()).unwrap();
+        // upsert_page advanced next_page_id to 2; no tombstones.
+        assert_eq!(next_free_page_id(&state), 2);
+    }
 
     #[test]
     fn parse_hash_route_accepts_real_site_prefix() {

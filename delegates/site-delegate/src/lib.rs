@@ -278,6 +278,70 @@ mod tests {
     }
 
     #[test]
+    fn per_prefix_only_key_is_missed_by_blind_probe_but_found_by_prefix_probe() {
+        // End-to-end reproduction of Bug 2 at the delegate boundary. A site
+        // created under delegate V6+ stores its signing key ONLY in the
+        // per-prefix slot `delta:signing_key:{prefix}`; the legacy
+        // single-key slot `delta:signing_key` is empty.
+        let sk_bytes = vec![7u8; 32];
+        let sk = SigningKey::from_bytes(&<[u8; 32]>::try_from(sk_bytes.as_slice()).unwrap());
+        let prefix = delta_core::pubkey_to_prefix(&sk.verifying_key());
+        let store = store(&[(signing_key_for_prefix(&prefix).as_str(), sk_bytes.clone())]);
+
+        // The OLD migration path probed prefix-blind (prefix = None), which
+        // reads only the legacy single-key slot -> finds nothing. This is
+        // exactly why the key was never migrated and SignPage later failed.
+        assert_eq!(
+            select_key_bytes(None, |name| store.get(name).cloned()),
+            None,
+            "prefix-blind probe must miss a per-prefix-only key (the bug)"
+        );
+
+        // The FIX asks by prefix (GetSigningKeyForPrefix / SignPage{prefix}),
+        // which finds the key so it can be migrated forward and used to sign.
+        assert_eq!(
+            select_key_bytes(Some(&prefix), |name| store.get(name).cloned()),
+            Some(sk_bytes),
+            "prefix-aware probe must recover the per-prefix key"
+        );
+    }
+
+    #[test]
+    fn v6_v7_style_delegate_signs_with_per_prefix_key_only() {
+        // A V6/V7 delegate holds a per-prefix key but predates
+        // GetSigningKeyForPrefix, so the key can't be discovered/migrated. It
+        // CAN still sign: a SignPage{prefix} loads the key via
+        // `load_signing_key(Some(prefix))` == `select_key_bytes(Some(prefix))`,
+        // which finds the per-prefix key even with an EMPTY legacy single slot.
+        // This documents the delegate property that a future V6/V7-stranded-key
+        // recovery (freenet/delta#35) would rely on. NOTE: the UI does NOT
+        // currently exploit this — the SignPage-to-legacy broadcast that would
+        // have was removed because it caused cross-site mis-signing; #35 tracks
+        // a properly-designed replacement. Here we recover the key the way the
+        // sign path does and confirm it produces a page that verifies.
+        let sk = SigningKey::from_bytes(&[9u8; 32]);
+        let prefix = delta_core::pubkey_to_prefix(&sk.verifying_key());
+        // Only a per-prefix key is stored; the legacy single slot is empty.
+        let store = store(&[(
+            signing_key_for_prefix(&prefix).as_str(),
+            sk.to_bytes().to_vec(),
+        )]);
+
+        // The sign path (prefix-aware) recovers the key...
+        let key_bytes = select_key_bytes(Some(&prefix), |n| store.get(n).cloned())
+            .expect("per-prefix key must be recoverable when signing");
+        let recovered = parse_signing_key(&key_bytes).unwrap();
+        let page = Page::new_with_order(1, "Home".into(), "hello".into(), 100, 0, &recovered);
+        page.verify(1, &sk.verifying_key())
+            .expect("page signed by the recovered per-prefix key must verify against the owner");
+
+        // ...while prefix-BLIND discovery (what key migration uses) misses it,
+        // which is precisely why the key is stranded and the sign-time
+        // fallback is needed.
+        assert!(select_key_bytes(None, |n| store.get(n).cloned()).is_none());
+    }
+
+    #[test]
     fn returns_none_when_nothing_stored() {
         let empty: HashMap<String, Vec<u8>> = HashMap::new();
         assert_eq!(
