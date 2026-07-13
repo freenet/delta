@@ -358,6 +358,20 @@ fn current_delegate_key() -> DelegateKey {
     delegate.key().clone()
 }
 
+/// Whether `responding_key` is the NEWEST legacy delegate — the last entry in
+/// `legacy_delegates.toml`, i.e. the delegate immediately preceding the
+/// current one. Only this legacy delegate's KnownSites real records are
+/// unioned into the current view once the current delegate is authoritative
+/// (see the KnownSites handler for the generation-aware rationale).
+fn is_newest_legacy_delegate(responding_key: &DelegateKey) -> bool {
+    let Some((newest_key, newest_hash)) = LEGACY_DELEGATES.last() else {
+        return false;
+    };
+    let key_matches = responding_key.bytes() == newest_key.as_slice();
+    let hash_matches = **responding_key.code_hash() == *newest_hash;
+    key_matches && hash_matches
+}
+
 /// Handle a delegate response — route signed objects to the network.
 pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<OutboundDelegateMsg>) {
     let is_legacy = responding_key != current_delegate_key();
@@ -500,23 +514,34 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                         });
                     }
 
-                    if is_legacy && *CURRENT_SITES_LOADED.read() {
-                        // Generation-aware reconciliation: once the current
-                        // delegate has spoken it is AUTHORITATIVE for the
-                        // removal set. A legacy real record whose prefix is
-                        // absent from the current delegate is treated as a
-                        // removal, not a never-seen site — we do NOT union it
-                        // back in. This is deliberate: a site removed BEFORE
-                        // the tombstone convention existed has no tombstone
-                        // and no REMOVED_PREFIXES entry, so an unconditional
-                        // union would silently resurrect it. The cost — a
-                        // genuinely legacy-only site never migrated to the
-                        // current delegate is not restored — is negligible
-                        // (such a site would have been migrated the first time
-                        // the user ran any version that persists known_sites)
-                        // and strictly safer than resurrecting deletions.
+                    // Generation-aware reconciliation of legacy real records.
+                    //
+                    // Once the current delegate is authoritative
+                    // (CURRENT_SITES_LOADED), we UNION real records only from
+                    // the NEWEST legacy delegate (the one immediately preceding
+                    // current), and skip OLDER ones. Rationale:
+                    //   * The newest legacy delegate reflects the user's site
+                    //     list as of just before the current delegate's
+                    //     upgrade, so it carries a genuinely-new site that was
+                    //     never migrated forward (the real 0.6->0.8 case). Its
+                    //     records are still filtered by REMOVED_PREFIXES and
+                    //     already-live in `restore_known_sites`, so a site the
+                    //     user removed under the CURRENT delegate stays removed.
+                    //   * It is post-tombstone (the convention has existed since
+                    //     V3), so a site removed while it was current is a
+                    //     TOMBSTONE there, never a real record — unioning it
+                    //     cannot resurrect a removed site.
+                    //   * OLDER legacy delegates can hold a FROZEN real record
+                    //     for a site removed later (a pre-tombstone removal
+                    //     deleted the record only from the delegate current at
+                    //     removal time), so unioning them WOULD resurrect a
+                    //     removed site. We must not.
+                    let skip_older_legacy = is_legacy
+                        && *CURRENT_SITES_LOADED.read()
+                        && !is_newest_legacy_delegate(&responding_key);
+                    if skip_older_legacy {
                         log(&format!(
-                            "Delta: skipping {} legacy known site(s) (current delegate is authoritative)",
+                            "Delta: skipping {} known site(s) from an older legacy delegate (current authoritative)",
                             real_records.len()
                         ));
                     } else {
@@ -1308,6 +1333,32 @@ mod tests {
         assert_ne!(n1, [0u8; 24], "nonce must not be all-zero");
         assert_ne!(c1, c2, "two generations must differ (CSPRNG)");
         assert_ne!(n1, n2, "two generations must differ (CSPRNG)");
+    }
+
+    #[test]
+    fn newest_legacy_delegate_is_the_last_toml_entry() {
+        // Only the newest legacy delegate's KnownSites real records are
+        // unioned once the current delegate is authoritative. Misidentifying
+        // it would either resurrect old removals (unioning too many) or drop a
+        // genuine legacy-only migration (unioning too few).
+        assert!(
+            !LEGACY_DELEGATES.is_empty(),
+            "legacy delegates table must be populated"
+        );
+        let (newest_key, newest_hash) = LEGACY_DELEGATES.last().unwrap();
+        let newest = DelegateKey::new(*newest_key, CodeHash::new(*newest_hash));
+        assert!(is_newest_legacy_delegate(&newest));
+
+        if LEGACY_DELEGATES.len() > 1 {
+            let (old_key, old_hash) = LEGACY_DELEGATES.first().unwrap();
+            let oldest = DelegateKey::new(*old_key, CodeHash::new(*old_hash));
+            assert!(
+                !is_newest_legacy_delegate(&oldest),
+                "an older legacy delegate must not be treated as newest"
+            );
+        }
+        // The current delegate is not a legacy delegate at all.
+        assert!(!is_newest_legacy_delegate(&current_delegate_key()));
     }
 
     #[test]
