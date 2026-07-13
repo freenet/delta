@@ -30,13 +30,11 @@ pub static PENDING_UPDATES: GlobalSignal<BTreeMap<(String, PageId), ContractKey>
 /// Pending config update waiting for delegate signature.
 static PENDING_CONFIG: GlobalSignal<Option<ContractKey>> = GlobalSignal::new(|| None);
 
-/// Legacy delegate that holds the signing key (when current delegate has none).
-/// Stores (delegate_key_bytes, code_hash_bytes) so we can reconstruct the DelegateKey.
-static LEGACY_SIGNING_DELEGATE: GlobalSignal<Option<([u8; 32], [u8; 32])>> =
-    GlobalSignal::new(|| None);
-
-/// Prefixes for which the CURRENT delegate has a signing key.
-/// Used to decide whether to route signing through current vs legacy delegate.
+/// Prefixes for which the CURRENT delegate is confirmed to hold a signing key.
+/// Signing ALWAYS routes to the current delegate (see `signing_target`); this
+/// tracks whether the key is confirmed there yet, purely for diagnostics (a
+/// sign before it is confirmed may fail transiently until the per-prefix key
+/// export migration completes).
 static CURRENT_KEY_PREFIXES: GlobalSignal<Vec<String>> = GlobalSignal::new(Vec::new);
 
 /// Whether the current delegate has ANY signing key (legacy single-key format).
@@ -405,13 +403,17 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                 DelegateResponse::PublicKey(vk) => {
                     let prefix = delta_core::pubkey_to_prefix(&vk);
                     if is_legacy {
+                        // A legacy delegate holds a (single-slot) signing key.
+                        // We do NOT record it for routing: signing NEVER goes
+                        // to a legacy delegate (a legacy delegate lacking THIS
+                        // prefix's per-prefix key would sign this site's content
+                        // with another site's single-slot key -> cross-site
+                        // corruption). The per-prefix key export migration
+                        // copies the key onto the current delegate instead.
                         log(&format!(
-                            "Delta: legacy delegate has signing key for site {prefix}"
+                            "Delta: legacy delegate reports a signing key for site {prefix} \
+                             (not used for routing; key is migrated to the current delegate)"
                         ));
-                        // Store the legacy delegate key for routing signing requests
-                        let key_bytes: [u8; 32] = responding_key.bytes().try_into().unwrap();
-                        let code_hash: [u8; 32] = **responding_key.code_hash();
-                        *LEGACY_SIGNING_DELEGATE.write() = Some((key_bytes, code_hash));
                     } else {
                         log(&format!(
                             "Delta: current delegate has key for site {prefix}"
@@ -819,14 +821,9 @@ fn send_delegate_request(request: &delta_core::DelegateRequest) {
     send_to_delegate_key(request, current_delegate_key());
 }
 
-/// Extract the prefix from a signing-related delegate request.
-///
-/// Every variant that `send_signing_request` may route MUST be listed
-/// here. If a request variant with a prefix is missing, the router
-/// falls back to the `HAS_CURRENT_LEGACY_KEY` heuristic and can pick
-/// the legacy delegate — which, for any variant introduced after V6
-/// (e.g. `GetSigningKeyForPrefix`), cannot deserialize the request
-/// and leaves the UI hanging on a request that will never complete.
+/// Extract the prefix from a signing-related delegate request, so
+/// `send_signing_request` can report whether the current delegate has
+/// confirmed this site's key yet (diagnostic only; routing is unconditional).
 fn request_prefix(request: &delta_core::DelegateRequest) -> Option<&str> {
     match request {
         delta_core::DelegateRequest::SignPage { prefix, .. }
@@ -837,54 +834,47 @@ fn request_prefix(request: &delta_core::DelegateRequest) -> Option<&str> {
     }
 }
 
-/// True for `DelegateRequest` variants that were introduced after V6
-/// and therefore CANNOT be deserialized by any legacy (pre-V7)
-/// delegate. Routing such a request to a legacy delegate would leave
-/// the UI hanging on a request the legacy side can't parse.
-fn variant_is_v7_plus(request: &delta_core::DelegateRequest) -> bool {
-    matches!(
-        request,
-        delta_core::DelegateRequest::GetSigningKeyForPrefix { .. }
-    )
+/// The delegate a signing request is routed to. ALWAYS the current delegate,
+/// regardless of `current_has_key` — signing is NEVER routed to a legacy
+/// delegate.
+///
+/// A legacy delegate that lacks THIS prefix's per-prefix key falls back to its
+/// legacy single slot (a DIFFERENT site's key) and would sign this site's
+/// content with the wrong key, which then verifies against — and corrupts — an
+/// unrelated site (cross-site mis-sign). The per-prefix key EXPORT migration
+/// (`migrate_per_prefix_signing_key`) copies each owned prefix's key onto the
+/// current delegate, so signing on the current delegate is the correct path.
+/// If the key isn't there yet (the brief post-upgrade window before the export
+/// migration completes, or the deferred V6/V7 cohort — see freenet/delta#35),
+/// the current delegate returns a clean "no signing key stored" error and the
+/// sign fails transiently rather than corrupting another site; it self-resolves
+/// once the export migration confirms the key (runs at startup and re-probes on
+/// each KnownSites response). This is exactly main's safe "fail, don't corrupt"
+/// behavior. `current_has_key` is accepted so the invariant "even a
+/// not-yet-migrated site routes to current, never legacy" is unit-testable.
+fn signing_target(_current_has_key: bool) -> DelegateKey {
+    current_delegate_key()
 }
 
-/// Send a signing request. Routes to the current delegate if it has the key
-/// for this prefix, otherwise falls back to the legacy delegate.
+/// Send a signing request. ALWAYS to the current delegate — never a legacy
+/// delegate (see `signing_target` for the anti-cross-site-corruption rationale).
 fn send_signing_request(request: &delta_core::DelegateRequest) {
     let prefix = request_prefix(request);
     let current_has_key = match prefix {
         Some(p) => CURRENT_KEY_PREFIXES.read().contains(&p.to_string()),
         None => *HAS_CURRENT_LEGACY_KEY.read(),
     };
-
-    let key = if current_has_key {
-        current_delegate_key()
-    } else if variant_is_v7_plus(request) {
-        // Never route V7+ variants to a legacy delegate: the legacy
-        // side can't deserialize them and the request would hang.
-        // Send to the current delegate — if the key isn't there, the
-        // current delegate returns a clean error instead of silence.
-        log("Delta: V7+ signing request, forcing current delegate (no legacy fallback)");
-        current_delegate_key()
-    } else if let Some((key_bytes, code_hash_bytes)) = *LEGACY_SIGNING_DELEGATE.read() {
-        log("Delta: routing signing request through legacy delegate");
-        DelegateKey::new(key_bytes, CodeHash::new(code_hash_bytes))
-    } else {
-        current_delegate_key()
-    };
-    send_to_delegate_key(request, key);
-
-    // NOTE: we intentionally do NOT broadcast signing requests to legacy
-    // delegates. An earlier revision added a SignPage-to-legacy broadcast to
-    // rescue keys stranded in V6/V7 delegates, but the delegate's
-    // `select_key_bytes` falls back to its legacy single slot, so a legacy
-    // delegate lacking THIS prefix's key could sign this site's content with a
-    // DIFFERENT site's key — verifying against, and corrupting, an unrelated
-    // site. The mainstream key recovery (V10 -> current via
-    // `migrate_per_prefix_signing_key`'s GetSigningKeyForPrefix) does not
-    // broadcast and is safe. Recovering V6/V7-only keys needs a properly
-    // designed, independently-reviewed fix — tracked separately; do NOT re-add
-    // any broadcast here.
+    if !current_has_key {
+        // Not-yet-migrated (post-upgrade window) or the deferred V6/V7 cohort:
+        // the current delegate may not hold the key yet, so this sign may fail
+        // transiently and self-resolve once the export migration confirms it.
+        // We still route to the CURRENT delegate — never to a legacy delegate.
+        log(
+            "Delta: signing on current delegate before its key is confirmed; \
+             may fail transiently until per-prefix key migration completes",
+        );
+    }
+    send_to_delegate_key(request, signing_target(current_has_key));
 }
 
 fn send_to_delegate_key(request: &delta_core::DelegateRequest, delegate_key: DelegateKey) {
@@ -1139,8 +1129,10 @@ fn per_prefix_key_migration_request(prefix: &str) -> delta_core::DelegateRequest
 ///     "populate from `is_owner`" optimism.
 ///   * LEGACY delegates — a V8+ delegate holding the key returns it so we
 ///     migrate it forward. V6/V7 delegates predate `GetSigningKeyForPrefix`
-///     and can't answer it; their stranded keys are instead made usable by the
-///     SignPage-to-legacy broadcast fallback in `send_signing_request`.
+///     and can't answer it, so a key stranded ONLY in a V6/V7 delegate is not
+///     recovered here; that narrow cohort is deferred to freenet/delta#35 (a
+///     properly-designed, no-broadcast recovery). We never route signing to a
+///     legacy delegate — see `signing_target`.
 ///
 /// Guarded on `CURRENT_KEY_PREFIXES` rather than a fire-once flag: we keep
 /// probing across successive `KnownSites` responses until the key is confirmed
@@ -1311,6 +1303,39 @@ mod tests {
         assert_ne!(n1, [0u8; 24], "nonce must not be all-zero");
         assert_ne!(c1, c2, "two generations must differ (CSPRNG)");
         assert_ne!(n1, n2, "two generations must differ (CSPRNG)");
+    }
+
+    #[test]
+    fn signing_never_routes_to_a_legacy_delegate() {
+        // BLOCKER (review): a SignPage for a NOT-YET-MIGRATED owned site must
+        // never route to a legacy delegate. A legacy delegate lacking this
+        // prefix's per-prefix key would fall back to its legacy single slot
+        // (another site's key) and sign this site's content with the wrong key
+        // -> cross-site mis-sign. Signing always targets the CURRENT delegate;
+        // if it lacks the key it fails safely instead of corrupting a site.
+        let current = current_delegate_key();
+
+        // Load-bearing case: current does NOT have the key yet (not migrated).
+        assert_eq!(
+            signing_target(false),
+            current,
+            "a not-yet-migrated site must still route to the current delegate"
+        );
+        // Steady state: current has the key.
+        assert_eq!(signing_target(true), current);
+
+        // And in NEITHER case does it route to any legacy delegate. If a future
+        // change re-adds "route to legacy when the current key is missing",
+        // signing_target(false) would return a legacy key and this fails.
+        for (key_bytes, code_hash_bytes) in LEGACY_DELEGATES.iter() {
+            let legacy = DelegateKey::new(*key_bytes, CodeHash::new(*code_hash_bytes));
+            assert_ne!(
+                signing_target(false),
+                legacy,
+                "signing must never route to a legacy delegate"
+            );
+            assert_ne!(signing_target(true), legacy);
+        }
     }
 
     #[test]

@@ -308,15 +308,17 @@ mod tests {
 
     #[test]
     fn v6_v7_style_delegate_signs_with_per_prefix_key_only() {
-        // MUST-FIX cohort (review): a V6/V7 delegate holds a per-prefix key
-        // but predates GetSigningKeyForPrefix, so the key can't be discovered/
-        // migrated. It CAN still sign: a SignPage{prefix} loads the key via
+        // A V6/V7 delegate holds a per-prefix key but predates
+        // GetSigningKeyForPrefix, so the key can't be discovered/migrated. It
+        // CAN still sign: a SignPage{prefix} loads the key via
         // `load_signing_key(Some(prefix))` == `select_key_bytes(Some(prefix))`,
-        // which finds the per-prefix key even with an EMPTY legacy single
-        // slot. This is exactly what the UI's SignPage-to-legacy broadcast
-        // fallback relies on to make a V6/V7-stranded key usable. Here we
-        // recover the key the way the sign path does and confirm it produces
-        // a page that verifies against the site owner.
+        // which finds the per-prefix key even with an EMPTY legacy single slot.
+        // This documents the delegate property that a future V6/V7-stranded-key
+        // recovery (freenet/delta#35) would rely on. NOTE: the UI does NOT
+        // currently exploit this — the SignPage-to-legacy broadcast that would
+        // have was removed because it caused cross-site mis-signing; #35 tracks
+        // a properly-designed replacement. Here we recover the key the way the
+        // sign path does and confirm it produces a page that verifies.
         let sk = SigningKey::from_bytes(&[9u8; 32]);
         let prefix = delta_core::pubkey_to_prefix(&sk.verifying_key());
         // Only a per-prefix key is stored; the legacy single slot is empty.

@@ -28,26 +28,25 @@ include!(concat!(env!("OUT_DIR"), "/legacy_contracts.rs"));
 /// When a GET response arrives for an old key, we PUT the state to the new key.
 ///
 /// Multiple old keys may be registered for the same prefix when the UI is
-/// probing several historical contract WASM hashes at startup; the first
-/// GET that returns non-empty state wins and the rest are cleared by
-/// `clear_pending_migrations_for_prefix` to prevent an older state from
-/// racing ahead of a newer one.
+/// probing several historical contract WASM hashes at startup. Late arrivals
+/// are NOT dropped: every generation's state flows through the tombstone-aware
+/// merge in `handle_site_state` / `reconcile_into`, which keeps the newest data
+/// and can never be clobbered by an older generation regardless of arrival
+/// order. Each entry is removed when its own key's GET resolves (state or
+/// NotFound).
 static PENDING_MIGRATIONS: GlobalSignal<BTreeMap<String, String>> =
     GlobalSignal::new(BTreeMap::new);
 
 /// Prefixes whose initial state capture is in progress.
 ///
-/// Populated by `restore_known_sites` for each site it is restoring,
-/// and cleared the first time a GET response arrives with non-empty
-/// state for that prefix. While a prefix is in this set, ANY
-/// subsequent non-empty state response for the same prefix — migration
-/// or current-key — is dropped, so a late arrival from an older hash
-/// cannot overwrite state just captured from a newer source.
-///
-/// Once a prefix has been captured (or the user edits/adds a site
-/// outside the startup path), it leaves this set and `handle_site_state`
-/// behaves normally: subsequent `UpdateNotification` state pushes
-/// from the network are accepted for live update.
+/// Populated by `restore_known_sites` for each site it is restoring. Its only
+/// remaining job is to classify a current-key GET as `InitialCurrentKey` (so an
+/// empty current-key response defers to the legacy probes) vs a later
+/// `LiveUpdate`. It does NOT gate which state wins: every candidate generation
+/// is reconciled via the tombstone-aware merge in `handle_site_state`
+/// (`reconcile_into`), which keeps the newest data and preserves deletions
+/// regardless of arrival order — there is no "first wins / drop late arrival"
+/// behavior.
 static MIGRATING_PREFIXES: GlobalSignal<BTreeSet<String>> = GlobalSignal::new(BTreeSet::new);
 
 /// Register a prefix as "currently being captured from the network".
@@ -794,8 +793,9 @@ mod tests {
         // A legacy-hash probe response must route through the
         // migration branch because the key itself is in
         // PENDING_MIGRATIONS, regardless of whether the prefix is
-        // still in MIGRATING_PREFIXES. (The caller later checks the
-        // migrating flag to decide whether to drop a late response.)
+        // still in MIGRATING_PREFIXES. The caller then reconciles the
+        // state via the tombstone-aware merge (newest wins, deletions
+        // preserved) — late arrivals are merged, never dropped.
         let pending = pending(&[("legacy_key_b58", "abcdef1234")]);
         let migrating = migrating(&[]);
         let c = classify_get_response("legacy_key_b58", &pending, &migrating, None);
