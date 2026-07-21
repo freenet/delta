@@ -1234,6 +1234,12 @@ fn handle_restored_site_state(prefix: &str, state_bytes: &[u8]) {
                 prefix: prefix.to_string(),
             };
             super::operations::put_site(&params, &merged);
+
+            // If a migration sweep for this prefix is still in flight, this
+            // backup PUT already put `merged` on the network current key —
+            // update its baseline so the sweep's finalize doesn't fire a second,
+            // identical PUT of the same state.
+            super::operations::note_forward_put_baseline(prefix, &merged);
         }
     }
 }

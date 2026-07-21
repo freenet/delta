@@ -157,6 +157,29 @@ fn handle_contract_response(response: ContractResponse) {
             );
 
             let state_bytes = state.to_vec();
+
+            // Current-key resolution + unload-window backup — DECOUPLED from
+            // classification. A GET whose key resolves to a known site's current
+            // key (legacy keys never do) records that state into the prefix's
+            // sweep the first time it is seen and, on that first recording,
+            // requests the delegate backup exactly once. This must not live in
+            // the InitialCurrentKey arm alone: a nonempty LEGACY response
+            // arriving first removes the prefix from MIGRATING_PREFIXES, so the
+            // current-key response then classifies as LiveUpdate and would skip
+            // both the baseline recording (defeating the write-amplification
+            // gate) and the backup request (stranding unload recovery). Runs
+            // before the match, so SITES holds this state before any async
+            // backup response is processed (option-B invariant).
+            if let Some(prefix) = prefix_for_key.as_deref() {
+                if !state_bytes.is_empty() {
+                    if let Ok(current_state) = from_reader::<SiteState, _>(state_bytes.as_slice()) {
+                        if record_sweep_current_key_state(prefix, current_state) {
+                            super::delegate::request_site_state_backup(prefix);
+                        }
+                    }
+                }
+            }
+
             match classification {
                 GetClassification::PendingMigration { prefix } => {
                     // Clear this one entry up front so the classifier
@@ -211,29 +234,10 @@ fn handle_contract_response(response: ContractResponse) {
                     });
                 }
                 GetClassification::InitialCurrentKey { prefix } => {
-                    // Unload-window recovery (option B): now that the network's
-                    // current key has RESOLVED, request the delegate state
-                    // backup. handle_restored_site_state reconciles it and PUTs
-                    // forward only if the backup strictly exceeds current SITES —
-                    // and by the time the (local) backup response is processed,
-                    // SITES already holds this current-key state (set just below,
-                    // synchronously, before any async backup response), so an
-                    // in-sync backup is a no-op (no write-amplification) while a
-                    // backup carrying data the network lacks is PUT. This
-                    // recovers state that a prior sweep wrote to the backup but
-                    // whose forward PUT never landed because the page was closed
-                    // mid-sweep (and the legacy generation was since GC'd, so the
-                    // reload re-sweep cannot re-fetch it).
-                    //
-                    // Accepted residual (pre-existing; matches pre-driver
-                    // behavior): if the current-key GET is itself lost (no
-                    // response AND no NotFound), this request never fires this
-                    // session, so a recovery needing the backup is deferred to
-                    // the next reload. Today's code likewise only requests the
-                    // backup off the current-key response path (via NotFound), so
-                    // this is no worse than shipped.
-                    super::delegate::request_site_state_backup(&prefix);
-
+                    // Note: the current-key state recording + unload-window backup
+                    // request happen in the classification-independent block above
+                    // (a legacy response arriving first would reclassify this as
+                    // LiveUpdate, so it cannot live here).
                     if state_bytes.is_empty() {
                         // Empty state for the current key during the
                         // initial capture window doesn't tell us
@@ -248,15 +252,6 @@ fn handle_contract_response(response: ContractResponse) {
                         log(&format!(
                             "Delta: captured state for site {prefix} from current contract key"
                         ));
-                    }
-                    // Record what the network's current key actually holds, so
-                    // the sweep's forward-PUT gate can tell "a legacy generation
-                    // recovered data the current key lacks" (→ PUT) from "a
-                    // legacy generation merely re-supplied what the current key
-                    // already has" (→ no PUT), instead of write-amplifying on
-                    // every reload where a legacy response beats the current key.
-                    if let Ok(current_state) = from_reader::<SiteState, _>(state_bytes.as_slice()) {
-                        record_sweep_current_key_state(&prefix, current_state);
                     }
                     // Do NOT cancel the legacy-generation probes: one of
                     // them may hold a NEWER generation that must still be
@@ -740,9 +735,13 @@ pub fn fire_legacy_contract_migrations(prefix: &str, current_key_b58: &str) {
 //     analysis (the fix that added tombstones); floor-vs-no-floor is tracked in
 //     delta#38.
 //   * The merge is order-INDEPENDENT only where writes do not conflict at an
-//     equal (page `updated_at` / config `version`). A same-timestamp conflicting
-//     write (e.g. concurrent tabs) is resolved keep-accumulator, which is
-//     order-dependent — but the PUT payload is the canonical concurrently-merged
+//     equal (page `updated_at` / config `version`), and where a page is not
+//     deleted twice at different `deleted_at`. Same-timestamp conflicting writes
+//     (e.g. concurrent tabs) resolve keep-accumulator, and conflicting tombstones
+//     (`SiteState::merge`'s `deleted_pages` or_insert) likewise keep the
+//     accumulator's deletion — both order-dependent. Harmless: for the tombstone
+//     conflict the page stays deleted either way, only the recorded deletion
+//     timestamp differs; and the PUT payload is the canonical concurrently-merged
 //     SITES value, so the fold matches production arrival-order behavior exactly.
 
 /// `ProbeStateOps` binding Delta's `SiteState` into the decision driver.
@@ -986,6 +985,30 @@ impl MigrationSweep {
                 .iter()
                 .all(|c| self.responses.contains_key(c))
     }
+
+    /// Record the network current-key state the FIRST time it is seen, returning
+    /// whether this was that first recording. The caller uses the `true` return
+    /// to request the unload-window backup exactly once — regardless of how many
+    /// current-key responses arrive, and independent of whether the response was
+    /// classified InitialCurrentKey or LiveUpdate (a legacy response arriving
+    /// first removes MIGRATING_PREFIXES and reclassifies the current-key response
+    /// as LiveUpdate).
+    fn record_current_key_state(&mut self, state: SiteState) -> bool {
+        if self.current_key_state.is_some() {
+            return false;
+        }
+        self.current_key_state = Some(state);
+        true
+    }
+
+    /// Overwrite the recorded current-key baseline with the state a forward PUT
+    /// just wrote to the network (a restored-backup PUT, or a late-response PUT).
+    /// After the PUT the network current key holds `state`, so a subsequent
+    /// finalize's "SITES != current-key" gate must compare against it — otherwise
+    /// it fires a second, identical PUT.
+    fn set_current_key_baseline(&mut self, state: SiteState) {
+        self.current_key_state = Some(state);
+    }
 }
 
 /// Per-candidate migration-probe timeout. Generous (River's UI probe ships 12s;
@@ -1044,14 +1067,32 @@ fn record_sweep_timeout(prefix: &str, key_b58: &str, armed_gen: u64) {
     }
 }
 
-/// Record the network current-key state for a prefix's in-flight sweep, so the
-/// finalize gate can PUT only when the reconciled SITES differs from what the
-/// current key already holds. No-op if there is no sweep for the prefix (the
-/// site had no legacy candidates, so there is nothing to finalize).
-fn record_sweep_current_key_state(prefix: &str, state: SiteState) {
+/// Record the network current-key state for a prefix's in-flight sweep (once),
+/// so the finalize gate can PUT only when the reconciled SITES differs from what
+/// the current key already holds. Returns whether this was the FIRST recording
+/// (so the caller requests the unload-window backup exactly once). Returns
+/// `false` — and requests nothing — if there is no sweep for the prefix (the
+/// site had no legacy candidates, so there is nothing to finalize / recover).
+fn record_sweep_current_key_state(prefix: &str, state: SiteState) -> bool {
+    MIGRATION_SWEEPS.with_mut(|sweeps| {
+        sweeps
+            .get_mut(prefix)
+            .map(|sweep| sweep.record_current_key_state(state))
+            .unwrap_or(false)
+    })
+}
+
+/// After a forward PUT fires OUTSIDE finalize (a restored-backup PUT, or a
+/// late-response PUT), update the prefix's sweep baseline to the PUT payload —
+/// that state is now what the network current key holds, so a later finalize's
+/// "SITES != current-key" gate will not fire a second, identical PUT. No-op if
+/// there is no sweep for the prefix (e.g. the late-response path, which only
+/// runs once the sweep has finalized and been removed, so there is nothing left
+/// to double-PUT against).
+pub(crate) fn note_forward_put_baseline(prefix: &str, payload: &SiteState) {
     MIGRATION_SWEEPS.with_mut(|sweeps| {
         if let Some(sweep) = sweeps.get_mut(prefix) {
-            sweep.current_key_state = Some(state);
+            sweep.set_current_key_baseline(payload.clone());
         }
     });
 }
@@ -1141,6 +1182,13 @@ fn forward_put_current_site(prefix: &str) {
         };
         put_site(&params, &merged);
         super::delegate::save_known_sites();
+        // Keep the sweep's current-key baseline in step with what we just wrote,
+        // so a later finalize doesn't re-PUT identical state. A no-op today for
+        // both callers (finalize has already removed the sweep; the
+        // late-response path only runs once the sweep is gone), kept so any
+        // future caller that PUTs while a sweep is still live stays double-PUT
+        // safe.
+        note_forward_put_baseline(prefix, &merged);
     }
 }
 
@@ -2266,6 +2314,105 @@ mod tests {
         assert!(
             sites.pages.contains_key(&2),
             "the recovered page is present in the state we PUT forward"
+        );
+    }
+
+    #[test]
+    fn current_key_state_records_once_so_the_backup_is_requested_once() {
+        // Codex P1: the current-key state recording (and the one-shot backup
+        // request keyed off its `true` return) must fire exactly once regardless
+        // of how many current-key responses arrive — including when a legacy
+        // response reclassifies the current-key response as LiveUpdate.
+        let owner = key(4);
+        let s1 = signed_state(&owner, &[(1, "home", 100)]);
+        let s2 = signed_state(&owner, &[(1, "home", 100), (2, "extra", 200)]);
+
+        let mut sweep = MigrationSweep::default();
+        sweep.register("k");
+        assert!(
+            sweep.record_current_key_state(s1.clone()),
+            "first current-key recording returns true → request backup once"
+        );
+        assert!(
+            !sweep.record_current_key_state(s2.clone()),
+            "a later current-key response must not re-record or re-request the backup"
+        );
+        assert_eq!(
+            sweep.current_key_state.as_ref(),
+            Some(&s1),
+            "the first current-key state is kept as the baseline"
+        );
+    }
+
+    #[test]
+    fn baseline_update_prevents_a_second_identical_finalize_put() {
+        // Codex P2: a restored-backup PUT of B (> current C) sets the sweep
+        // baseline to B; finalize's "SITES != current-key" gate must then see
+        // baseline == SITES and NOT fire a second identical PUT.
+        let owner = key(4);
+        let current = signed_state(&owner, &[(1, "home", 100)]); // C
+        let recovered = signed_state(&owner, &[(1, "home", 100), (2, "recovered", 200)]); // B > C
+
+        let mut sweep = MigrationSweep::default();
+        sweep.register("k"); // legacy candidate that will miss
+        sweep.resolve("k", None, false); // all legacy candidates miss
+        sweep.record_current_key_state(current.clone()); // baseline = C
+                                                         // Backup PUT of B happened outside finalize → baseline updated to B.
+        sweep.set_current_key_baseline(recovered.clone());
+
+        // Finalize now sees SITES (== B) equal to the baseline → NO second PUT.
+        assert!(
+            !plan_sweep_forward_put("abcdef1234", &sweep, recovered.clone()).forward_put,
+            "finalize must not re-PUT state the restored-backup PUT already wrote"
+        );
+    }
+
+    #[test]
+    fn conflicting_tombstone_deleted_at_is_order_dependent_but_page_stays_deleted() {
+        // Codex P3 honest-domain pin: `SiteState::merge`'s `deleted_pages`
+        // or_insert keeps the ACCUMULATOR's deletion when the same page is
+        // deleted at two different `deleted_at` (concurrent deletes). This is
+        // order-dependent in the recorded timestamp — but HARMLESS: the page
+        // stays deleted either way; only the recorded `deleted_at` differs. Pins
+        // the current contract semantics (SiteState::merge is out of scope to
+        // change), documenting why these samples are excluded from the
+        // commutativity property set.
+        let owner = key(2);
+        let mut del_early = signed_state(&owner, &[(1, "home", 100)]);
+        del_early
+            .delete_page(
+                &delta_core::SignedPageDeletion::new(2, 300, &owner),
+                &owner.verifying_key(),
+            )
+            .unwrap();
+        let mut del_late = signed_state(&owner, &[(1, "home", 100)]);
+        del_late
+            .delete_page(
+                &delta_core::SignedPageDeletion::new(2, 900, &owner),
+                &owner.verifying_key(),
+            )
+            .unwrap();
+
+        let a = DeltaProbeOps.merge_generations(del_early.clone(), del_late.clone());
+        let b = DeltaProbeOps.merge_generations(del_late.clone(), del_early.clone());
+
+        // Page stays deleted in BOTH orders (the harmless part).
+        assert!(!a.pages.contains_key(&2));
+        assert!(!b.pages.contains_key(&2));
+        assert!(a.deleted_pages.contains_key(&2));
+        assert!(b.deleted_pages.contains_key(&2));
+        // But the recorded deleted_at is the accumulator's → order-dependent.
+        assert_eq!(
+            a.deleted_pages[&2].deleted_at, 300,
+            "keeps the accumulator's (early) deletion timestamp"
+        );
+        assert_eq!(
+            b.deleted_pages[&2].deleted_at, 900,
+            "keeps the accumulator's (late) deletion timestamp"
+        );
+        assert_ne!(
+            a.deleted_pages[&2].deleted_at, b.deleted_pages[&2].deleted_at,
+            "conflicting-tombstone deleted_at is order-dependent (documented, harmless)"
         );
     }
 }
