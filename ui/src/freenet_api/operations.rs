@@ -585,6 +585,29 @@ pub fn get_for_migration(old_key_b58: &str, prefix: &str) {
     // here, before any response can arrive.
     register_sweep_candidate(prefix, old_key_b58);
 
+    // Arm a per-candidate timeout. NEW behavior vs Delta's previously-untimed
+    // sweep: without it, a candidate whose GET neither responds nor NotFounds
+    // would leave the sweep incomplete forever, so the driver's single forward
+    // PUT would never fire this session (recovered state would still reach local
+    // SITES via the per-response reconcile below, but would not propagate to the
+    // network's current key until the next reload). The timeout delivers a miss
+    // to the sweep — the driver's own model for a lost candidate — bounding a
+    // previously-unbounded wait so the forward PUT always lands. A real response
+    // arriving after the timeout is single-shot-dropped from the sweep (the
+    // idempotent `resolve`) but is still reconciled into SITES.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let prefix = prefix.to_string();
+        let key_b58 = old_key_b58.to_string();
+        wasm_bindgen_futures::spawn_local(async move {
+            gloo_timers::future::sleep(std::time::Duration::from_millis(
+                SWEEP_CANDIDATE_TIMEOUT_MS.into(),
+            ))
+            .await;
+            record_sweep_resolution(&prefix, &key_b58, None, false);
+        });
+    }
+
     log(&format!(
         "Delta: GET from old contract for migration: {old_key_b58}"
     ));
@@ -879,6 +902,12 @@ impl MigrationSweep {
     }
 }
 
+/// Per-candidate migration-probe timeout. Generous (River's UI probe ships 12s;
+/// this is looser still): the sweep must complete even if a candidate GET is
+/// genuinely lost, and over-waiting only delays the forward PUT, whereas
+/// under-waiting could drop a slow-but-live generation from the fold.
+const SWEEP_CANDIDATE_TIMEOUT_MS: u32 = 30_000;
+
 /// In-flight migration sweeps, keyed by site prefix. An entry is created when
 /// the first candidate GET for a prefix is fired and removed when the sweep
 /// finalizes.
@@ -916,24 +945,33 @@ fn record_sweep_resolution(
     }
 }
 
-/// Fold a completed sweep through the driver and, if a legacy generation
-/// contributed new data, PUT the reconciled state forward to the current
-/// contract key exactly once.
-fn finalize_migration_sweep(prefix: &str) {
-    let Some(sweep) = MIGRATION_SWEEPS.with_mut(|sweeps| sweeps.remove(prefix)) else {
-        return;
-    };
+/// The forward-PUT decision for a completed sweep, computed purely (no globals)
+/// so the write gate is unit-testable.
+struct SweepPlan {
+    /// Whether to PUT the reconciled state forward to the current contract key.
+    /// This is the sweep's `changed_local` — the EXACT condition the pre-driver
+    /// code PUT on (a legacy generation actually changed local SITES state), so
+    /// a dominated (no-op) sweep never write-amplifies.
+    forward_put: bool,
+    /// Whether the fold was cut short by the hop cap (missing the oldest
+    /// generations). Impossible for Delta at ≤ a handful of generations vs a 64
+    /// hop cap, but surfaced so a future lineage explosion is loud, not silent.
+    truncated_fold: bool,
+}
 
-    // Fold the sweep's generations through the driver, newest-first by the
-    // registry generation order. FoldAll's fold is order-independent (proven by
-    // the `policy_check` tests); ordering follows the registry so the probe
-    // order matches the anti-rollback intent. `local` is the current reconciled
-    // SITES state, which the per-response merges have already folded these
-    // generations into — so the driver's fold is the idempotent confirmation and
-    // the value we actually PUT is that canonical SITES state. (A fired stale
-    // stored key that is not itself a registry hash — rare — is folded into
-    // SITES per-response but not probed by the driver; the forward PUT of SITES
-    // still carries it.)
+/// Fold a completed sweep through the driver and decide whether to forward-PUT.
+///
+/// Pure: takes the sweep and the current local snapshot, touches no globals, so
+/// the Bug-B write-forward gate is unit-testable. The fold goes newest-first by
+/// the registry generation order (FoldAll's fold is order-independent — proven
+/// by the `policy_check` tests — so ordering is only for the anti-rollback probe
+/// intent). `local` is the current reconciled SITES state, which the
+/// per-response merges have already folded these generations into, so the fold
+/// is the idempotent confirmation; the value we actually PUT is that canonical
+/// SITES state. (A fired stale stored key that is not itself a registry hash —
+/// rare — is folded into SITES per-response but not probed by the driver; the
+/// forward PUT of SITES still carries it.)
+fn plan_sweep_forward_put(prefix: &str, sweep: &MigrationSweep, local: SiteState) -> SweepPlan {
     let candidates = legacy_lineage_newest_first(prefix);
     let max_hops = candidates.len().max(DEFAULT_MAX_PROBE_HOPS);
     let responses: HashMap<ContractInstanceId, Option<Vec<u8>>> = sweep
@@ -945,26 +983,40 @@ fn finalize_migration_sweep(prefix: &str) {
                 .map(|id| (id, sweep.responses.get(b58).cloned().unwrap_or(None)))
         })
         .collect();
+    let outcome = drive_fold_probe(candidates, &responses, local, max_hops);
+    SweepPlan {
+        forward_put: sweep.changed_local,
+        truncated_fold: matches!(
+            outcome,
+            Outcome::Recovered {
+                truncated_fold: true,
+                ..
+            }
+        ),
+    }
+}
+
+/// Fold a completed sweep through the driver and, if a legacy generation
+/// contributed new data, PUT the reconciled state forward to the current
+/// contract key exactly once.
+fn finalize_migration_sweep(prefix: &str) {
+    let Some(sweep) = MIGRATION_SWEEPS.with_mut(|sweeps| sweeps.remove(prefix)) else {
+        return;
+    };
     let local = state::SITES
         .read()
         .get(prefix)
         .map(|s| s.state.clone())
         .unwrap_or_default();
-    let outcome = drive_fold_probe(candidates, &responses, local, max_hops);
-    if let Outcome::Recovered {
-        truncated_fold: true,
-        ..
-    } = &outcome
-    {
-        // Should be impossible for Delta (≤ a handful of generations vs a 64
-        // hop cap); surface loudly if it ever happens, since a truncated fold
-        // is missing the oldest generations.
+    let plan = plan_sweep_forward_put(prefix, &sweep, local);
+
+    if plan.truncated_fold {
         log(&format!(
             "Delta: WARNING migration fold for {prefix} was truncated by the hop cap"
         ));
     }
 
-    if !sweep.changed_local {
+    if !plan.forward_put {
         // No legacy generation added data the current key lacked — nothing to
         // migrate forward (matches the pre-driver "dominated by current;
         // ignored" no-write path).
@@ -1744,6 +1796,85 @@ mod tests {
         assert!(
             sweep.resolve("a", None, false),
             "resolving the sole candidate completes it"
+        );
+    }
+
+    #[test]
+    fn sweep_forward_put_gate_follows_changed_local() {
+        // The write gate: `plan_sweep_forward_put` forward-PUTs iff a legacy
+        // generation actually changed SITES (changed_local). A dominated sweep
+        // must NOT forward-PUT (no write-amplification) — the exact pre-driver
+        // condition.
+        let owner = key(4);
+        let real = signed_state(&owner, &[(1, "x", 100)]);
+        let k = cid(7).encode();
+
+        let mut changed = MigrationSweep::default();
+        changed.register(&k);
+        changed.resolve(&k, Some(cbor(&real)), true);
+        assert!(
+            plan_sweep_forward_put("abcdef1234", &changed, SiteState::default()).forward_put,
+            "a legacy generation that changed SITES must forward-PUT"
+        );
+
+        let mut dominated = MigrationSweep::default();
+        dominated.register(&k);
+        dominated.resolve(&k, Some(cbor(&real)), false);
+        assert!(
+            !plan_sweep_forward_put("abcdef1234", &dominated, real.clone()).forward_put,
+            "a dominated sweep must NOT forward-PUT (no write-amplification)"
+        );
+    }
+
+    #[test]
+    fn bug_b_deletion_propagates_forward_only_when_current_lacks_it() {
+        // Bug-B write-forward correctness: the forward PUT is gated on reconcile
+        // having changed SITES. A legacy generation carrying a deletion the
+        // current key LACKS changes SITES -> must forward-PUT so the deletion
+        // propagates to the current key. The reverse (current already has the
+        // deletion) is dominated -> must NOT forward-PUT.
+        let owner = key(2);
+        let pre_delete = signed_state(&owner, &[(1, "home", 100), (2, "newest", 200)]);
+        let mut post_delete = pre_delete.clone();
+        post_delete
+            .delete_page(
+                &delta_core::SignedPageDeletion::new(2, 300, &owner),
+                &owner.verifying_key(),
+            )
+            .unwrap();
+        let k = cid(7).encode();
+
+        // Current key LACKS the deletion (pre_delete); a legacy generation HAS
+        // it (post_delete). reconcile_into(current, legacy) changes SITES.
+        let mut current = pre_delete.clone();
+        let changed = reconcile_into(&mut current, &post_delete);
+        assert!(
+            changed,
+            "the recovered deletion must change the pre-delete current state"
+        );
+        assert!(
+            !current.pages.contains_key(&2),
+            "the deletion is present in the state we PUT forward"
+        );
+        let mut sweep = MigrationSweep::default();
+        sweep.register(&k);
+        sweep.resolve(&k, Some(cbor(&post_delete)), changed);
+        assert!(
+            plan_sweep_forward_put("abcdef1234", &sweep, pre_delete.clone()).forward_put,
+            "a recovered deletion the current key lacks must be written forward"
+        );
+
+        // Reverse: current key ALREADY has the deletion; the pre-delete
+        // generation is dominated -> no change -> no forward PUT.
+        let mut current2 = post_delete.clone();
+        let changed2 = reconcile_into(&mut current2, &pre_delete);
+        assert!(!changed2, "resurrecting a deleted page must be a no-op");
+        let mut sweep2 = MigrationSweep::default();
+        sweep2.register(&k);
+        sweep2.resolve(&k, Some(cbor(&pre_delete)), changed2);
+        assert!(
+            !plan_sweep_forward_put("abcdef1234", &sweep2, post_delete.clone()).forward_put,
+            "a dominated (deletion-already-present) generation must not write-amplify"
         );
     }
 }
