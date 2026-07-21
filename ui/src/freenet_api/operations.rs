@@ -1075,11 +1075,12 @@ fn record_sweep_timeout(prefix: &str, key_b58: &str, armed_gen: u64) {
 }
 
 /// Record the network current-key state for a prefix's in-flight sweep (once),
-/// so the finalize gate can PUT only when the reconciled SITES differs from what
-/// the current key already holds. Returns whether this was the FIRST recording
-/// (so the caller requests the unload-window backup exactly once). Returns
-/// `false` — and requests nothing — if there is no sweep for the prefix (the
-/// site had no legacy candidates, so there is nothing to finalize / recover).
+/// so the finalize gate can PUT only when the reconciled SITES differs from
+/// what the current key already holds. Baseline recording ONLY: the
+/// unload-window backup request is sweep-independent (`request_backup_once` /
+/// `BACKUP_REQUESTED_PREFIXES`), so a missing or already-finalized sweep does
+/// not affect it. Returns whether this was the first recording (informational;
+/// `false` when there is no live sweep to record into).
 fn record_sweep_current_key_state(prefix: &str, state: SiteState) -> bool {
     MIGRATION_SWEEPS.with_mut(|sweeps| {
         sweeps
