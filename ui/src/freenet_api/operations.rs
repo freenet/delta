@@ -830,30 +830,41 @@ fn drive_fold_probe(
 }
 
 // ---------------------------------------------------------------------------
-// Per-prefix migration sweep: driver-owned single forward PUT
+// Per-prefix migration sweep: batched single forward PUT
 // ---------------------------------------------------------------------------
 //
-// Delta fires every legacy / stale-key / self-heal candidate GET concurrently
-// (unchanged — the concurrent fan-out is Delta's strength). Their responses
-// stream in and each is STILL reconciled into SITES + backed up to the delegate
-// immediately (per-response UX preserved). What changes is the forward PUT: the
-// pre-driver code re-PUT the reconciled state to the current contract key on
-// EVERY legacy response that changed local state. The driver folds to ONE
-// outcome, so we instead accumulate the fired candidates' responses here and,
-// once every candidate has resolved (a GET response or a NotFound), run a
-// `FoldAll` probe and do a SINGLE forward PUT of the reconciled state — gated
-// on a legacy generation having actually changed SITES, so a no-op (dominated)
-// sweep never write-amplifies. This is the "one-final-PUT" adoption
-// (freenet-migrate#6). The state PUT is the canonical reconciled SITES value,
-// which the per-response merges (the same `reconcile_into` the driver folds
-// with) have already produced.
+// Honest framing: `reconcile_into` still owns the production data decisions —
+// every legacy / stale-key / self-heal candidate GET is fired concurrently (the
+// concurrent fan-out is Delta's strength, unchanged) and each response is STILL
+// reconciled into SITES + backed up to the delegate immediately (per-response
+// visibility preserved). The freenet-migrate driver's role here is to VALIDATE
+// and PIN the fold (via `DeltaProbeOps` + the property tests, which prove the
+// merge is a sound `FoldAll`) and to BOUND the sweep into ONE decision, not to
+// re-implement the merge.
 //
-// Bounded divergence vs the pre-driver code: the forward PUT is deferred to
-// sweep completion instead of firing per-response. If a candidate is genuinely
-// lost (no GET response AND no NotFound) the sweep never completes this session,
-// so the forward PUT waits for the next reload — but SITES is already updated
-// and delegate-backed-up, and `restore_known_sites` re-fires the sweep next
-// load. This is the accepted trade for owning the fold as one decision.
+// What changes vs the pre-driver code: the forward PUT. It used to re-PUT the
+// reconciled state to the current contract key on EVERY legacy response that
+// changed local state; now the fired candidates' responses are accumulated and,
+// once every candidate has resolved (a GET response, a NotFound, or a
+// per-candidate timeout), a single forward PUT of the reconciled state fires —
+// gated on a legacy generation having actually changed SITES, so a dominated
+// sweep never write-amplifies. This is the "one-final-PUT" adoption
+// (freenet-migrate#6). The state PUT is the canonical reconciled SITES value
+// (`forward_put_current_site`), which the per-response merges (the same
+// `reconcile_into`) already produced — never the driver's `Outcome::merged`.
+//
+// Divergences vs the pre-driver per-response PUT (both bounded):
+//   1. Benign: with no lost candidate, the same reconciled state is PUT once at
+//      completion instead of once per changing generation. End state identical.
+//   2. Real, and specifically handled: a candidate whose GET is slow enough to
+//      lose the race to its 30s timeout is first recorded as a miss (possibly
+//      COMPLETING and finalizing the sweep); its real response then arrives,
+//      reconciles newer data into SITES, and — because the sweep is already
+//      gone — would NOT propagate to the current key. That is caught by
+//      `plan_late_response_action` -> `LateResponseAction::ForwardPutNow`, a
+//      one-off forward PUT for the late change. (If the sweep is still live, the
+//      late change instead re-arms the eventual finalize via
+//      `MigrationSweep::resolve`'s changed_local OR.)
 
 /// Accumulates one prefix's in-flight initial-capture migration sweep.
 #[derive(Default)]
@@ -880,14 +891,26 @@ impl MigrationSweep {
 
     /// Record a resolved candidate (`Some(bytes)` GET state or `None` miss) and
     /// OR in whether it changed local state. Ignores keys that were never a
-    /// candidate and is idempotent against a duplicate delivery. Returns
-    /// whether the sweep is now complete (every fired candidate resolved).
+    /// candidate. Returns whether the sweep is now complete (every fired
+    /// candidate resolved).
+    ///
+    /// The `changed_local` OR runs even for an ALREADY-resolved candidate: a
+    /// real GET response arriving after that candidate's timeout-miss (while the
+    /// sweep is still tracked) carries data the per-response reconcile has put
+    /// into SITES, and it must still gate the eventual forward PUT. Such a late
+    /// response does not re-count toward completion and does not overwrite the
+    /// first recorded response. (The distinct case where the sweep has ALREADY
+    /// finalized is handled by `plan_late_response_action` /
+    /// `LateResponseAction::ForwardPutNow`, not here.)
     fn resolve(&mut self, key_b58: &str, response: Option<Vec<u8>>, changed_local: bool) -> bool {
-        if !self.candidates.iter().any(|c| c == key_b58) || self.responses.contains_key(key_b58) {
+        if !self.candidates.iter().any(|c| c == key_b58) {
+            return false;
+        }
+        self.changed_local |= changed_local;
+        if self.responses.contains_key(key_b58) {
             return false;
         }
         self.responses.insert(key_b58.to_string(), response);
-        self.changed_local |= changed_local;
         self.is_complete()
     }
 
@@ -926,22 +949,91 @@ fn register_sweep_candidate(prefix: &str, key_b58: &str) {
     });
 }
 
+/// What to do with a resolved candidate for a prefix, given whether that
+/// prefix's sweep is still tracked. Pure, so the finalize -> late-response
+/// orchestration is unit-testable off the Dioxus globals.
+#[derive(Debug, PartialEq, Eq)]
+enum LateResponseAction {
+    /// The sweep is still tracked: record the resolution into it (it will
+    /// finalize when complete, PUTting if a legacy generation changed SITES).
+    Resolve,
+    /// The sweep already finalized (or never existed) and this response changed
+    /// SITES: fire a one-off forward PUT now so the recovered data reaches the
+    /// current contract key. The single-PUT common case already ran at finalize;
+    /// this covers a slow generation whose real response lost the race to its
+    /// own 30s timeout (which had completed the sweep as a miss). Without it the
+    /// recovered state would sit local-only + delegate-backed-up but never
+    /// propagate to the network this session, and — once the current key holds
+    /// the partial migration — reload would not NotFound, so the backup fallback
+    /// would not fire either (the BLOCKING data-propagation bug two reviewers
+    /// independently caught).
+    ForwardPutNow,
+    /// The sweep already finalized and this response changed nothing: nothing to
+    /// do (no write-amplification).
+    Ignore,
+}
+
+/// Decide what a resolved candidate should trigger. See [`LateResponseAction`].
+fn plan_late_response_action(sweep_tracked: bool, changed_local: bool) -> LateResponseAction {
+    match (sweep_tracked, changed_local) {
+        (true, _) => LateResponseAction::Resolve,
+        (false, true) => LateResponseAction::ForwardPutNow,
+        (false, false) => LateResponseAction::Ignore,
+    }
+}
+
 /// Record a resolved candidate for a prefix's sweep. `changed_local` is whether
-/// this response's reconcile changed SITES. When every fired candidate has
-/// resolved, finalize the sweep.
+/// this response's reconcile changed SITES. Routes via
+/// [`plan_late_response_action`]: a normal resolution into a tracked sweep
+/// (finalizing when complete), or — for a response arriving after the sweep has
+/// already finalized — a one-off forward PUT when it changed SITES.
 fn record_sweep_resolution(
     prefix: &str,
     key_b58: &str,
     response: Option<Vec<u8>>,
     changed_local: bool,
 ) {
-    let ready = MIGRATION_SWEEPS.with_mut(|sweeps| {
-        sweeps
-            .get_mut(prefix)
-            .is_some_and(|sweep| sweep.resolve(key_b58, response, changed_local))
-    });
-    if ready {
-        finalize_migration_sweep(prefix);
+    let sweep_tracked = MIGRATION_SWEEPS.read().contains_key(prefix);
+    match plan_late_response_action(sweep_tracked, changed_local) {
+        LateResponseAction::Resolve => {
+            let ready = MIGRATION_SWEEPS.with_mut(|sweeps| {
+                sweeps
+                    .get_mut(prefix)
+                    .is_some_and(|sweep| sweep.resolve(key_b58, response, changed_local))
+            });
+            if ready {
+                finalize_migration_sweep(prefix);
+            }
+        }
+        LateResponseAction::ForwardPutNow => {
+            log(&format!(
+                "Delta: late migration response for {prefix} arrived after the sweep \
+                 finalized; propagating recovered state with a one-off forward PUT"
+            ));
+            forward_put_current_site(prefix);
+        }
+        LateResponseAction::Ignore => {}
+    }
+}
+
+/// PUT the current reconciled SITES state for `prefix` forward to the current
+/// contract key and persist known sites. Shared by the sweep finalize and the
+/// late-response-after-finalize one-off PUT.
+///
+/// The payload is the canonical reconciled SITES state, NOT the driver's
+/// `Outcome::merged`. Do NOT switch the payload to `outcome.merged` without
+/// revisiting `DeltaProbeOps::merge_with_local` (which is fail-closed toward the
+/// LOCAL snapshot on a verification failure, the opposite of the driver's
+/// advisory hint) and non-registry stale keys (a fired stale stored key that is
+/// not a registry hash contributes to SITES but is not a driver candidate, so
+/// it would be missing from `outcome.merged`).
+fn forward_put_current_site(prefix: &str) {
+    if let Some(merged) = state::SITES.read().get(prefix).map(|s| s.state.clone()) {
+        let params = delta_core::SiteParameters {
+            prefix: prefix.to_string(),
+        };
+        put_site(&params, &merged);
+        super::delegate::save_known_sites();
     }
 }
 
@@ -953,9 +1045,11 @@ struct SweepPlan {
     /// code PUT on (a legacy generation actually changed local SITES state), so
     /// a dominated (no-op) sweep never write-amplifies.
     forward_put: bool,
-    /// Whether the fold was cut short by the hop cap (missing the oldest
-    /// generations). Impossible for Delta at ≤ a handful of generations vs a 64
-    /// hop cap, but surfaced so a future lineage explosion is loud, not silent.
+    /// Whether the fold was cut short by the FIXED 64-hop cap (missing the
+    /// oldest generations). Delta's registry is 5, far under 64, so this never
+    /// fires today — but the cap is fixed (not `len().max(64)`, which could
+    /// never truncate) so the warning becomes real if the lineage ever exceeds
+    /// the cap.
     truncated_fold: bool,
 }
 
@@ -973,7 +1067,6 @@ struct SweepPlan {
 /// forward PUT of SITES still carries it.)
 fn plan_sweep_forward_put(prefix: &str, sweep: &MigrationSweep, local: SiteState) -> SweepPlan {
     let candidates = legacy_lineage_newest_first(prefix);
-    let max_hops = candidates.len().max(DEFAULT_MAX_PROBE_HOPS);
     let responses: HashMap<ContractInstanceId, Option<Vec<u8>>> = sweep
         .candidates
         .iter()
@@ -983,8 +1076,14 @@ fn plan_sweep_forward_put(prefix: &str, sweep: &MigrationSweep, local: SiteState
                 .map(|id| (id, sweep.responses.get(b58).cloned().unwrap_or(None)))
         })
         .collect();
-    let outcome = drive_fold_probe(candidates, &responses, local, max_hops);
+    // FIXED hop cap (not `len().max(64)`): a lineage larger than the cap must
+    // actually truncate so the `truncated_fold` warning is real signal.
+    let outcome = drive_fold_probe(candidates, &responses, local, DEFAULT_MAX_PROBE_HOPS);
     SweepPlan {
+        // The write gate is reconcile's changed-signal (a legacy generation
+        // actually changed SITES) — NOT the driver outcome, which would over-PUT
+        // a real-but-dominated generation. The PUT payload is canonical SITES,
+        // never `outcome.merged` (see `forward_put_current_site`).
         forward_put: sweep.changed_local,
         truncated_fold: matches!(
             outcome,
@@ -1023,17 +1122,11 @@ fn finalize_migration_sweep(prefix: &str) {
         return;
     }
 
-    if let Some(merged) = state::SITES.read().get(prefix).map(|s| s.state.clone()) {
-        let params = delta_core::SiteParameters {
-            prefix: prefix.to_string(),
-        };
-        put_site(&params, &merged);
-        super::delegate::save_known_sites();
-        log(&format!(
-            "Delta: migration sweep for {prefix} complete; reconciled state PUT \
-             to the current contract key"
-        ));
-    }
+    log(&format!(
+        "Delta: migration sweep for {prefix} complete; reconciled state PUT \
+         to the current contract key"
+    ));
+    forward_put_current_site(prefix);
 }
 
 /// PUT (create) a site contract with full state.
@@ -1875,6 +1968,90 @@ mod tests {
         assert!(
             !plan_sweep_forward_put("abcdef1234", &sweep2, post_delete.clone()).forward_put,
             "a dominated (deletion-already-present) generation must not write-amplify"
+        );
+    }
+
+    #[test]
+    fn plan_late_response_action_covers_finalize_and_late_cases() {
+        // A still-tracked sweep -> normal resolve, regardless of change.
+        assert_eq!(
+            plan_late_response_action(true, true),
+            LateResponseAction::Resolve
+        );
+        assert_eq!(
+            plan_late_response_action(true, false),
+            LateResponseAction::Resolve
+        );
+        // Sweep already finalized + a late response that CHANGED SITES -> one-off
+        // forward PUT (the BLOCKING fix: a premature timeout completed the sweep,
+        // then the real response arrived and reconciled newer data into SITES).
+        assert_eq!(
+            plan_late_response_action(false, true),
+            LateResponseAction::ForwardPutNow
+        );
+        // Sweep already finalized + a late response that changed nothing ->
+        // ignore (no write-amplification).
+        assert_eq!(
+            plan_late_response_action(false, false),
+            LateResponseAction::Ignore
+        );
+    }
+
+    #[test]
+    fn resolve_ors_changed_local_for_a_late_but_live_response() {
+        // A candidate resolved as a timeout-miss (changed=false); its real
+        // response then arrives while the sweep is STILL live and DID change
+        // SITES. `resolve` must OR changed_local so the eventual finalize
+        // forward-PUTs the late data — without re-counting completion or
+        // overwriting the first recorded response.
+        let mut sweep = MigrationSweep::default();
+        sweep.register("a");
+        sweep.register("b");
+        assert!(!sweep.resolve("a", None, false), "a timed out as a miss");
+        assert!(!sweep.changed_local);
+        assert!(
+            !sweep.resolve("a", Some(vec![1]), true),
+            "a late response for an already-resolved candidate must not re-complete"
+        );
+        assert!(
+            sweep.changed_local,
+            "a late change on a still-live sweep must still gate the forward PUT"
+        );
+        assert_eq!(
+            sweep.responses.get("a"),
+            Some(&None),
+            "the first (miss) response is kept, not overwritten"
+        );
+        assert!(
+            sweep.resolve("b", None, false),
+            "completing b finalizes with changed_local carried"
+        );
+    }
+
+    #[test]
+    fn driver_marks_fold_truncated_past_the_fixed_hop_cap() {
+        // The hop cap is FIXED at DEFAULT_MAX_PROBE_HOPS (not `len().max(64)`,
+        // which could never truncate), so a lineage larger than the cap actually
+        // truncates and the warning is real. Delta's registry is 5 (never
+        // truncates); this pins the guard for a future lineage explosion.
+        let owner = key(9);
+        let real = signed_state(&owner, &[(1, "x", 100)]);
+        let ids: Vec<ContractInstanceId> =
+            (1..=(DEFAULT_MAX_PROBE_HOPS as u8 + 1)).map(cid).collect();
+        let responses: HashMap<ContractInstanceId, Option<Vec<u8>>> =
+            ids.iter().map(|id| (*id, Some(cbor(&real)))).collect();
+        let outcome = drive_fold_probe(
+            NewestFirst::assume_ordered(ids),
+            &responses,
+            SiteState::default(),
+            DEFAULT_MAX_PROBE_HOPS,
+        );
+        let Outcome::Recovered { truncated_fold, .. } = outcome else {
+            panic!("expected recovery");
+        };
+        assert!(
+            truncated_fold,
+            "a lineage exceeding the hop cap must mark the fold truncated"
         );
     }
 }
