@@ -158,24 +158,31 @@ fn handle_contract_response(response: ContractResponse) {
 
             let state_bytes = state.to_vec();
 
-            // Current-key resolution + unload-window backup — DECOUPLED from
-            // classification. A GET whose key resolves to a known site's current
-            // key (legacy keys never do) records that state into the prefix's
-            // sweep the first time it is seen and, on that first recording,
-            // requests the delegate backup exactly once. This must not live in
-            // the InitialCurrentKey arm alone: a nonempty LEGACY response
-            // arriving first removes the prefix from MIGRATING_PREFIXES, so the
-            // current-key response then classifies as LiveUpdate and would skip
-            // both the baseline recording (defeating the write-amplification
-            // gate) and the backup request (stranding unload recovery). Runs
-            // before the match, so SITES holds this state before any async
-            // backup response is processed (option-B invariant).
+            // Current-key resolution — DECOUPLED from classification (a nonempty
+            // LEGACY response arriving first removes the prefix from
+            // MIGRATING_PREFIXES, so the current-key response then classifies as
+            // LiveUpdate). A GET whose key resolves to a known site's current key
+            // (legacy keys never do) drives two independent things:
+            //
+            //   * The unload-window backup request, fired ONCE per prefix per
+            //     session, UNCONDITIONALLY on any current-key resolution —
+            //     nonempty, empty, or undecodable — and independent of the sweep
+            //     and its lifetime. A one-candidate sweep can finalize (and be
+            //     removed) before the current-key response, and a site may have
+            //     no legacy candidates at all; a sweep-gated request would be
+            //     skipped in exactly those orderings. Firing after the current
+            //     key resolves preserves option-B's no-write-amplification: by
+            //     the time the (local) backup response is reconciled, SITES holds
+            //     the current-key state, so the backup only PUTs when it exceeds
+            //     it.
+            //   * The sweep's current-key BASELINE recording (for the finalize
+            //     gate), which naturally needs a decodable nonempty state and a
+            //     live sweep, so it stays gated on those.
             if let Some(prefix) = prefix_for_key.as_deref() {
+                request_backup_once(prefix);
                 if !state_bytes.is_empty() {
                     if let Ok(current_state) = from_reader::<SiteState, _>(state_bytes.as_slice()) {
-                        if record_sweep_current_key_state(prefix, current_state) {
-                            super::delegate::request_site_state_backup(prefix);
-                        }
+                        record_sweep_current_key_state(prefix, current_state);
                     }
                 }
             }
@@ -1097,6 +1104,43 @@ pub(crate) fn note_forward_put_baseline(prefix: &str, payload: &SiteState) {
     });
 }
 
+/// Prefixes whose unload-window state backup has already been requested this
+/// session. Tracked INDEPENDENTLY of `MIGRATION_SWEEPS` and its lifetime: the
+/// backup request must fire on ANY current-key resolution for a known site, even
+/// when a one-candidate sweep finalized (and was removed) before the current-key
+/// response arrives, when the current-key response is empty/undecodable, or when
+/// the site has no legacy candidates at all — orderings where a sweep-gated
+/// request would be skipped. Resets each session (page reload), which is exactly
+/// the reload-recovery cadence.
+static BACKUP_REQUESTED_PREFIXES: GlobalSignal<BTreeSet<String>> = GlobalSignal::new(BTreeSet::new);
+
+/// Whether the unload-window backup should be requested for `prefix` now, given
+/// the prefixes already requested this session. Pure; the once-per-prefix
+/// decision independent of sweep lifetime and response content.
+fn should_request_backup(already_requested: &BTreeSet<String>, prefix: &str) -> bool {
+    !already_requested.contains(prefix)
+}
+
+/// Request the delegate state backup for `prefix` exactly once per session, on
+/// ANY current-key resolution (nonempty, empty, or undecodable alike). Fired
+/// AFTER the current key resolves, so `handle_restored_site_state` reconciles
+/// against a SITES that already holds the current-key state and PUTs only when
+/// the backup exceeds it (no write-amplification). Independent of the sweep, so
+/// it still fires in the orderings a sweep-gated request would miss.
+fn request_backup_once(prefix: &str) {
+    let fire = BACKUP_REQUESTED_PREFIXES.with_mut(|set| {
+        if should_request_backup(set, prefix) {
+            set.insert(prefix.to_string());
+            true
+        } else {
+            false
+        }
+    });
+    if fire {
+        super::delegate::request_site_state_backup(prefix);
+    }
+}
+
 /// What to do with a resolved candidate for a prefix, given whether that
 /// prefix's sweep is still tracked. Pure, so the finalize -> late-response
 /// orchestration is unit-testable off the Dioxus globals.
@@ -1736,13 +1780,18 @@ mod tests {
     /// revision of the base page. Config is held constant and content changes
     /// bump `updated_at`, so these samples exercise the HONEST domain over which
     /// the merge is commutative + idempotent + order-invariant: distinct
-    /// `updated_at`/`version` per write. The known exclusions (both documented
-    /// at the FoldAll header, both pre-existing, both shared by today's sweep):
-    /// (a) two writes conflicting at an EQUAL `updated_at`/`version` resolve
-    /// keep-accumulator, so they are order-dependent (a concurrent-tab edge, not
-    /// generational drift); (b) a pre-tombstone (C1) delete can resurrect. These
-    /// samples deliberately avoid (a) because it does not occur across genuine
-    /// generations and is not what FoldAll folds.
+    /// `updated_at`/`version` per write, and at most one deletion per page. The
+    /// THREE known exclusions (all documented at the FoldAll header, all
+    /// pre-existing, all shared by today's concurrent sweep): (a) two writes
+    /// conflicting at an EQUAL `updated_at`/`version` resolve keep-accumulator
+    /// (order-dependent — a concurrent-tab edge, not generational drift); (b) the
+    /// same page deleted twice at different `deleted_at` keeps the accumulator's
+    /// tombstone (order-dependent in the recorded timestamp, but the page stays
+    /// deleted either way — see
+    /// `conflicting_tombstone_deleted_at_is_order_dependent_but_page_stays_deleted`);
+    /// (c) a pre-tombstone (C1) delete can resurrect. These samples deliberately
+    /// avoid (a) and (b) because neither occurs across genuine generations and
+    /// neither is what FoldAll folds.
     fn fold_samples(owner: &ed25519_dalek::SigningKey) -> Vec<SiteState> {
         let s1 = signed_state(owner, &[(1, "home", 100)]);
         let s2 = signed_state(owner, &[(1, "home", 100), (2, "about", 200)]);
@@ -1757,13 +1806,18 @@ mod tests {
     }
 
     #[test]
-    fn merge_generations_satisfies_fold_all_preconditions() {
+    fn merge_is_fold_all_sound_over_the_honest_generational_domain() {
         // G1.5: FoldAll is only sound when the merge is commutative +
         // idempotent + fold-order-invariant. `DeltaProbeOps::merge_generations`
         // delegates to `reconcile_into`, so this proves Delta's incident fix
-        // satisfies the FoldAll preconditions before the `FoldAllAck` is
-        // constructed anywhere in production. If any of these fail, FoldAll is
-        // NOT sound for Delta and the adoption must stop.
+        // satisfies the FoldAll preconditions OVER THE HONEST DOMAIN — distinct
+        // `updated_at`/`version` per write and at most one deletion per page, the
+        // domain `fold_samples` exercises. The three documented exclusions (equal
+        // -timestamp conflicting writes; the same page deleted twice at different
+        // `deleted_at`; pre-tombstone-C1 resurrection) are order-dependent, all
+        // pre-existing and shared by today's sweep, and are pinned by their own
+        // tests rather than asserted commutative here. If any assertion below
+        // fails, FoldAll is NOT sound for Delta and the adoption must stop.
         let owner = key(1);
         let samples = fold_samples(&owner);
         let merge = |a: SiteState, b: SiteState| DeltaProbeOps.merge_generations(a, b);
@@ -2318,11 +2372,10 @@ mod tests {
     }
 
     #[test]
-    fn current_key_state_records_once_so_the_backup_is_requested_once() {
-        // Codex P1: the current-key state recording (and the one-shot backup
-        // request keyed off its `true` return) must fire exactly once regardless
-        // of how many current-key responses arrive — including when a legacy
-        // response reclassifies the current-key response as LiveUpdate.
+    fn current_key_state_is_recorded_once_as_the_gate_baseline() {
+        // The sweep's current-key baseline (used ONLY by the finalize
+        // write-amplification gate) records the FIRST current-key state seen and
+        // ignores later ones.
         let owner = key(4);
         let s1 = signed_state(&owner, &[(1, "home", 100)]);
         let s2 = signed_state(&owner, &[(1, "home", 100), (2, "extra", 200)]);
@@ -2331,16 +2384,47 @@ mod tests {
         sweep.register("k");
         assert!(
             sweep.record_current_key_state(s1.clone()),
-            "first current-key recording returns true → request backup once"
+            "first recording"
         );
         assert!(
             !sweep.record_current_key_state(s2.clone()),
-            "a later current-key response must not re-record or re-request the backup"
+            "a later current-key response must not overwrite the baseline"
         );
         assert_eq!(
             sweep.current_key_state.as_ref(),
             Some(&s1),
             "the first current-key state is kept as the baseline"
+        );
+    }
+
+    #[test]
+    fn backup_requested_once_per_prefix_independent_of_sweep_and_content() {
+        // Codex P1 (delta-check): the unload-window backup request must fire
+        // exactly once per prefix per session, DECOUPLED from the sweep — so it
+        // still fires when a one-candidate sweep finalized first, when the
+        // current-key response is empty/undecodable, or when the site has no
+        // legacy candidates. `should_request_backup` depends only on the
+        // already-requested set, never on sweep state or response content.
+        let mut requested = BTreeSet::new();
+
+        // First current-key resolution for a prefix → request (whatever the
+        // ordering or response content).
+        assert!(
+            should_request_backup(&requested, "aaaaaaaaaa"),
+            "first current-key resolution requests the backup"
+        );
+        requested.insert("aaaaaaaaaa".to_string());
+        // A second current-key resolution for the same prefix → no re-request
+        // (e.g. an empty current-key response after a nonempty one, or a
+        // steady-state re-GET).
+        assert!(
+            !should_request_backup(&requested, "aaaaaaaaaa"),
+            "a second current-key resolution does not re-request"
+        );
+        // A different prefix requests independently.
+        assert!(
+            should_request_backup(&requested, "bbbbbbbbbb"),
+            "a different prefix requests independently"
         );
     }
 
