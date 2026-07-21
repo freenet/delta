@@ -47,6 +47,13 @@ hex = "0.4"
 
 # Freenet
 freenet-stdlib = { workspace = true, features = ["net"] }
+# Shared contract/delegate upgrade-migration machinery. We use its sans-IO
+# `driver` (ProbeDriver / ProbeStateOps / SelectionPolicy::FoldAll): the same
+# decision machinery River and riverctl ship, so the anti-rollback +
+# tombstone-preservation guarantees live in one reviewed, property-tested place
+# rather than being re-derived in each app. Pins freenet-stdlib ^0.8.2, which
+# unifies with our 0.8.3 so ContractInstanceId/Parameters are the same types.
+freenet-migrate = "0.3.0"
 
 # Internal
 delta-core.workspace = true
