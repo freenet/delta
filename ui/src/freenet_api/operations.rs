@@ -3,7 +3,7 @@ use delta_core::SiteState;
 use dioxus::prelude::ReadableExt;
 use freenet_migrate::{
     ContractLineageEntry, FoldAllAck, NewestFirst, Outcome, ProbeDriver, ProbeStateOps,
-    SelectionPolicy, Step,
+    SelectionPolicy, Step, DEFAULT_MAX_PROBE_HOPS,
 };
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse};
 use freenet_stdlib::prelude::*;
@@ -169,6 +169,12 @@ fn handle_contract_response(response: ContractResponse) {
                         log(&format!(
                             "Delta: migration GET returned empty for site {prefix}"
                         ));
+                        // An empty legacy generation is a resolved candidate
+                        // (a miss for the fold). Record it so the sweep can
+                        // complete; preserve the pre-driver early return, which
+                        // deliberately does NOT clear MIGRATING_PREFIXES for an
+                        // empty response.
+                        record_sweep_resolution(&prefix, &key_b58, None, false);
                         return;
                     }
                     // Reconcile this legacy generation into local state via a
@@ -176,31 +182,27 @@ fn handle_contract_response(response: ContractResponse) {
                     // new data is adopted, deletions on either side are preserved,
                     // and an older/dominated generation is a no-op. We do NOT drop
                     // late responses and do NOT cancel sibling probes, so a
-                    // still-newer generation can also contribute. If the merge
-                    // changed anything, PUT the RECONCILED local state (not the raw
-                    // incoming bytes) forward to the current contract key so a
-                    // deletion the merge preserved isn't undone on the current key.
+                    // still-newer generation can also contribute.
+                    //
+                    // The forward PUT of the reconciled state is deferred to
+                    // sweep completion (`finalize_migration_sweep`) — the driver
+                    // folds all generations to one outcome and PUTs once, instead
+                    // of re-PUTting per response. Record this resolved candidate
+                    // and whether it changed local state (the exact condition the
+                    // pre-driver code PUT on).
                     let new_key = state::contract_key_from_prefix(&prefix);
-                    if handle_site_state(new_key, &state_bytes) {
+                    let changed = handle_site_state(new_key, &state_bytes);
+                    if changed {
                         log(&format!(
-                            "Delta: merged newer data for site {prefix}; \
-                             migrating reconciled state to the current contract key"
+                            "Delta: merged newer data for site {prefix} from a legacy generation"
                         ));
-                        if let Some(merged) =
-                            state::SITES.read().get(&prefix).map(|s| s.state.clone())
-                        {
-                            let params = delta_core::SiteParameters {
-                                prefix: prefix.clone(),
-                            };
-                            put_site(&params, &merged);
-                        }
-                        super::delegate::save_known_sites();
                     } else {
                         log(&format!(
                             "Delta: legacy generation for site {prefix} added no new \
                              data (dominated by current); ignored"
                         ));
                     }
+                    record_sweep_resolution(&prefix, &key_b58, Some(state_bytes), changed);
                     // Initial capture has progressed for this prefix; a
                     // subsequent current-key GET now flows through the
                     // LiveUpdate path (still merge-guarded).
@@ -271,11 +273,14 @@ fn handle_contract_response(response: ContractResponse) {
             // current contract key alongside the legacy-hash probes,
             // so a NotFound on one legacy hash does not need to retry
             // the current key here — that GET is already in flight.
-            if PENDING_MIGRATIONS.write().remove(&key_b58).is_some() {
+            let pending_prefix = PENDING_MIGRATIONS.write().remove(&key_b58);
+            if let Some(prefix) = pending_prefix {
                 log(&format!(
                     "Delta: legacy contract key {key_b58} has no state; \
                      another probe may still succeed"
                 ));
+                // Resolve this candidate as a miss so the sweep can complete.
+                record_sweep_resolution(&prefix, &key_b58, None, false);
             } else if let Some(prefix) = find_prefix_for_contract_key_b58(&key_b58) {
                 // Network doesn't have this contract under its current
                 // key either — try restoring from a delegate backup.
@@ -575,6 +580,10 @@ pub fn get_for_migration(old_key_b58: &str, prefix: &str) {
     PENDING_MIGRATIONS
         .write()
         .insert(old_key_b58.to_string(), prefix.to_string());
+    // Track this candidate in the prefix's sweep so the driver's single forward
+    // PUT fires once every candidate has resolved. Registered synchronously
+    // here, before any response can arrive.
+    register_sweep_candidate(prefix, old_key_b58);
 
     log(&format!(
         "Delta: GET from old contract for migration: {old_key_b58}"
@@ -772,7 +781,6 @@ fn cbor_site_params(prefix: &str) -> Vec<u8> {
 /// the merge is what makes that safe. A candidate with no map entry is treated
 /// as a miss (the finalize caller only runs this once every fired candidate has
 /// resolved, so that path is defensive).
-#[allow(dead_code)]
 fn drive_fold_probe(
     candidates: NewestFirst,
     responses: &HashMap<ContractInstanceId, Option<Vec<u8>>>,
@@ -796,6 +804,184 @@ fn drive_fold_probe(
     driver
         .take_outcome()
         .expect("Step::Done implies an untaken outcome")
+}
+
+// ---------------------------------------------------------------------------
+// Per-prefix migration sweep: driver-owned single forward PUT
+// ---------------------------------------------------------------------------
+//
+// Delta fires every legacy / stale-key / self-heal candidate GET concurrently
+// (unchanged — the concurrent fan-out is Delta's strength). Their responses
+// stream in and each is STILL reconciled into SITES + backed up to the delegate
+// immediately (per-response UX preserved). What changes is the forward PUT: the
+// pre-driver code re-PUT the reconciled state to the current contract key on
+// EVERY legacy response that changed local state. The driver folds to ONE
+// outcome, so we instead accumulate the fired candidates' responses here and,
+// once every candidate has resolved (a GET response or a NotFound), run a
+// `FoldAll` probe and do a SINGLE forward PUT of the reconciled state — gated
+// on a legacy generation having actually changed SITES, so a no-op (dominated)
+// sweep never write-amplifies. This is the "one-final-PUT" adoption
+// (freenet-migrate#6). The state PUT is the canonical reconciled SITES value,
+// which the per-response merges (the same `reconcile_into` the driver folds
+// with) have already produced.
+//
+// Bounded divergence vs the pre-driver code: the forward PUT is deferred to
+// sweep completion instead of firing per-response. If a candidate is genuinely
+// lost (no GET response AND no NotFound) the sweep never completes this session,
+// so the forward PUT waits for the next reload — but SITES is already updated
+// and delegate-backed-up, and `restore_known_sites` re-fires the sweep next
+// load. This is the accepted trade for owning the fold as one decision.
+
+/// Accumulates one prefix's in-flight initial-capture migration sweep.
+#[derive(Default)]
+struct MigrationSweep {
+    /// Candidate keys (base58) fired via `get_for_migration` for this prefix.
+    candidates: Vec<String>,
+    /// Resolved responses so far, keyed by candidate base58 key:
+    /// `Some(bytes)` = GET state, `None` = a NotFound / empty / miss.
+    responses: HashMap<String, Option<Vec<u8>>>,
+    /// Whether any legacy generation actually changed local SITES state — the
+    /// exact condition under which the pre-driver code PUT the reconciled state
+    /// forward. Preserved so a dominated (no-op) sweep never write-amplifies.
+    changed_local: bool,
+}
+
+impl MigrationSweep {
+    /// Track a fired candidate key. Idempotent — a key fired twice is one
+    /// candidate.
+    fn register(&mut self, key_b58: &str) {
+        if !self.candidates.iter().any(|c| c == key_b58) {
+            self.candidates.push(key_b58.to_string());
+        }
+    }
+
+    /// Record a resolved candidate (`Some(bytes)` GET state or `None` miss) and
+    /// OR in whether it changed local state. Ignores keys that were never a
+    /// candidate and is idempotent against a duplicate delivery. Returns
+    /// whether the sweep is now complete (every fired candidate resolved).
+    fn resolve(&mut self, key_b58: &str, response: Option<Vec<u8>>, changed_local: bool) -> bool {
+        if !self.candidates.iter().any(|c| c == key_b58) || self.responses.contains_key(key_b58) {
+            return false;
+        }
+        self.responses.insert(key_b58.to_string(), response);
+        self.changed_local |= changed_local;
+        self.is_complete()
+    }
+
+    /// Whether every fired candidate has resolved. A sweep with no candidates
+    /// is never "complete" (there is nothing to finalize).
+    fn is_complete(&self) -> bool {
+        !self.candidates.is_empty()
+            && self
+                .candidates
+                .iter()
+                .all(|c| self.responses.contains_key(c))
+    }
+}
+
+/// In-flight migration sweeps, keyed by site prefix. An entry is created when
+/// the first candidate GET for a prefix is fired and removed when the sweep
+/// finalizes.
+static MIGRATION_SWEEPS: GlobalSignal<BTreeMap<String, MigrationSweep>> =
+    GlobalSignal::new(BTreeMap::new);
+
+/// Register a fired migration-candidate key under its prefix's sweep. Called
+/// synchronously from `get_for_migration`, before any response can arrive, so
+/// the full candidate set is known by the time the first response lands.
+fn register_sweep_candidate(prefix: &str, key_b58: &str) {
+    MIGRATION_SWEEPS.with_mut(|sweeps| {
+        sweeps
+            .entry(prefix.to_string())
+            .or_default()
+            .register(key_b58);
+    });
+}
+
+/// Record a resolved candidate for a prefix's sweep. `changed_local` is whether
+/// this response's reconcile changed SITES. When every fired candidate has
+/// resolved, finalize the sweep.
+fn record_sweep_resolution(
+    prefix: &str,
+    key_b58: &str,
+    response: Option<Vec<u8>>,
+    changed_local: bool,
+) {
+    let ready = MIGRATION_SWEEPS.with_mut(|sweeps| {
+        sweeps
+            .get_mut(prefix)
+            .is_some_and(|sweep| sweep.resolve(key_b58, response, changed_local))
+    });
+    if ready {
+        finalize_migration_sweep(prefix);
+    }
+}
+
+/// Fold a completed sweep through the driver and, if a legacy generation
+/// contributed new data, PUT the reconciled state forward to the current
+/// contract key exactly once.
+fn finalize_migration_sweep(prefix: &str) {
+    let Some(sweep) = MIGRATION_SWEEPS.with_mut(|sweeps| sweeps.remove(prefix)) else {
+        return;
+    };
+
+    // Fold the sweep's generations through the driver, newest-first by the
+    // registry generation order. FoldAll's fold is order-independent (proven by
+    // the `policy_check` tests); ordering follows the registry so the probe
+    // order matches the anti-rollback intent. `local` is the current reconciled
+    // SITES state, which the per-response merges have already folded these
+    // generations into — so the driver's fold is the idempotent confirmation and
+    // the value we actually PUT is that canonical SITES state. (A fired stale
+    // stored key that is not itself a registry hash — rare — is folded into
+    // SITES per-response but not probed by the driver; the forward PUT of SITES
+    // still carries it.)
+    let candidates = legacy_lineage_newest_first(prefix);
+    let max_hops = candidates.len().max(DEFAULT_MAX_PROBE_HOPS);
+    let responses: HashMap<ContractInstanceId, Option<Vec<u8>>> = sweep
+        .candidates
+        .iter()
+        .filter_map(|b58| {
+            b58.parse::<ContractInstanceId>()
+                .ok()
+                .map(|id| (id, sweep.responses.get(b58).cloned().unwrap_or(None)))
+        })
+        .collect();
+    let local = state::SITES
+        .read()
+        .get(prefix)
+        .map(|s| s.state.clone())
+        .unwrap_or_default();
+    let outcome = drive_fold_probe(candidates, &responses, local, max_hops);
+    if let Outcome::Recovered {
+        truncated_fold: true,
+        ..
+    } = &outcome
+    {
+        // Should be impossible for Delta (≤ a handful of generations vs a 64
+        // hop cap); surface loudly if it ever happens, since a truncated fold
+        // is missing the oldest generations.
+        log(&format!(
+            "Delta: WARNING migration fold for {prefix} was truncated by the hop cap"
+        ));
+    }
+
+    if !sweep.changed_local {
+        // No legacy generation added data the current key lacked — nothing to
+        // migrate forward (matches the pre-driver "dominated by current;
+        // ignored" no-write path).
+        return;
+    }
+
+    if let Some(merged) = state::SITES.read().get(prefix).map(|s| s.state.clone()) {
+        let params = delta_core::SiteParameters {
+            prefix: prefix.to_string(),
+        };
+        put_site(&params, &merged);
+        super::delegate::save_known_sites();
+        log(&format!(
+            "Delta: migration sweep for {prefix} complete; reconciled state PUT \
+             to the current contract key"
+        ));
+    }
 }
 
 /// PUT (create) a site contract with full state.
@@ -1223,8 +1409,8 @@ mod tests {
     // freenet-migrate driver adoption (delta#33/#34, freenet-migrate#6)
     // -----------------------------------------------------------------------
 
+    use freenet_migrate::contract_id_from_code_hash;
     use freenet_migrate::driver::policy_check;
-    use freenet_migrate::{contract_id_from_code_hash, DEFAULT_MAX_PROBE_HOPS};
 
     fn cid(n: u8) -> ContractInstanceId {
         ContractInstanceId::new([n; 32])
@@ -1477,6 +1663,87 @@ mod tests {
         assert_eq!(
             seeded, local,
             "local-only data must survive an all-miss sweep"
+        );
+    }
+
+    #[test]
+    fn sweep_completes_only_when_every_candidate_resolves() {
+        let mut sweep = MigrationSweep::default();
+        sweep.register("a");
+        sweep.register("b");
+        sweep.register("c");
+        assert!(!sweep.is_complete(), "no candidate resolved yet");
+
+        // A GET-state resolution that changed local state.
+        assert!(
+            !sweep.resolve("a", Some(vec![1, 2, 3]), true),
+            "1 of 3 resolved"
+        );
+        // A miss (NotFound) that did not change local state.
+        assert!(!sweep.resolve("b", None, false), "2 of 3 resolved");
+        // Final candidate resolves -> complete.
+        assert!(sweep.resolve("c", Some(vec![4]), false), "all 3 resolved");
+        assert!(sweep.is_complete());
+        assert!(
+            sweep.changed_local,
+            "changed_local OR-accumulates across responses"
+        );
+    }
+
+    #[test]
+    fn sweep_register_and_resolve_are_idempotent() {
+        let mut sweep = MigrationSweep::default();
+        sweep.register("a");
+        sweep.register("a"); // duplicate fire
+        sweep.register("b");
+        assert_eq!(
+            sweep.candidates.len(),
+            2,
+            "duplicate register is one candidate"
+        );
+
+        assert!(!sweep.resolve("a", Some(vec![1]), true), "1 of 2");
+        // Duplicate delivery for an already-resolved candidate must not
+        // re-count, must not flip completion, and must not clobber the recorded
+        // response.
+        assert!(
+            !sweep.resolve("a", Some(vec![9, 9]), false),
+            "duplicate delivery is ignored"
+        );
+        assert_eq!(
+            sweep.responses.get("a"),
+            Some(&Some(vec![1])),
+            "first response kept"
+        );
+        assert!(
+            sweep.changed_local,
+            "duplicate must not clear an earlier change flag"
+        );
+
+        assert!(sweep.resolve("b", None, false), "b completes the sweep");
+    }
+
+    #[test]
+    fn sweep_ignores_non_candidate_keys_and_empty_is_never_complete() {
+        let mut sweep = MigrationSweep::default();
+        assert!(
+            !sweep.is_complete(),
+            "an empty sweep has nothing to finalize"
+        );
+        sweep.register("a");
+        // A response for a key that was never fired for this prefix is ignored.
+        assert!(!sweep.resolve("not-a-candidate", Some(vec![1]), true));
+        assert!(
+            !sweep.changed_local,
+            "a non-candidate must not set changed_local"
+        );
+        assert!(
+            sweep.responses.is_empty(),
+            "a non-candidate must not be recorded"
+        );
+        assert!(
+            sweep.resolve("a", None, false),
+            "resolving the sole candidate completes it"
         );
     }
 }
