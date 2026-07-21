@@ -226,6 +226,15 @@ fn handle_contract_response(response: ContractResponse) {
                             "Delta: captured state for site {prefix} from current contract key"
                         ));
                     }
+                    // Record what the network's current key actually holds, so
+                    // the sweep's forward-PUT gate can tell "a legacy generation
+                    // recovered data the current key lacks" (→ PUT) from "a
+                    // legacy generation merely re-supplied what the current key
+                    // already has" (→ no PUT), instead of write-amplifying on
+                    // every reload where a legacy response beats the current key.
+                    if let Ok(current_state) = from_reader::<SiteState, _>(state_bytes.as_slice()) {
+                        record_sweep_current_key_state(&prefix, current_state);
+                    }
                     // Do NOT cancel the legacy-generation probes: one of
                     // them may hold a NEWER generation that must still be
                     // able to win via the recency guard (self-heal for
@@ -582,8 +591,9 @@ pub fn get_for_migration(old_key_b58: &str, prefix: &str) {
         .insert(old_key_b58.to_string(), prefix.to_string());
     // Track this candidate in the prefix's sweep so the driver's single forward
     // PUT fires once every candidate has resolved. Registered synchronously
-    // here, before any response can arrive.
-    register_sweep_candidate(prefix, old_key_b58);
+    // here, before any response can arrive. The returned generation tags the
+    // timeout so a stale fire cannot disturb a later same-prefix sweep.
+    let sweep_gen = register_sweep_candidate(prefix, old_key_b58);
 
     // Arm a per-candidate timeout. NEW behavior vs Delta's previously-untimed
     // sweep: without it, a candidate whose GET neither responds nor NotFounds
@@ -594,7 +604,8 @@ pub fn get_for_migration(old_key_b58: &str, prefix: &str) {
     // to the sweep — the driver's own model for a lost candidate — bounding a
     // previously-unbounded wait so the forward PUT always lands. A real response
     // arriving after the timeout is single-shot-dropped from the sweep (the
-    // idempotent `resolve`) but is still reconciled into SITES.
+    // idempotent `resolve`) but is still reconciled into SITES. The generation
+    // tag makes a stale timeout a no-op against a superseded sweep.
     #[cfg(target_arch = "wasm32")]
     {
         let prefix = prefix.to_string();
@@ -604,9 +615,11 @@ pub fn get_for_migration(old_key_b58: &str, prefix: &str) {
                 SWEEP_CANDIDATE_TIMEOUT_MS.into(),
             ))
             .await;
-            record_sweep_resolution(&prefix, &key_b58, None, false);
+            record_sweep_timeout(&prefix, &key_b58, sweep_gen);
         });
     }
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = sweep_gen;
 
     log(&format!(
         "Delta: GET from old contract for migration: {old_key_b58}"
@@ -690,11 +703,24 @@ pub fn fire_legacy_contract_migrations(prefix: &str, current_key_b58: &str) {
 // pin.
 //
 // Policy is `FoldAll`: Delta already folds *every* legacy generation into
-// local state (its concurrent sweep is a FoldAll realized concurrently), and
-// that is only sound because deletions are explicit tombstones and the merge
-// is commutative + idempotent. Those preconditions are proven mechanically by
-// the `policy_check` property tests in this module's test suite — the
-// `FoldAllAck` is the loud acknowledgement that they must hold.
+// local state (its concurrent sweep is a FoldAll realized concurrently). The
+// `policy_check` property tests mechanically confirm the merge is commutative,
+// idempotent, and fold-order-invariant over the tombstone-era generations, and
+// the `FoldAllAck` is the loud acknowledgement of the preconditions. Two honest
+// bounds on that soundness — BOTH pre-existing, shared identically by today's
+// concurrent per-response sweep, so adopting the driver introduces neither:
+//
+//   * The tombstone precondition holds only for the TOMBSTONE-ERA lineage. The
+//     oldest registry generation (C1, "Pre-tombstone WASM") predates tombstones,
+//     so a page deleted before tombstones existed can resurrect through the fold
+//     from C1. This is the pre-existing accepted residual from the delta#34-era
+//     analysis (the fix that added tombstones); floor-vs-no-floor is tracked in
+//     delta#38.
+//   * The merge is order-INDEPENDENT only where writes do not conflict at an
+//     equal (page `updated_at` / config `version`). A same-timestamp conflicting
+//     write (e.g. concurrent tabs) is resolved keep-accumulator, which is
+//     order-dependent — but the PUT payload is the canonical concurrently-merged
+//     SITES value, so the fold matches production arrival-order behavior exactly.
 
 /// `ProbeStateOps` binding Delta's `SiteState` into the decision driver.
 struct DeltaProbeOps;
@@ -869,14 +895,28 @@ fn drive_fold_probe(
 /// Accumulates one prefix's in-flight initial-capture migration sweep.
 #[derive(Default)]
 struct MigrationSweep {
+    /// Monotonic tag identifying this sweep instance, so a stale per-candidate
+    /// timeout closure from a SUPERSEDED same-prefix sweep (created within the
+    /// 30s window after this one finalized) delivers no spurious miss. River's
+    /// per-fire route-token pattern. 0 = unassigned (`Default`).
+    generation: u64,
     /// Candidate keys (base58) fired via `get_for_migration` for this prefix.
     candidates: Vec<String>,
     /// Resolved responses so far, keyed by candidate base58 key:
     /// `Some(bytes)` = GET state, `None` = a NotFound / empty / miss.
     responses: HashMap<String, Option<Vec<u8>>>,
-    /// Whether any legacy generation actually changed local SITES state — the
-    /// exact condition under which the pre-driver code PUT the reconciled state
-    /// forward. Preserved so a dominated (no-op) sweep never write-amplifies.
+    /// The state the network's CURRENT contract key returned during this sweep
+    /// (decoded, as the network holds it), or `None` if the current key never
+    /// returned real state. The forward-PUT gate is "reconciled SITES differs
+    /// from this", so a legacy generation that merely re-supplies state the
+    /// current key already has never triggers a redundant PUT (the owned-site
+    /// self-heal write-amplification Codex flagged). Falls back to
+    /// `changed_local` only when this is `None`.
+    current_key_state: Option<SiteState>,
+    /// Whether any legacy generation changed local SITES state. Used only as
+    /// the fallback gate when `current_key_state` is `None` (the current key
+    /// never responded), since it cannot tell "recovered data the network
+    /// lacks" from "re-supplied identical data".
     changed_local: bool,
 }
 
@@ -937,15 +977,59 @@ const SWEEP_CANDIDATE_TIMEOUT_MS: u32 = 30_000;
 static MIGRATION_SWEEPS: GlobalSignal<BTreeMap<String, MigrationSweep>> =
     GlobalSignal::new(BTreeMap::new);
 
-/// Register a fired migration-candidate key under its prefix's sweep. Called
+/// Monotonic source of `MigrationSweep::generation` tags. Starts at 1 so a tag
+/// is always distinguishable from the `Default` (0 = unassigned).
+static NEXT_SWEEP_GENERATION: GlobalSignal<u64> = GlobalSignal::new(|| 1);
+
+/// Register a fired migration-candidate key under its prefix's sweep, returning
+/// the sweep's generation (for the per-candidate timeout to capture). Called
 /// synchronously from `get_for_migration`, before any response can arrive, so
 /// the full candidate set is known by the time the first response lands.
-fn register_sweep_candidate(prefix: &str, key_b58: &str) {
+fn register_sweep_candidate(prefix: &str, key_b58: &str) -> u64 {
+    // Reserve a generation up front (a cheap monotonic tag) so the borrow of
+    // NEXT_SWEEP_GENERATION never nests inside the MIGRATION_SWEEPS borrow;
+    // it is only consumed if this call creates the sweep.
+    let reserved = NEXT_SWEEP_GENERATION.with_mut(|g| {
+        let v = *g;
+        *g += 1;
+        v
+    });
     MIGRATION_SWEEPS.with_mut(|sweeps| {
-        sweeps
-            .entry(prefix.to_string())
-            .or_default()
-            .register(key_b58);
+        let sweep = sweeps.entry(prefix.to_string()).or_default();
+        if sweep.generation == 0 {
+            sweep.generation = reserved;
+        }
+        sweep.register(key_b58);
+        sweep.generation
+    })
+}
+
+/// Whether a per-candidate timeout that armed at `armed_gen` should still fire,
+/// given the prefix's current sweep generation (`None` if the sweep is gone). A
+/// mismatch means a superseded / different sweep now owns the prefix, so the
+/// stale timeout must be a no-op.
+fn sweep_timeout_is_current(current_gen: Option<u64>, armed_gen: u64) -> bool {
+    current_gen == Some(armed_gen)
+}
+
+/// Deliver a per-candidate timeout as a miss, but only if the prefix's sweep is
+/// still the generation that armed the timer (see `sweep_timeout_is_current`).
+fn record_sweep_timeout(prefix: &str, key_b58: &str, armed_gen: u64) {
+    let current_gen = MIGRATION_SWEEPS.read().get(prefix).map(|s| s.generation);
+    if sweep_timeout_is_current(current_gen, armed_gen) {
+        record_sweep_resolution(prefix, key_b58, None, false);
+    }
+}
+
+/// Record the network current-key state for a prefix's in-flight sweep, so the
+/// finalize gate can PUT only when the reconciled SITES differs from what the
+/// current key already holds. No-op if there is no sweep for the prefix (the
+/// site had no legacy candidates, so there is nothing to finalize).
+fn record_sweep_current_key_state(prefix: &str, state: SiteState) {
+    MIGRATION_SWEEPS.with_mut(|sweeps| {
+        if let Some(sweep) = sweeps.get_mut(prefix) {
+            sweep.current_key_state = Some(state);
+        }
     });
 }
 
@@ -1041,9 +1125,11 @@ fn forward_put_current_site(prefix: &str) {
 /// so the write gate is unit-testable.
 struct SweepPlan {
     /// Whether to PUT the reconciled state forward to the current contract key.
-    /// This is the sweep's `changed_local` — the EXACT condition the pre-driver
-    /// code PUT on (a legacy generation actually changed local SITES state), so
-    /// a dominated (no-op) sweep never write-amplifies.
+    /// Gated on the reconciled SITES differing from what the network's CURRENT
+    /// key holds (`current_key_state`), so a legacy generation that merely
+    /// re-supplies state the current key already has never write-amplifies (the
+    /// owned-site self-heal redundant-write Codex flagged). Falls back to
+    /// `changed_local` only when the current key never returned real state.
     forward_put: bool,
     /// Whether the fold was cut short by the FIXED 64-hop cap (missing the
     /// oldest generations). Delta's registry is 5, far under 64, so this never
@@ -1076,15 +1162,21 @@ fn plan_sweep_forward_put(prefix: &str, sweep: &MigrationSweep, local: SiteState
                 .map(|id| (id, sweep.responses.get(b58).cloned().unwrap_or(None)))
         })
         .collect();
+    // The write gate is "reconciled SITES differs from what the network current
+    // key holds" — NOT the driver outcome (which would over-PUT a real-but-
+    // dominated generation), and NOT bare changed_local (which cannot tell a
+    // recovered-something generation from one that re-supplied identical state).
+    // Computed before `local` is moved into the fold. The PUT payload is
+    // canonical SITES, never `outcome.merged` (see `forward_put_current_site`).
+    let forward_put = match &sweep.current_key_state {
+        Some(current_key) => local != *current_key,
+        None => sweep.changed_local,
+    };
     // FIXED hop cap (not `len().max(64)`): a lineage larger than the cap must
     // actually truncate so the `truncated_fold` warning is real signal.
     let outcome = drive_fold_probe(candidates, &responses, local, DEFAULT_MAX_PROBE_HOPS);
     SweepPlan {
-        // The write gate is reconcile's changed-signal (a legacy generation
-        // actually changed SITES) — NOT the driver outcome, which would over-PUT
-        // a real-but-dominated generation. The PUT payload is canonical SITES,
-        // never `outcome.merged` (see `forward_put_current_site`).
-        forward_put: sweep.changed_local,
+        forward_put,
         truncated_fold: matches!(
             outcome,
             Outcome::Recovered {
@@ -1570,12 +1662,16 @@ mod tests {
     /// A representative spread of same-owner generations that exercises the
     /// FoldAll preconditions: a base page, a superset with a second page, the
     /// #34 bug-B state (the second page deleted via tombstone), and a newer
-    /// revision of the base page. Config is held constant so the samples
-    /// isolate the page/tombstone dimensions where the incident lives (two
-    /// same-owner snapshots never legitimately share a page `updated_at` with
-    /// differing content, nor a config `version` with differing config, so the
-    /// merge is commutative over realistic generations — which is exactly what
-    /// these samples assert).
+    /// revision of the base page. Config is held constant and content changes
+    /// bump `updated_at`, so these samples exercise the HONEST domain over which
+    /// the merge is commutative + idempotent + order-invariant: distinct
+    /// `updated_at`/`version` per write. The known exclusions (both documented
+    /// at the FoldAll header, both pre-existing, both shared by today's sweep):
+    /// (a) two writes conflicting at an EQUAL `updated_at`/`version` resolve
+    /// keep-accumulator, so they are order-dependent (a concurrent-tab edge, not
+    /// generational drift); (b) a pre-tombstone (C1) delete can resurrect. These
+    /// samples deliberately avoid (a) because it does not occur across genuine
+    /// generations and is not what FoldAll folds.
     fn fold_samples(owner: &ed25519_dalek::SigningKey) -> Vec<SiteState> {
         let s1 = signed_state(owner, &[(1, "home", 100)]);
         let s2 = signed_state(owner, &[(1, "home", 100), (2, "about", 200)]);
@@ -2052,6 +2148,68 @@ mod tests {
         assert!(
             truncated_fold,
             "a lineage exceeding the hop cap must mark the fold truncated"
+        );
+    }
+
+    #[test]
+    fn sweep_forward_put_gate_uses_recorded_current_key_state() {
+        // Codex P2: a legacy response that beats the current-key response with
+        // IDENTICAL state leaves changed_local = true, but the current key
+        // already holds that state — so no PUT. Only a legacy generation that
+        // recovered data the current key LACKS should PUT.
+        let owner = key(4);
+        let current = signed_state(&owner, &[(1, "home", 100)]);
+        let with_extra = signed_state(&owner, &[(1, "home", 100), (2, "extra", 200)]);
+        let k = cid(7).encode();
+
+        // Legacy re-supplied identical state; SITES == current key state -> NO
+        // put, even though changed_local is true (legacy first-captured).
+        let mut identical = MigrationSweep::default();
+        identical.register(&k);
+        identical.resolve(&k, Some(cbor(&current)), true);
+        identical.current_key_state = Some(current.clone());
+        assert!(
+            !plan_sweep_forward_put("abcdef1234", &identical, current.clone()).forward_put,
+            "a legacy generation identical to the current key must not write-amplify"
+        );
+
+        // Legacy recovered data the current key lacks; SITES != current key
+        // state -> PUT.
+        let mut recovered = MigrationSweep::default();
+        recovered.register(&k);
+        recovered.resolve(&k, Some(cbor(&with_extra)), true);
+        recovered.current_key_state = Some(current.clone());
+        assert!(
+            plan_sweep_forward_put("abcdef1234", &recovered, with_extra.clone()).forward_put,
+            "a legacy generation that recovered data the current key lacks must PUT"
+        );
+
+        // Current key never returned real state -> fall back to changed_local.
+        let mut no_ck = MigrationSweep::default();
+        no_ck.register(&k);
+        no_ck.resolve(&k, Some(cbor(&current)), true);
+        assert!(no_ck.current_key_state.is_none());
+        assert!(
+            plan_sweep_forward_put("abcdef1234", &no_ck, current.clone()).forward_put,
+            "with no current-key state recorded, fall back to changed_local (PUT)"
+        );
+    }
+
+    #[test]
+    fn stale_sweep_timeout_is_noop_against_a_superseded_generation() {
+        // A per-candidate timeout armed for one sweep must not deliver a miss to
+        // a later same-prefix sweep (River's per-fire route-token pattern).
+        assert!(
+            sweep_timeout_is_current(Some(5), 5),
+            "matching generation fires"
+        );
+        assert!(
+            !sweep_timeout_is_current(Some(6), 5),
+            "a superseded sweep: the stale timeout no-ops"
+        );
+        assert!(
+            !sweep_timeout_is_current(None, 5),
+            "a finalized/removed sweep: the stale timeout no-ops"
         );
     }
 }
