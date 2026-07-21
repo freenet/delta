@@ -211,6 +211,29 @@ fn handle_contract_response(response: ContractResponse) {
                     });
                 }
                 GetClassification::InitialCurrentKey { prefix } => {
+                    // Unload-window recovery (option B): now that the network's
+                    // current key has RESOLVED, request the delegate state
+                    // backup. handle_restored_site_state reconciles it and PUTs
+                    // forward only if the backup strictly exceeds current SITES —
+                    // and by the time the (local) backup response is processed,
+                    // SITES already holds this current-key state (set just below,
+                    // synchronously, before any async backup response), so an
+                    // in-sync backup is a no-op (no write-amplification) while a
+                    // backup carrying data the network lacks is PUT. This
+                    // recovers state that a prior sweep wrote to the backup but
+                    // whose forward PUT never landed because the page was closed
+                    // mid-sweep (and the legacy generation was since GC'd, so the
+                    // reload re-sweep cannot re-fetch it).
+                    //
+                    // Accepted residual (pre-existing; matches pre-driver
+                    // behavior): if the current-key GET is itself lost (no
+                    // response AND no NotFound), this request never fires this
+                    // session, so a recovery needing the backup is deferred to
+                    // the next reload. Today's code likewise only requests the
+                    // backup off the current-key response path (via NotFound), so
+                    // this is no worse than shipped.
+                    super::delegate::request_site_state_backup(&prefix);
+
                     if state_bytes.is_empty() {
                         // Empty state for the current key during the
                         // initial capture window doesn't tell us
@@ -2210,6 +2233,39 @@ mod tests {
         assert!(
             !sweep_timeout_is_current(None, 5),
             "a finalized/removed sweep: the stale timeout no-ops"
+        );
+    }
+
+    #[test]
+    fn backup_after_current_key_puts_only_when_it_exceeds_the_current_state() {
+        // Option-B unload-window fix: the delegate backup is requested AFTER the
+        // current-key GET resolved, so by the time the (local) backup response
+        // is reconciled, SITES already holds the current-key state S. The gate
+        // handle_restored_site_state uses is `reconcile_into` returning "changed",
+        // so it PUTs forward ONLY when the backup strictly exceeds S (genuine
+        // recovery) — never when the backup merely equals the network current
+        // state (no write-amplification). This pins that gate.
+        let owner = key(4);
+        let current = signed_state(&owner, &[(1, "home", 100)]); // S: network current key
+        let backup_equal = current.clone(); // backup == S
+        let backup_more = signed_state(&owner, &[(1, "home", 100), (2, "recovered", 200)]); // backup ⊋ S
+
+        // Backup equal to the current state → no change → no forward PUT.
+        let mut sites = current.clone();
+        assert!(
+            !reconcile_into(&mut sites, &backup_equal),
+            "a backup equal to the current key state must not trigger a forward PUT"
+        );
+
+        // Backup carrying data the current key lacks → change → recovery PUT.
+        let mut sites = current.clone();
+        assert!(
+            reconcile_into(&mut sites, &backup_more),
+            "a backup exceeding the current key state must trigger the recovery PUT"
+        );
+        assert!(
+            sites.pages.contains_key(&2),
+            "the recovered page is present in the state we PUT forward"
         );
     }
 }
