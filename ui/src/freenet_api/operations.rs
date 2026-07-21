@@ -1,13 +1,17 @@
 use ciborium::de::from_reader;
 use delta_core::SiteState;
 use dioxus::prelude::ReadableExt;
+use freenet_migrate::{
+    ContractLineageEntry, FoldAllAck, NewestFirst, Outcome, ProbeDriver, ProbeStateOps,
+    SelectionPolicy, Step,
+};
 use freenet_stdlib::client_api::{ClientRequest, ContractRequest, ContractResponse, HostResponse};
 use freenet_stdlib::prelude::*;
 use std::sync::Arc;
 
 use crate::state::{self, KnownSite, SiteRole};
 use dioxus::prelude::*;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// Site contract WASM (embedded at build time).
 const SITE_CONTRACT_WASM: &[u8] = include_bytes!("../../public/contracts/site_contract.wasm");
@@ -528,11 +532,7 @@ pub fn get_site_by_id(id: &ContractInstanceId) {
 /// BLAKE3(BLAKE3(wasm) || CBOR(params))`, where BLAKE3(wasm) is already
 /// `wasm_code_hash`.
 fn contract_id_for_prefix_with_hash(prefix: &str, wasm_code_hash: &[u8; 32]) -> String {
-    let params = delta_core::SiteParameters {
-        prefix: prefix.to_string(),
-    };
-    let mut params_buf = Vec::new();
-    ciborium::ser::into_writer(&params, &mut params_buf).expect("CBOR params");
+    let params_buf = cbor_site_params(prefix);
 
     let mut hasher = blake3::Hasher::new();
     hasher.update(wasm_code_hash);
@@ -643,6 +643,159 @@ pub fn fire_legacy_contract_migrations(prefix: &str, current_key_b58: &str) {
     for old_b58 in legacy_ids {
         get_for_migration(&old_b58, prefix);
     }
+}
+
+// ---------------------------------------------------------------------------
+// freenet-migrate decision driver
+// ---------------------------------------------------------------------------
+//
+// Delta's initial-capture sweep is adopted onto freenet-migrate's sans-IO
+// `ProbeDriver` (the same decision machinery River and riverctl ship). The
+// binding below is deliberately thin: every state decision delegates to the
+// incident-hardened `reconcile_into` (delta#33/#34), so the driver's fold IS
+// Delta's tombstone-aware, commutative merge — there is no second merge
+// implementation that could silently drift from the one the existing tests
+// pin.
+//
+// Policy is `FoldAll`: Delta already folds *every* legacy generation into
+// local state (its concurrent sweep is a FoldAll realized concurrently), and
+// that is only sound because deletions are explicit tombstones and the merge
+// is commutative + idempotent. Those preconditions are proven mechanically by
+// the `policy_check` property tests in this module's test suite — the
+// `FoldAllAck` is the loud acknowledgement that they must hold.
+
+/// `ProbeStateOps` binding Delta's `SiteState` into the decision driver.
+struct DeltaProbeOps;
+
+impl ProbeStateOps for DeltaProbeOps {
+    type State = SiteState;
+
+    /// Same defensive deserialization as `handle_site_state`: an undecodable
+    /// (corrupt / ancient-format) or empty generation is a **miss**, never a
+    /// panic and never adopted.
+    fn decode(&self, bytes: &[u8]) -> Option<SiteState> {
+        if bytes.is_empty() {
+            return None;
+        }
+        from_reader(bytes).ok()
+    }
+
+    /// Mirrors `reconcile_into`'s `incoming == SiteState::default()` miss: the
+    /// zeroed placeholder is not real state.
+    ///
+    /// Deliberately does **not** verify the signature. `reconcile_into` adopts
+    /// a FIRST capture (empty existing) without a signature check — the pre-#34
+    /// behavior it explicitly preserves (see its TODO). Adding a verify here
+    /// would diverge from that; if first-capture verification is ever added it
+    /// must be added in `reconcile_into` and here together.
+    fn is_real(&self, state: &SiteState) -> bool {
+        *state != SiteState::default()
+    }
+
+    /// Fold an older generation into the newer accumulator. `reconcile_into`
+    /// is commutative + tombstone-aware, so this is exactly the fold Delta's
+    /// concurrent SITES merge performs: owner-equality guard (mismatch keeps
+    /// the accumulator, logging a warn), then `SiteState::merge` (fail-closed:
+    /// keep the accumulator on a verification failure), then the F3
+    /// `next_page_id`-max.
+    fn merge_generations(&self, mut newer: SiteState, older: SiteState) -> SiteState {
+        reconcile_into(&mut newer, &older);
+        newer
+    }
+
+    /// Fold the recovered generation into the device's local snapshot, keeping
+    /// local-only writes. Same reconcile: a first capture (empty local) adopts
+    /// `recovered` wholesale, an empty `recovered` is a no-op, and a
+    /// different-owner `recovered` keeps the local snapshot unchanged.
+    ///
+    /// Note the fail-closed direction differs from the driver's advisory hint
+    /// ("prefer returning recovered"): Delta keeps the LOCAL snapshot if
+    /// `recovered` fails verification, because adopting an unverified state
+    /// over a verified local one is exactly the class of bug #34 hardened
+    /// against. `reconcile_into` is commutative, so the adopted page/tombstone
+    /// set is identical regardless of which side is the base.
+    fn merge_with_local(&self, recovered: SiteState, local: &SiteState) -> SiteState {
+        let mut base = local.clone();
+        reconcile_into(&mut base, &recovered);
+        base
+    }
+
+    // prepare_forward: identity (the default). Delta carries no key-relative
+    // upgrade pointer inside its state (unlike freenet/river#427), so there is
+    // nothing to strip before the forward PUT.
+}
+
+/// Build the newest-first candidate ordering for a site `prefix` from the
+/// legacy-contract registry. `legacy_contracts.toml` is oldest→newest, so
+/// generation = index; `NewestFirst::from_lineage` sorts descending by that
+/// field (robust even if the registry were ever authored out of order).
+///
+/// The `Parameters` are the CBOR-encoded `SiteParameters { prefix }` — the
+/// same bytes Delta hashes into the contract key, so
+/// `contract_id_from_code_hash` reproduces exactly the ids
+/// `contract_id_for_prefix_with_hash` derives (pinned by
+/// `driver_candidate_ids_match_delta_derivation`).
+fn legacy_lineage_newest_first(prefix: &str) -> NewestFirst {
+    let params_bytes = cbor_site_params(prefix);
+    let params = Parameters::from(params_bytes);
+    let lineage: Vec<ContractLineageEntry> = LEGACY_CONTRACT_HASHES
+        .iter()
+        .enumerate()
+        .map(|(generation, code_hash)| ContractLineageEntry {
+            generation: generation as u32,
+            code_hash: *code_hash,
+            note: "delta legacy contract",
+        })
+        .collect();
+    NewestFirst::from_lineage(&params, &lineage)
+}
+
+/// CBOR encoding of `SiteParameters { prefix }` — the contract's parameter
+/// bytes. Shared by the driver candidate derivation so it stays byte-identical
+/// to `contract_id_for_prefix_with_hash`.
+fn cbor_site_params(prefix: &str) -> Vec<u8> {
+    let params = delta_core::SiteParameters {
+        prefix: prefix.to_string(),
+    };
+    let mut buf = Vec::new();
+    ciborium::ser::into_writer(&params, &mut buf).expect("CBOR params");
+    buf
+}
+
+/// Drive a `FoldAll` probe over `candidates` (newest-first) to completion using
+/// already-fetched `responses` (`Some(bytes)` = GET state, `None` = a
+/// NotFound / miss for that candidate), folding onto `local`.
+///
+/// Pure and deterministic: the driver always asks newest-first and drains the
+/// map, so the returned [`Outcome`] does not depend on the order responses
+/// were inserted — the fold-order-invariance the `policy_check` tests prove for
+/// the merge is what makes that safe. A candidate with no map entry is treated
+/// as a miss (the finalize caller only runs this once every fired candidate has
+/// resolved, so that path is defensive).
+#[allow(dead_code)]
+fn drive_fold_probe(
+    candidates: NewestFirst,
+    responses: &HashMap<ContractInstanceId, Option<Vec<u8>>>,
+    local: SiteState,
+    max_hops: usize,
+) -> Outcome<SiteState> {
+    let mut driver = ProbeDriver::new(
+        DeltaProbeOps,
+        local,
+        candidates,
+        SelectionPolicy::FoldAll(FoldAllAck::i_understand_fold_all_resurrects_without_tombstones()),
+    )
+    .with_max_hops(max_hops);
+    while let Step::Get(id) = driver.next_action() {
+        match responses.get(&id) {
+            Some(Some(bytes)) => driver.on_response(id, bytes),
+            // NotFound, or a candidate that never resolved: a miss.
+            Some(None) | None => driver.on_timeout(id),
+        }
+    }
+    driver
+        .take_outcome()
+        .expect("Step::Done implies an untaken outcome")
 }
 
 /// PUT (create) a site contract with full state.
@@ -1063,6 +1216,267 @@ mod tests {
             !LEGACY_CONTRACT_HASHES.is_empty(),
             "legacy_contracts.toml must contain at least one entry so that users \
              of the previous release can migrate their site state"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // freenet-migrate driver adoption (delta#33/#34, freenet-migrate#6)
+    // -----------------------------------------------------------------------
+
+    use freenet_migrate::driver::policy_check;
+    use freenet_migrate::{contract_id_from_code_hash, DEFAULT_MAX_PROBE_HOPS};
+
+    fn cid(n: u8) -> ContractInstanceId {
+        ContractInstanceId::new([n; 32])
+    }
+
+    fn cbor(state: &SiteState) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ciborium::ser::into_writer(state, &mut buf).expect("CBOR state");
+        buf
+    }
+
+    /// A representative spread of same-owner generations that exercises the
+    /// FoldAll preconditions: a base page, a superset with a second page, the
+    /// #34 bug-B state (the second page deleted via tombstone), and a newer
+    /// revision of the base page. Config is held constant so the samples
+    /// isolate the page/tombstone dimensions where the incident lives (two
+    /// same-owner snapshots never legitimately share a page `updated_at` with
+    /// differing content, nor a config `version` with differing config, so the
+    /// merge is commutative over realistic generations — which is exactly what
+    /// these samples assert).
+    fn fold_samples(owner: &ed25519_dalek::SigningKey) -> Vec<SiteState> {
+        let s1 = signed_state(owner, &[(1, "home", 100)]);
+        let s2 = signed_state(owner, &[(1, "home", 100), (2, "about", 200)]);
+        let mut s3 = signed_state(owner, &[(1, "home", 100)]);
+        s3.delete_page(
+            &delta_core::SignedPageDeletion::new(2, 300, owner),
+            &owner.verifying_key(),
+        )
+        .unwrap();
+        let s4 = signed_state(owner, &[(1, "updated", 500)]);
+        vec![s1, s2, s3, s4]
+    }
+
+    #[test]
+    fn merge_generations_satisfies_fold_all_preconditions() {
+        // G1.5: FoldAll is only sound when the merge is commutative +
+        // idempotent + fold-order-invariant. `DeltaProbeOps::merge_generations`
+        // delegates to `reconcile_into`, so this proves Delta's incident fix
+        // satisfies the FoldAll preconditions before the `FoldAllAck` is
+        // constructed anywhere in production. If any of these fail, FoldAll is
+        // NOT sound for Delta and the adoption must stop.
+        let owner = key(1);
+        let samples = fold_samples(&owner);
+        let merge = |a: SiteState, b: SiteState| DeltaProbeOps.merge_generations(a, b);
+        policy_check::assert_merge_commutative(&samples, merge);
+        policy_check::assert_merge_idempotent(&samples, merge);
+        policy_check::assert_fold_order_invariant(&samples, merge);
+    }
+
+    #[test]
+    fn driver_fold_preserves_deletion_of_newest_page_in_both_orders() {
+        // The #34 bug-B case driven through the ACTUAL driver: deleting the
+        // NEWEST page lowers max(updated_at), which a scalar-recency selector
+        // would treat as "older" and resurrect. The tombstone-aware fold must
+        // keep the deletion regardless of which generation the deletion lands
+        // in — mirroring `reconcile_preserves_deletion_of_newest_page`, but
+        // through `ProbeDriver` + `SelectionPolicy::FoldAll`.
+        let owner = key(2);
+        let full = signed_state(&owner, &[(1, "home", 100), (2, "newest", 200)]);
+        let mut deleted = full.clone();
+        deleted
+            .delete_page(
+                &delta_core::SignedPageDeletion::new(2, 300, &owner),
+                &owner.verifying_key(),
+            )
+            .unwrap();
+
+        for order in [
+            [deleted.clone(), full.clone()],
+            [full.clone(), deleted.clone()],
+        ] {
+            let responses: HashMap<ContractInstanceId, Option<Vec<u8>>> = HashMap::from([
+                (cid(2), Some(cbor(&order[0]))), // newest candidate
+                (cid(1), Some(cbor(&order[1]))), // oldest candidate
+            ]);
+            let candidates = NewestFirst::assume_ordered(vec![cid(2), cid(1)]);
+            let outcome = drive_fold_probe(
+                candidates,
+                &responses,
+                SiteState::default(),
+                DEFAULT_MAX_PROBE_HOPS,
+            );
+            let Outcome::Recovered {
+                merged,
+                truncated_fold,
+                ..
+            } = outcome
+            else {
+                panic!("expected recovery, got a non-Recovered outcome");
+            };
+            assert!(
+                !truncated_fold,
+                "a 2-candidate fold cannot truncate at 64 hops"
+            );
+            assert!(
+                !merged.pages.contains_key(&2),
+                "deleted-newest page resurrected (arrival order {order:?})"
+            );
+            assert!(
+                merged.deleted_pages.contains_key(&2),
+                "tombstone must survive the fold (arrival order {order:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn driver_probes_newest_generation_first() {
+        // The generation-ordering pin: `NewestFirst::from_lineage` sorts by the
+        // registry `generation` field descending, so the driver's first GET is
+        // the newest generation — the anti-rollback ordering the whole fix
+        // rests on. (For FoldAll the RESULT is order-independent, but the probe
+        // order and `source` still follow generation.)
+        let params = Parameters::from(cbor_site_params("abcdef1234"));
+        let lineage = [
+            ContractLineageEntry {
+                generation: 0,
+                code_hash: [10; 32],
+                note: "older",
+            },
+            ContractLineageEntry {
+                generation: 1,
+                code_hash: [11; 32],
+                note: "newer",
+            },
+        ];
+        let candidates = NewestFirst::from_lineage(&params, &lineage);
+        let mut driver = ProbeDriver::new(
+            DeltaProbeOps,
+            SiteState::default(),
+            candidates,
+            SelectionPolicy::FoldAll(
+                FoldAllAck::i_understand_fold_all_resurrects_without_tombstones(),
+            ),
+        );
+        let Step::Get(first) = driver.next_action() else {
+            panic!("expected a GET step");
+        };
+        assert_eq!(
+            first,
+            contract_id_from_code_hash(&[11; 32], &params),
+            "the newest generation (gen 1) must be probed first"
+        );
+    }
+
+    #[test]
+    fn legacy_lineage_orders_registry_newest_first() {
+        // `legacy_lineage_newest_first` must present the registry's LAST entry
+        // (newest by `legacy_contracts.toml` order) as the first candidate.
+        let prefix = "abcdef1234";
+        let params = Parameters::from(cbor_site_params(prefix));
+        let candidates = legacy_lineage_newest_first(prefix);
+        let mut driver = ProbeDriver::new(
+            DeltaProbeOps,
+            SiteState::default(),
+            candidates,
+            SelectionPolicy::FoldAll(
+                FoldAllAck::i_understand_fold_all_resurrects_without_tombstones(),
+            ),
+        );
+        let Step::Get(first) = driver.next_action() else {
+            panic!("expected a GET step");
+        };
+        let newest_hash = LEGACY_CONTRACT_HASHES.last().copied().unwrap();
+        assert_eq!(
+            first,
+            contract_id_from_code_hash(&newest_hash, &params),
+            "the newest legacy generation must be probed first"
+        );
+    }
+
+    #[test]
+    fn driver_candidate_ids_match_delta_derivation() {
+        // The driver's candidate ids (blake3(code_hash ‖ params) via
+        // `contract_id_from_code_hash`) must be byte-identical to Delta's own
+        // `contract_id_for_prefix_with_hash`, or the driver would probe the
+        // wrong keys. Guards against a future stdlib change to the id encoding.
+        let prefix = "abcdef1234";
+        let params = Parameters::from(cbor_site_params(prefix));
+        for hash in LEGACY_CONTRACT_HASHES {
+            let via_driver = contract_id_from_code_hash(hash, &params).encode();
+            let via_delta = contract_id_for_prefix_with_hash(prefix, hash);
+            assert_eq!(
+                via_driver, via_delta,
+                "driver candidate id derivation diverged from Delta's contract key derivation"
+            );
+        }
+    }
+
+    #[test]
+    fn driver_fold_is_independent_of_arrival_position() {
+        // Out-of-order delivery: whichever probe position an older vs newer
+        // generation lands in, the fold keeps the newer content (recency is by
+        // `updated_at`, not probe order) and the merged result is identical.
+        let owner = key(6);
+        let older = signed_state(&owner, &[(1, "old", 100)]);
+        let newer = signed_state(&owner, &[(1, "new", 500)]);
+        let candidates = NewestFirst::assume_ordered(vec![cid(2), cid(1)]);
+
+        let responses_a: HashMap<ContractInstanceId, Option<Vec<u8>>> =
+            HashMap::from([(cid(2), Some(cbor(&newer))), (cid(1), Some(cbor(&older)))]);
+        let responses_b: HashMap<ContractInstanceId, Option<Vec<u8>>> =
+            HashMap::from([(cid(2), Some(cbor(&older))), (cid(1), Some(cbor(&newer)))]);
+
+        let merged_a = match drive_fold_probe(
+            candidates.clone(),
+            &responses_a,
+            SiteState::default(),
+            DEFAULT_MAX_PROBE_HOPS,
+        ) {
+            Outcome::Recovered { merged, .. } => merged,
+            other => panic!("expected recovery, got {other:?}"),
+        };
+        let merged_b = match drive_fold_probe(
+            candidates,
+            &responses_b,
+            SiteState::default(),
+            DEFAULT_MAX_PROBE_HOPS,
+        ) {
+            Outcome::Recovered { merged, .. } => merged,
+            other => panic!("expected recovery, got {other:?}"),
+        };
+
+        assert_eq!(merged_a.pages[&1].content, "new");
+        assert_eq!(merged_a.pages[&1].updated_at, 500);
+        assert_eq!(
+            merged_a, merged_b,
+            "fold result must not depend on which probe position a generation arrives at"
+        );
+    }
+
+    #[test]
+    fn driver_all_miss_seeds_local_snapshot() {
+        // Local-only data must survive a sweep where every candidate is a miss
+        // (NotFound / undecodable) — the no-silent-data-loss guarantee, now via
+        // the driver. `SeedLocal` carries the local snapshot forward unchanged.
+        let owner = key(8);
+        let local = signed_state(&owner, &[(1, "local-only", 700)]);
+        let responses: HashMap<ContractInstanceId, Option<Vec<u8>>> =
+            HashMap::from([(cid(2), None), (cid(1), Some(b"undecodable".to_vec()))]);
+        let candidates = NewestFirst::assume_ordered(vec![cid(2), cid(1)]);
+        let outcome = drive_fold_probe(
+            candidates,
+            &responses,
+            local.clone(),
+            DEFAULT_MAX_PROBE_HOPS,
+        );
+        let Outcome::SeedLocal { local: seeded } = outcome else {
+            panic!("all-miss sweep must seed the local snapshot");
+        };
+        assert_eq!(
+            seeded, local,
+            "local-only data must survive an all-miss sweep"
         );
     }
 }

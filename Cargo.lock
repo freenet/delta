@@ -671,6 +671,7 @@ dependencies = [
  "delta-core",
  "dioxus",
  "ed25519-dalek",
+ "freenet-migrate",
  "freenet-stdlib",
  "getrandom 0.2.17",
  "gloo-timers",
@@ -1346,6 +1347,22 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "freenet-migrate"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "80de2864555343441300c6fa1aced20f989ec16657d651be3bb30bff1d1224c8"
+dependencies = [
+ "blake3",
+ "bs58",
+ "ciborium",
+ "ed25519-dalek",
+ "freenet-scaffold",
+ "freenet-stdlib",
+ "serde",
+ "serde_with",
 ]
 
 [[package]]
