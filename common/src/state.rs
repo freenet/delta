@@ -68,20 +68,26 @@ pub struct SiteState {
     pub deleted_pages: BTreeMap<PageId, SignedPageDeletion>,
 }
 
+/// The owner key [`SiteState::default`] carries. The contract starts from a
+/// default state when no state exists yet, so this value marks "no owner has
+/// claimed this address"; it never matches a real key.
+fn placeholder_owner() -> VerifyingKey {
+    // A zeroed key — only valid for empty/placeholder states
+    let zero_bytes = [0u8; 32];
+    VerifyingKey::from_bytes(&zero_bytes).unwrap_or_else(|_| {
+        // Fallback: this will fail verification but won't panic
+        VerifyingKey::from_bytes(&[
+            1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0,
+        ])
+        .expect("hardcoded valid point")
+    })
+}
+
 impl Default for SiteState {
     fn default() -> Self {
-        // Default uses a zeroed key — only valid for empty/placeholder states
-        let zero_bytes = [0u8; 32];
-        let owner = VerifyingKey::from_bytes(&zero_bytes).unwrap_or_else(|_| {
-            // Fallback: this will fail verification but won't panic
-            VerifyingKey::from_bytes(&[
-                1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 0,
-            ])
-            .expect("hardcoded valid point")
-        });
         Self {
-            owner,
+            owner: placeholder_owner(),
             config: SignedConfig::default(),
             pages: BTreeMap::new(),
             next_page_id: 1,
@@ -118,7 +124,36 @@ impl SiteState {
         for (&page_id, page) in &self.pages {
             page.verify(page_id, &self.owner)?;
         }
+        // Tombstones are as destructive as pages are constructive: `merge`
+        // applies them unconditionally and they permanently suppress the page
+        // id. They MUST be authenticated here, or any peer can copy this
+        // site's public `owner` and owner-signed `config`, ship no pages, and
+        // attach tombstones signed by nobody to wipe the site.
+        for (&page_id, deletion) in &self.deleted_pages {
+            // The map key is what `merge` deletes by, so a tombstone re-keyed
+            // under a different id would retarget a genuine owner signature at
+            // a page the owner never deleted.
+            if deletion.page_id != page_id {
+                return Err(format!(
+                    "tombstone stored under page {page_id} is signed for page {}",
+                    deletion.page_id
+                ));
+            }
+            deletion.verify(&self.owner)?;
+        }
         Ok(())
+    }
+
+    /// True while this is the placeholder state the contract starts from when
+    /// no state exists at the address yet.
+    ///
+    /// Structural rather than owner-only. A placeholder-owner state cannot
+    /// reach the network today, since `verify` checks the config signature
+    /// against `owner` and the placeholder is a low-order point nobody holds a
+    /// private key for. But `merge` hands the incoming owner the address on
+    /// this branch, so it should not become exploitable if `verify` changes.
+    pub fn is_uninitialized(&self) -> bool {
+        self.owner == placeholder_owner() && self.pages.is_empty() && self.deleted_pages.is_empty()
     }
 
     /// Add or update a page. The page must be signed by the owner.
@@ -419,6 +454,25 @@ impl SiteState {
     /// each page. Used when receiving a full state via UpdateData::State.
     pub fn merge(&mut self, params: &SiteParameters, other: &SiteState) -> Result<(), String> {
         other.verify(params)?;
+
+        // `params` only pins the first `SITE_PREFIX_LEN` characters of the
+        // owner key, so a second key sharing that prefix passes `verify` and
+        // would otherwise graft its config and pages onto an established
+        // site. Bind the merge to the owner already at this address instead.
+        if self.is_uninitialized() {
+            // Nobody has claimed this address yet — the contract starts from
+            // `default()` when there is no stored state. Adopt the incoming
+            // owner, which `other.verify` has already bound to the address
+            // prefix. Without this the merged state keeps the placeholder key
+            // and fails its own `verify`.
+            self.owner = other.owner;
+        } else if self.owner != other.owner {
+            return Err(format!(
+                "refusing merge from a different owner at the same address: {} != {}",
+                bs58::encode(self.owner.as_bytes()).into_string(),
+                bs58::encode(other.owner.as_bytes()).into_string()
+            ));
+        }
 
         if other.config.config.version > self.config.config.version {
             self.config = other.config.clone();
@@ -867,6 +921,162 @@ mod tests {
 
         site_a.merge(&params, &site_b).unwrap();
         assert_eq!(site_a.pages[&1].content, "new");
+    }
+
+    /// Builds a site with one page, plus the hostile state a peer can assemble
+    /// from that site's PUBLIC data alone: the same `owner`, the same
+    /// owner-signed `config`, no pages, and caller-supplied tombstones.
+    fn victim_and_hostile_shell(
+        owner: &SigningKey,
+        deleted_pages: BTreeMap<PageId, SignedPageDeletion>,
+    ) -> (SiteState, SiteState) {
+        let mut victim = SiteState::new(SiteConfig::default(), owner);
+        let page = Page::new(1, "Home".into(), "content".into(), 1000, owner);
+        victim.upsert_page(1, page, &owner.verifying_key()).unwrap();
+        assert_eq!(victim.pages.len(), 1);
+
+        let hostile = SiteState {
+            owner: owner.verifying_key(),
+            config: victim.config.clone(),
+            pages: BTreeMap::new(),
+            next_page_id: victim.next_page_id,
+            deleted_pages,
+        };
+        (victim, hostile)
+    }
+
+    /// A hostile peer needs no key material and no prefix collision to wipe a
+    /// site: every field `verify` inspects is public. Copy the victim's `owner`
+    /// and owner-signed `config` out of the published state, ship no pages so
+    /// there are no page signatures to check, and attach a tombstone signed by
+    /// nobody. `verify` must reject it, or `merge` applies the tombstone and
+    /// permanently suppresses the page id.
+    #[test]
+    fn unsigned_tombstone_is_rejected() {
+        let owner = gen_key();
+        let params = make_params(&owner);
+        let attacker = gen_key();
+
+        let forged = SignedPageDeletion::new(1, 9999, &attacker);
+        let (mut victim, hostile) =
+            victim_and_hostile_shell(&owner, [(1, forged)].into_iter().collect());
+
+        assert!(
+            hostile.verify(&params).is_err(),
+            "a tombstone signed by an unrelated key must not validate"
+        );
+        assert!(
+            victim.merge(&params, &hostile).is_err(),
+            "merge must refuse a state carrying an unauthenticated tombstone"
+        );
+        assert_eq!(victim.pages.len(), 1, "victim's page survives");
+    }
+
+    /// Signature checking alone is not enough. A genuine tombstone the owner
+    /// published for one page is public, and its signature covers only
+    /// `(page_id, deleted_at)`. `merge` deletes by the MAP KEY, so re-filing a
+    /// real tombstone under a different id would point a valid owner signature
+    /// at a page the owner never deleted.
+    #[test]
+    fn tombstone_rekeyed_under_another_page_is_rejected() {
+        let owner = gen_key();
+        let params = make_params(&owner);
+
+        // Genuine: the owner really did delete page 7.
+        let genuine = SignedPageDeletion::new(7, 5000, &owner);
+        // Re-filed under page 1, which the owner never deleted.
+        let (mut victim, hostile) =
+            victim_and_hostile_shell(&owner, [(1, genuine)].into_iter().collect());
+
+        assert!(
+            hostile.verify(&params).is_err(),
+            "tombstone's own page_id must match the key it is stored under"
+        );
+        assert!(victim.merge(&params, &hostile).is_err());
+        assert_eq!(victim.pages.len(), 1, "victim's page survives");
+    }
+
+    /// The prefix in `params` pins only the first `SITE_PREFIX_LEN` characters
+    /// of the owner key, so a second key sharing it lands on the same contract
+    /// address and passes `verify`. It must still not be able to graft its
+    /// config onto an established site.
+    ///
+    /// Standing in for a ground prefix collision: `params` are built from the
+    /// IMPOSTOR's key, so their state clears `other.verify(params)` exactly as
+    /// it would under a real collision. `merge` never compares `self.owner`
+    /// against `params`, so the branch under test is reached identically.
+    ///
+    /// Building `params` from the victim instead makes this test VACUOUS:
+    /// `verify` rejects on the prefix before the owner binding is ever
+    /// consulted, so it passes even with that binding deleted. Caught by
+    /// mutation testing; do not "simplify" it back.
+    #[test]
+    fn merge_from_a_different_owner_is_rejected() {
+        let owner = gen_key();
+        let mut victim = SiteState::new(SiteConfig::default(), &owner);
+        let page = Page::new(1, "Home".into(), "content".into(), 1000, &owner);
+        victim.upsert_page(1, page, &owner.verifying_key()).unwrap();
+        let original_version = victim.config.config.version;
+
+        let colliding = gen_key();
+        let params = make_params(&colliding);
+        let mut impostor = SiteState::new(
+            SiteConfig {
+                version: 99,
+                ..SiteConfig::default()
+            },
+            &colliding,
+        );
+        let their_page = Page::new(1, "Pwned".into(), "pwned".into(), 9999, &colliding);
+        impostor
+            .upsert_page(1, their_page, &colliding.verifying_key())
+            .unwrap();
+        impostor
+            .verify(&params)
+            .expect("impostor must clear verify, as it would under a real collision");
+
+        let err = victim
+            .merge(&params, &impostor)
+            .expect_err("merge must refuse a different owner at the same address");
+        assert!(
+            err.contains("different owner"),
+            "must reject on the owner binding, not incidentally on the prefix: {err}"
+        );
+        assert_eq!(
+            victim.pages[&1].content, "content",
+            "victim's page survives"
+        );
+        assert_eq!(
+            victim.config.config.version, original_version,
+            "victim's config survives"
+        );
+    }
+
+    /// The owner's own deletions must still work end to end, and a brand new
+    /// site must still be adoptable into the contract's default placeholder
+    /// state.
+    #[test]
+    fn legitimate_deletion_and_first_publish_still_work() {
+        let owner = gen_key();
+        let params = make_params(&owner);
+
+        let mut site = SiteState::new(SiteConfig::default(), &owner);
+        let page = Page::new(1, "Home".into(), "content".into(), 1000, &owner);
+        site.upsert_page(1, page, &owner.verifying_key()).unwrap();
+        let deletion = SignedPageDeletion::new(1, 2000, &owner);
+        site.delete_page(&deletion, &owner.verifying_key()).unwrap();
+        site.verify(&params)
+            .expect("owner-signed tombstone must validate");
+
+        // A peer receiving this state for the first time starts from the
+        // placeholder the contract builds when no state exists.
+        let mut fresh = SiteState::default();
+        assert!(fresh.is_uninitialized());
+        fresh
+            .merge(&params, &site)
+            .expect("first publish must merge into the placeholder state");
+        assert_eq!(fresh.owner, owner.verifying_key());
+        assert!(fresh.deleted_pages.contains_key(&1));
     }
 
     #[test]
