@@ -50,3 +50,9 @@ version = "C5"
 description = "Before freenet-stdlib 0.8.3 bump"
 date = "2026-07-12"
 code_hash = "8e36f95d436899960cf31afd76586837a3bf9f91483dcd09d26483ad02823c53"
+
+[[entry]]
+version = "C6"
+description = "Before tombstone authentication + owner-bound merge (security fix)"
+date = "2026-07-26"
+code_hash = "7f81b4d6c7ff15eb6c8b5c5573b6911b2f076ccde7feaef6c4f8d16402c1acba"
