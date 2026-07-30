@@ -409,10 +409,13 @@ impl SiteState {
         // in `deleted_pages` (signed at delete time), so there is nothing
         // "retroactive" about it. Skipping this made a pending deletion
         // relative to a specific peer indistinguishable from genuine
-        // convergence (delta#43): the peer never learns about a deletion it
-        // missed via the live broadcast, and has no other path to find out
-        // short of a full-state resync that this same method's emptiness
-        // was supposed to trigger.
+        // convergence (delta#43): freenet-core's InterestSync backstop reads
+        // an EMPTY result from this method as "converged, nothing to send"
+        // and SUPPRESSES the heal it would otherwise trigger. Without this
+        // filter, a peer that missed the live delete broadcast has no other
+        // path to learn about the deletion: this method staying (wrongly)
+        // empty is exactly what would have suppressed the resync that could
+        // have told it.
         let page_deletions: Vec<SignedPageDeletion> = self
             .deleted_pages
             .iter()
@@ -469,6 +472,15 @@ impl SiteState {
             }
         }
 
+        // Deletions are applied AFTER updates, deliberately: if a single
+        // delta somehow carries both a page_update and a page_deletion for
+        // the SAME id (only possible today from an already-corrupted state,
+        // e.g. one still recovering from the pre-#18 oscillation bug, since
+        // a well-formed state never has an id in both `pages` and
+        // `deleted_pages` at once), the update would land first and the
+        // deletion removes it again right after. This ordering makes
+        // deletion win deterministically rather than leaving the outcome
+        // dependent on `BTreeMap`/`Vec` iteration order.
         for deletion in &delta.page_deletions {
             self.delete_page(deletion, &owner)?;
         }
@@ -1174,6 +1186,80 @@ mod tests {
                 panic!(
                     "no fixpoint after {MAX_ROUNDS} rounds of simultaneous exchange; \
                      a.pages={:?} b.pages={:?}",
+                    a.pages.keys().collect::<Vec<_>>(),
+                    b.pages.keys().collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    /// Second-lens follow-up: the oscillation above isn't limited to a
+    /// stale peer that missed a delete broadcast. The SAME owner deleting a
+    /// DIFFERENT page on each of two devices (e.g. offline edits on a phone
+    /// and a laptop) hits it too: `a` ends up with `pages=[2] tomb=[1]`,
+    /// `b` with `pages=[1] tomb=[2]`, and without the guard each side's
+    /// page_update for its own surviving page resurrects the other's
+    /// deleted page, forever. Same guard, same fixpoint check.
+    #[test]
+    fn concurrent_deletes_of_different_pages_converge() {
+        let owner = gen_key();
+        let params = make_params(&owner);
+
+        let mut a = SiteState::new(SiteConfig::default(), &owner);
+        let page1 = Page::new(1, "One".into(), "# One".into(), 1000, &owner);
+        let page2 = Page::new(2, "Two".into(), "# Two".into(), 1000, &owner);
+        a.upsert_page(1, page1.clone(), &owner.verifying_key())
+            .unwrap();
+        a.upsert_page(2, page2.clone(), &owner.verifying_key())
+            .unwrap();
+
+        // b starts as a's twin (same two pages, e.g. synced before either
+        // device went offline).
+        let mut b = SiteState::new(SiteConfig::default(), &owner);
+        b.upsert_page(1, page1, &owner.verifying_key()).unwrap();
+        b.upsert_page(2, page2, &owner.verifying_key()).unwrap();
+
+        // a deletes page 1 (offline); b deletes page 2 (offline, on a
+        // different device), neither aware of the other's edit.
+        let a_deletion = SignedPageDeletion::new(1, 2000, &owner);
+        a.delete_page(&a_deletion, &owner.verifying_key()).unwrap();
+        let b_deletion = SignedPageDeletion::new(2, 2000, &owner);
+        b.delete_page(&b_deletion, &owner.verifying_key()).unwrap();
+
+        const MAX_ROUNDS: usize = 10;
+        for round in 0..MAX_ROUNDS {
+            let a_summary = a.summarize();
+            let b_summary = b.summarize();
+
+            let delta_to_b = a.compute_delta(&b_summary);
+            let delta_to_a = b.compute_delta(&a_summary);
+
+            if delta_to_b.is_none() && delta_to_a.is_none() {
+                assert!(
+                    !a.pages.contains_key(&1) && !a.pages.contains_key(&2),
+                    "a should have converged with both pages gone"
+                );
+                assert!(
+                    !b.pages.contains_key(&1) && !b.pages.contains_key(&2),
+                    "b should have converged with both pages gone"
+                );
+                assert!(a.deleted_pages.contains_key(&1));
+                assert!(a.deleted_pages.contains_key(&2));
+                assert!(b.deleted_pages.contains_key(&1));
+                assert!(b.deleted_pages.contains_key(&2));
+                return;
+            }
+
+            if let Some(d) = delta_to_b {
+                b.apply_delta(&d, &params).unwrap();
+            }
+            if let Some(d) = delta_to_a {
+                a.apply_delta(&d, &params).unwrap();
+            }
+
+            if round == MAX_ROUNDS - 1 {
+                panic!(
+                    "no fixpoint after {MAX_ROUNDS} rounds; a.pages={:?} b.pages={:?}",
                     a.pages.keys().collect::<Vec<_>>(),
                     b.pages.keys().collect::<Vec<_>>()
                 );
