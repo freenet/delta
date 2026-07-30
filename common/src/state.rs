@@ -404,18 +404,29 @@ impl SiteState {
             }
         }
 
-        // Pages the peer has that we don't — they were deleted.
-        // We can't produce signed deletions retroactively here,
-        // so we skip this for now. Deletions must be explicitly
-        // propagated via update_state.
+        // Pages the peer's summary still reports holding that we've since
+        // deleted: forward the already-signed tombstone. We already have it
+        // in `deleted_pages` (signed at delete time), so there is nothing
+        // "retroactive" about it. Skipping this made a pending deletion
+        // relative to a specific peer indistinguishable from genuine
+        // convergence (delta#43): the peer never learns about a deletion it
+        // missed via the live broadcast, and has no other path to find out
+        // short of a full-state resync that this same method's emptiness
+        // was supposed to trigger.
+        let page_deletions: Vec<SignedPageDeletion> = self
+            .deleted_pages
+            .iter()
+            .filter(|(id, _)| summary.pages.contains_key(id))
+            .map(|(_, deletion)| deletion.clone())
+            .collect();
 
-        if config.is_none() && page_updates.is_empty() {
+        if config.is_none() && page_updates.is_empty() && page_deletions.is_empty() {
             None
         } else {
             Some(SiteStateDelta {
                 config,
                 page_updates,
-                page_deletions: Vec::new(),
+                page_deletions,
             })
         }
     }
@@ -915,6 +926,163 @@ mod tests {
 
         assert_eq!(peer.pages.len(), 1);
         assert_eq!(peer.pages[&1].content, "# Hello");
+    }
+
+    /// delta#43 follow-up: a peer whose summary still lists a page we've
+    /// since deleted must get a non-empty delta carrying the tombstone.
+    /// Without this, `compute_delta` only diffs `pages` and never looks at
+    /// `deleted_pages`, so a pending deletion silently produces the SAME
+    /// `None` as genuine convergence — which is exactly what a byte-empty
+    /// `get_state_delta` (delta#43) reports to freenet-core's InterestSync
+    /// staleness backstop as "converged despite differing summary bytes",
+    /// permanently suppressing the one heal that would have delivered the
+    /// tombstone to a peer that missed the live delete broadcast.
+    #[test]
+    fn deletion_pending_relative_to_peer_summary_is_not_an_empty_delta() {
+        let owner = gen_key();
+        let mut site = SiteState::new(SiteConfig::default(), &owner);
+
+        let page = Page::new(1, "Home".into(), "# Hello".into(), 1000, &owner);
+        site.upsert_page(1, page, &owner.verifying_key()).unwrap();
+
+        // A peer's summary from before the deletion: it still reports
+        // holding page 1.
+        let peer_summary = site.summarize();
+
+        let deletion = SignedPageDeletion::new(1, 2000, &owner);
+        site.delete_page(&deletion, &owner.verifying_key()).unwrap();
+
+        let delta = site
+            .compute_delta(&peer_summary)
+            .expect("a pending deletion the peer doesn't know about must not be None");
+
+        assert_eq!(
+            delta.page_deletions.len(),
+            1,
+            "delta should carry the tombstone for the page the peer still reports holding"
+        );
+        assert_eq!(delta.page_deletions[0].page_id, 1);
+        assert!(delta.page_updates.is_empty());
+    }
+
+    #[test]
+    fn deletion_delta_heals_a_peer_with_the_stale_page() {
+        let owner = gen_key();
+        let params = make_params(&owner);
+        let mut site = SiteState::new(SiteConfig::default(), &owner);
+
+        let page = Page::new(1, "Home".into(), "# Hello".into(), 1000, &owner);
+        site.upsert_page(1, page.clone(), &owner.verifying_key())
+            .unwrap();
+
+        // A peer that received the page before the deletion (e.g. missed the
+        // live delete broadcast) and is still serving the stale copy.
+        let mut peer = SiteState::new(SiteConfig::default(), &owner);
+        peer.upsert_page(1, page, &owner.verifying_key()).unwrap();
+        let peer_summary = peer.summarize();
+
+        let deletion = SignedPageDeletion::new(1, 2000, &owner);
+        site.delete_page(&deletion, &owner.verifying_key()).unwrap();
+
+        let delta = site
+            .compute_delta(&peer_summary)
+            .expect("pending deletion must produce a delta");
+        peer.apply_delta(&delta, &params).unwrap();
+
+        assert!(
+            peer.pages.is_empty(),
+            "peer should have dropped the deleted page"
+        );
+        assert!(
+            peer.deleted_pages.contains_key(&1),
+            "peer should have adopted the tombstone"
+        );
+
+        // Once both sides agree, the delta against the healed peer's own
+        // (now tombstone-consistent) summary is genuinely empty again — not
+        // because deletions are invisible to compute_delta, but because
+        // there is truly nothing left to communicate.
+        let converged_summary = peer.summarize();
+        assert!(site.compute_delta(&converged_summary).is_none());
+    }
+
+    /// Review follow-up on delta#43: `compute_delta` populating
+    /// `page_deletions` makes `apply_delta`'s deletion loop reachable via
+    /// real network sync for the first time (previously `compute_delta`
+    /// never emitted one, so only a hand-built delta could exercise it).
+    /// `delete_page`'s `deleted_pages.insert` is last-write-wins, unlike
+    /// `merge`'s `or_insert_with` (first-write-wins) — see the analogous,
+    /// already-pinned `conflicting_tombstone_deleted_at_is_order_dependent_but_page_stays_deleted`
+    /// in `ui/src/freenet_api/operations.rs` for the `merge` path. Both are
+    /// order-dependent in which `deleted_at`/signature ends up recorded, but
+    /// harmless: the page stays deleted either way. Pinning the `apply_delta`
+    /// side explicitly now that it is reachable, not changing the behavior.
+    #[test]
+    fn apply_delta_conflicting_tombstone_is_order_dependent_but_page_stays_deleted() {
+        let owner = gen_key();
+        let params = make_params(&owner);
+
+        let mut peer = SiteState::new(SiteConfig::default(), &owner);
+        let page = Page::new(1, "Home".into(), "# Hello".into(), 1000, &owner);
+        peer.upsert_page(1, page, &owner.verifying_key()).unwrap();
+        // Peer already tombstoned page 1 locally.
+        let local_deletion = SignedPageDeletion::new(1, 1000, &owner);
+        peer.delete_page(&local_deletion, &owner.verifying_key())
+            .unwrap();
+
+        // A delta arrives carrying a DIFFERENT (later) tombstone for the
+        // same page, e.g. from a peer that deleted it independently.
+        let incoming_deletion = SignedPageDeletion::new(1, 2000, &owner);
+        let delta = SiteStateDelta {
+            config: None,
+            page_updates: BTreeMap::new(),
+            page_deletions: vec![incoming_deletion],
+        };
+        peer.apply_delta(&delta, &params).unwrap();
+
+        assert!(
+            peer.pages.is_empty(),
+            "page must stay deleted regardless of which tombstone wins"
+        );
+        assert_eq!(
+            peer.deleted_pages[&1].deleted_at, 2000,
+            "delete_page overwrites with the incoming tombstone (last-write-wins); \
+             documenting the current behavior, not asserting it as ideal"
+        );
+    }
+
+    /// A delta can legitimately carry both a config bump and a pending
+    /// deletion in the same message; the `None` gate must require all three
+    /// fields empty, not just page_updates.
+    #[test]
+    fn delta_carries_both_a_config_change_and_a_pending_deletion() {
+        let owner = gen_key();
+        let mut site = SiteState::new(SiteConfig::default(), &owner);
+
+        let page = Page::new(1, "Home".into(), "# Hello".into(), 1000, &owner);
+        site.upsert_page(1, page, &owner.verifying_key()).unwrap();
+
+        // Peer's summary predates both the deletion and the config bump.
+        let peer_summary = site.summarize();
+
+        let deletion = SignedPageDeletion::new(1, 2000, &owner);
+        site.delete_page(&deletion, &owner.verifying_key()).unwrap();
+        site.config = SignedConfig::new(
+            SiteConfig {
+                version: 2,
+                name: "Renamed".into(),
+                description: String::new(),
+            },
+            &owner,
+        );
+
+        let delta = site
+            .compute_delta(&peer_summary)
+            .expect("config bump plus pending deletion must not be None");
+
+        assert!(delta.config.is_some(), "delta should carry the config bump");
+        assert_eq!(delta.page_deletions.len(), 1);
+        assert!(delta.page_updates.is_empty());
     }
 
     #[test]

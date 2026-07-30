@@ -137,7 +137,7 @@ impl ContractInterface for Contract {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use delta_core::{Page, SiteConfig};
+    use delta_core::{Page, SignedPageDeletion, SiteConfig};
     use ed25519_dalek::SigningKey;
 
     fn test_owner() -> SigningKey {
@@ -145,10 +145,12 @@ mod tests {
     }
 
     /// #5072: `get_state_delta` against a peer that already has the exact
-    /// same state must return an EMPTY delta. Core's convergence check
-    /// (`get_state_delta(our_state, their_summary).is_empty()`) is the only
-    /// signal it uses to decide two peers have converged; a non-empty
-    /// "nothing changed" delta means that signal can never fire.
+    /// same state must return an EMPTY delta. freenet-core's InterestSync
+    /// staleness backstop (run only once two peers' summary bytes already
+    /// differ, per `plan_fanout_send` skipping byte-identical summaries
+    /// first) treats an empty `get_state_delta` result as "converged
+    /// despite differing summary bytes"; a non-empty "nothing changed"
+    /// delta means that backstop can never fire for this contract.
     #[test]
     fn self_delta_against_own_summary_is_empty() {
         let owner = test_owner();
@@ -184,6 +186,80 @@ mod tests {
             "delta against own summary should be empty (0 bytes), got {} bytes: {:?}",
             delta.as_ref().len(),
             delta.as_ref()
+        );
+    }
+
+    /// delta#43 follow-up: a deletion pending relative to a specific peer's
+    /// summary must produce a NON-EMPTY delta (see `deletion_pending_relative_to_peer_summary_is_not_an_empty_delta`
+    /// in `delta-core`), and applying that delta through the contract's real
+    /// `update_state` entry point must actually remove the page and record
+    /// the tombstone on the peer that missed the live delete broadcast.
+    /// This is the scenario the `self_delta_against_own_summary_is_empty`
+    /// fix must not silence: a stale-but-summary-matching peer still needs
+    /// to hear about the deletion.
+    #[test]
+    fn get_state_delta_carries_a_pending_deletion_and_heals_a_stale_peer() {
+        let owner = test_owner();
+        let params = SiteParameters::from_owner(&owner.verifying_key());
+        let mut params_buf = Vec::new();
+        into_writer(&params, &mut params_buf).unwrap();
+
+        let mut site_state = SiteState::new(SiteConfig::default(), &owner);
+        let page = Page::new(1, "Home".into(), "# Welcome".into(), 1000, &owner);
+        site_state
+            .upsert_page(1, page.clone(), &owner.verifying_key())
+            .unwrap();
+
+        // A peer that received the page before the deletion and hasn't
+        // heard about it since (its state IS the pre-deletion state).
+        let mut stale_peer_state = SiteState::new(SiteConfig::default(), &owner);
+        stale_peer_state
+            .upsert_page(1, page, &owner.verifying_key())
+            .unwrap();
+        let mut peer_state_buf = Vec::new();
+        into_writer(&stale_peer_state, &mut peer_state_buf).unwrap();
+        let peer_summary = Contract::summarize_state(
+            Parameters::from(Vec::new()),
+            State::from(peer_state_buf.clone()),
+        )
+        .expect("summarize_state should succeed");
+
+        let deletion = SignedPageDeletion::new(1, 2000, &owner);
+        site_state
+            .delete_page(&deletion, &owner.verifying_key())
+            .unwrap();
+        let mut site_state_buf = Vec::new();
+        into_writer(&site_state, &mut site_state_buf).unwrap();
+
+        let delta = Contract::get_state_delta(
+            Parameters::from(Vec::new()),
+            State::from(site_state_buf),
+            StateSummary::from(peer_summary.as_ref().to_vec()),
+        )
+        .expect("get_state_delta should succeed");
+
+        assert!(
+            !delta.as_ref().is_empty(),
+            "a peer that still has the deleted page must get a non-empty delta"
+        );
+
+        let healed = Contract::update_state(
+            Parameters::from(params_buf),
+            State::from(peer_state_buf),
+            vec![UpdateData::Delta(delta)],
+        )
+        .expect("update_state should apply the deletion delta");
+
+        let healed_state = from_reader::<SiteState, &[u8]>(healed.unwrap_valid().as_ref())
+            .expect("healed state should deserialize");
+
+        assert!(
+            healed_state.pages.is_empty(),
+            "stale peer should have dropped the deleted page"
+        );
+        assert!(
+            healed_state.deleted_pages.contains_key(&1),
+            "stale peer should have adopted the tombstone"
         );
     }
 }
