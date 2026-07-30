@@ -56,3 +56,9 @@ version = "C6"
 description = "Before tombstone authentication + owner-bound merge (security fix)"
 date = "2026-07-26"
 code_hash = "7f81b4d6c7ff15eb6c8b5c5573b6911b2f076ccde7feaef6c4f8d16402c1acba"
+
+[[entry]]
+version = "C7"
+description = "Before self-delta empty-bytes fix + deletion-propagation via compute_delta (delta#43)"
+date = "2026-07-30"
+code_hash = "192b171dc49e97c3b7ac014fcd7d932d6275b6917c944a76a2aec86613a6f8d2"

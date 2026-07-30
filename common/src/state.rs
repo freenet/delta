@@ -404,18 +404,32 @@ impl SiteState {
             }
         }
 
-        // Pages the peer has that we don't — they were deleted.
-        // We can't produce signed deletions retroactively here,
-        // so we skip this for now. Deletions must be explicitly
-        // propagated via update_state.
+        // Pages the peer's summary still reports holding that we've since
+        // deleted: forward the already-signed tombstone. We already have it
+        // in `deleted_pages` (signed at delete time), so there is nothing
+        // "retroactive" about it. Skipping this made a pending deletion
+        // relative to a specific peer indistinguishable from genuine
+        // convergence (delta#43): freenet-core's InterestSync backstop reads
+        // an EMPTY result from this method as "converged, nothing to send"
+        // and SUPPRESSES the heal it would otherwise trigger. Without this
+        // filter, a peer that missed the live delete broadcast has no other
+        // path to learn about the deletion: this method staying (wrongly)
+        // empty is exactly what would have suppressed the resync that could
+        // have told it.
+        let page_deletions: Vec<SignedPageDeletion> = self
+            .deleted_pages
+            .iter()
+            .filter(|(id, _)| summary.pages.contains_key(id))
+            .map(|(_, deletion)| deletion.clone())
+            .collect();
 
-        if config.is_none() && page_updates.is_empty() {
+        if config.is_none() && page_updates.is_empty() && page_deletions.is_empty() {
             None
         } else {
             Some(SiteStateDelta {
                 config,
                 page_updates,
-                page_deletions: Vec::new(),
+                page_deletions,
             })
         }
     }
@@ -427,6 +441,21 @@ impl SiteState {
         delta: &SiteStateDelta,
         params: &SiteParameters,
     ) -> Result<(), String> {
+        // A delta has no owner field of its own to establish or verify
+        // against, unlike a full state (which `merge` can adopt wholesale
+        // once it has cleared `other.verify(params)` against a real owner).
+        // Applying a delta to an uninitialized (placeholder-owner) state
+        // would verify every signature against `placeholder_owner()`, which
+        // is not self-protecting: `is_uninitialized`'s rustdoc already
+        // documents that ed25519-dalek's non-strict `verify` doesn't reject
+        // the placeholder's weak (order-4) key, so a signature under it is
+        // forgeable without any private key. Refuse outright rather than
+        // silently "verifying" against a key nobody controls; first capture
+        // for an unclaimed address happens via `merge`, not `apply_delta`.
+        if self.is_uninitialized() {
+            return Err("cannot apply a delta to an uninitialized site".to_string());
+        }
+
         let owner = self.owner;
 
         if let Some(new_config) = &delta.config {
@@ -437,6 +466,18 @@ impl SiteState {
         }
 
         for (&page_id, page) in &delta.page_updates {
+            // #18: don't resurrect a page we've already tombstoned. Without
+            // this, a delta that arrives before its sender learns about our
+            // deletion (this round's summary predates it) re-creates the
+            // page here, and if the sender is ALSO stale relative to us in
+            // the same round, the next round flips the roles and oscillates
+            // forever instead of converging. `merge` already has the
+            // equivalent check for full-state application; this is the
+            // matching guard for delta application. See
+            // `deletion_converges_under_simultaneous_bidirectional_exchange`.
+            if self.deleted_pages.contains_key(&page_id) {
+                continue;
+            }
             let dominated = self
                 .pages
                 .get(&page_id)
@@ -446,6 +487,16 @@ impl SiteState {
             }
         }
 
+        // Deletions are applied after updates. The #18 guard above is what
+        // actually guarantees deletion wins as an observable property
+        // across an exchange (see
+        // `deletion_converges_under_simultaneous_bidirectional_exchange`):
+        // once a tombstone exists and gets communicated, every later update
+        // for that id is rejected on arrival. This ordering only covers a
+        // narrower, single-call case the guard above can't see yet: if ONE
+        // delta carries both a page_update and a page_deletion for the same
+        // id, applying updates first makes that mixed delta resolve to
+        // deletion-wins too, instead of depending on iteration order.
         for deletion in &delta.page_deletions {
             self.delete_page(deletion, &owner)?;
         }
@@ -915,6 +966,485 @@ mod tests {
 
         assert_eq!(peer.pages.len(), 1);
         assert_eq!(peer.pages[&1].content, "# Hello");
+    }
+
+    /// delta#43 follow-up: a peer whose summary still lists a page we've
+    /// since deleted must get a non-empty delta carrying the tombstone.
+    /// Without this, `compute_delta` only diffs `pages` and never looks at
+    /// `deleted_pages`, so a pending deletion silently produces the SAME
+    /// `None` as genuine convergence — which is exactly what a byte-empty
+    /// `get_state_delta` (delta#43) reports to freenet-core's InterestSync
+    /// staleness backstop as "converged despite differing summary bytes",
+    /// permanently suppressing the one heal that would have delivered the
+    /// tombstone to a peer that missed the live delete broadcast.
+    /// Review follow-up (F1): `apply_delta` verifies signatures against
+    /// `self.owner`, but a `SiteState::default()` (uninitialized) state has
+    /// `owner == placeholder_owner()` — a `[0u8; 32]` key that decompresses
+    /// to a weak (order-4) point ed25519-dalek's non-strict `verify` does
+    /// not reject. A zero signature verifies for a meaningful fraction of
+    /// messages against it, so a delta could be forged against any site
+    /// whose local state happens to still be the placeholder (e.g. a
+    /// `KnownSite` installed with `state: SiteState::default()` before its
+    /// real content ever arrived). This grinds `deleted_at` for a
+    /// zero-signature `SignedPageDeletion` that verifies under the
+    /// placeholder key (mirroring how the forgery was found in review),
+    /// then confirms `apply_delta` refuses it outright rather than
+    /// "verifying" a signature nobody's private key produced.
+    #[test]
+    fn apply_delta_rejects_a_forged_delta_against_an_uninitialized_state() {
+        let mut site = SiteState::default();
+        assert!(site.is_uninitialized());
+        let params = SiteParameters {
+            prefix: pubkey_to_prefix(&placeholder_owner()),
+        };
+
+        let zero_sig = Signature::from_bytes(&[0u8; 64]);
+        let forged_deletion = (0u64..10_000)
+            .find_map(|deleted_at| {
+                let bytes = deletion_signing_bytes(1, deleted_at);
+                placeholder_owner()
+                    .verify(&bytes, &zero_sig)
+                    .ok()
+                    .map(|()| SignedPageDeletion {
+                        page_id: 1,
+                        deleted_at,
+                        signature: zero_sig,
+                    })
+            })
+            .expect(
+                "a zero-signature deleted_at that verifies under the placeholder \
+                 key should exist well within 10_000 tries (review found one in 4)",
+            );
+
+        let delta = SiteStateDelta {
+            config: None,
+            page_updates: BTreeMap::new(),
+            page_deletions: vec![forged_deletion],
+        };
+
+        let result = site.apply_delta(&delta, &params);
+        assert!(
+            result.is_err(),
+            "a delta must never apply to an uninitialized (placeholder-owner) state"
+        );
+        assert!(site.pages.is_empty());
+        assert!(
+            site.deleted_pages.is_empty(),
+            "the forged tombstone must not be recorded"
+        );
+    }
+
+    #[test]
+    fn deletion_pending_relative_to_peer_summary_is_not_an_empty_delta() {
+        let owner = gen_key();
+        let mut site = SiteState::new(SiteConfig::default(), &owner);
+
+        let page = Page::new(1, "Home".into(), "# Hello".into(), 1000, &owner);
+        site.upsert_page(1, page, &owner.verifying_key()).unwrap();
+
+        // A peer's summary from before the deletion: it still reports
+        // holding page 1.
+        let peer_summary = site.summarize();
+
+        let deletion = SignedPageDeletion::new(1, 2000, &owner);
+        site.delete_page(&deletion, &owner.verifying_key()).unwrap();
+
+        let delta = site
+            .compute_delta(&peer_summary)
+            .expect("a pending deletion the peer doesn't know about must not be None");
+
+        assert_eq!(
+            delta.page_deletions.len(),
+            1,
+            "delta should carry the tombstone for the page the peer still reports holding"
+        );
+        assert_eq!(delta.page_deletions[0].page_id, 1);
+        assert!(delta.page_updates.is_empty());
+    }
+
+    #[test]
+    fn deletion_delta_heals_a_peer_with_the_stale_page() {
+        let owner = gen_key();
+        let params = make_params(&owner);
+        let mut site = SiteState::new(SiteConfig::default(), &owner);
+
+        let page = Page::new(1, "Home".into(), "# Hello".into(), 1000, &owner);
+        site.upsert_page(1, page.clone(), &owner.verifying_key())
+            .unwrap();
+
+        // A peer that received the page before the deletion (e.g. missed the
+        // live delete broadcast) and is still serving the stale copy.
+        let mut peer = SiteState::new(SiteConfig::default(), &owner);
+        peer.upsert_page(1, page, &owner.verifying_key()).unwrap();
+        let peer_summary = peer.summarize();
+
+        let deletion = SignedPageDeletion::new(1, 2000, &owner);
+        site.delete_page(&deletion, &owner.verifying_key()).unwrap();
+
+        let delta = site
+            .compute_delta(&peer_summary)
+            .expect("pending deletion must produce a delta");
+        peer.apply_delta(&delta, &params).unwrap();
+
+        assert!(
+            peer.pages.is_empty(),
+            "peer should have dropped the deleted page"
+        );
+        assert!(
+            peer.deleted_pages.contains_key(&1),
+            "peer should have adopted the tombstone"
+        );
+
+        // Once both sides agree, the delta against the healed peer's own
+        // (now tombstone-consistent) summary is genuinely empty again — not
+        // because deletions are invisible to compute_delta, but because
+        // there is truly nothing left to communicate.
+        let converged_summary = peer.summarize();
+        assert!(site.compute_delta(&converged_summary).is_none());
+    }
+
+    /// Review follow-up: the #18 guard in `apply_delta` (`if
+    /// self.deleted_pages.contains_key(&page_id) { continue; }`) checks the
+    /// SPECIFIC id being applied, not merely "do I have any tombstone at
+    /// all". Neither convergence test can distinguish those two readings,
+    /// since neither delivers a live page alongside an unrelated tombstone.
+    /// A peer holding a tombstone for page 1 must still accept an unrelated
+    /// update to page 2.
+    #[test]
+    fn apply_delta_delivers_unrelated_pages_when_a_tombstone_exists() {
+        let owner = gen_key();
+        let params = make_params(&owner);
+        let mut peer = SiteState::new(SiteConfig::default(), &owner);
+
+        let page1 = Page::new(1, "One".into(), "# One".into(), 1000, &owner);
+        let page2 = Page::new(2, "Two".into(), "# Two".into(), 1000, &owner);
+        peer.upsert_page(1, page1, &owner.verifying_key()).unwrap();
+        peer.upsert_page(2, page2, &owner.verifying_key()).unwrap();
+
+        let deletion = SignedPageDeletion::new(1, 2000, &owner);
+        peer.delete_page(&deletion, &owner.verifying_key()).unwrap();
+
+        // A delta with a newer page 2, no mention of page 1 at all.
+        let page2_v2 = Page::new(2, "Two".into(), "# Two v2".into(), 2000, &owner);
+        let mut page_updates = BTreeMap::new();
+        page_updates.insert(2, page2_v2);
+        let delta = SiteStateDelta {
+            config: None,
+            page_updates,
+            page_deletions: Vec::new(),
+        };
+
+        peer.apply_delta(&delta, &params).unwrap();
+
+        assert_eq!(
+            peer.pages[&2].content, "# Two v2",
+            "an unrelated tombstone must not block an update to a different page"
+        );
+        assert!(!peer.pages.contains_key(&1), "page 1 must stay deleted");
+    }
+
+    /// Review follow-up: the `summary.pages.contains_key(id)` filter in
+    /// `compute_delta` checks the SPECIFIC id, not merely "does the peer's
+    /// summary have any pages at all". Deletes two pages, but the peer's
+    /// summary only still lists one of them (it already learned about the
+    /// other's deletion, or never held it) — only that one tombstone should
+    /// be forwarded, not every locally-known deletion.
+    #[test]
+    fn compute_delta_emits_only_tombstones_the_peer_still_holds() {
+        let owner = gen_key();
+        let mut site = SiteState::new(SiteConfig::default(), &owner);
+
+        let page1 = Page::new(1, "One".into(), "# One".into(), 1000, &owner);
+        let page2 = Page::new(2, "Two".into(), "# Two".into(), 1000, &owner);
+        site.upsert_page(1, page1, &owner.verifying_key()).unwrap();
+        site.upsert_page(2, page2, &owner.verifying_key()).unwrap();
+
+        let deletion1 = SignedPageDeletion::new(1, 2000, &owner);
+        site.delete_page(&deletion1, &owner.verifying_key())
+            .unwrap();
+        let deletion2 = SignedPageDeletion::new(2, 2000, &owner);
+        site.delete_page(&deletion2, &owner.verifying_key())
+            .unwrap();
+
+        let mut peer_summary = SiteStateSummary::default();
+        peer_summary.pages.insert(1, (blake3::hash(b"# One"), 1000));
+
+        let delta = site
+            .compute_delta(&peer_summary)
+            .expect("should have a delta for page 1's tombstone");
+        let ids: Vec<PageId> = delta.page_deletions.iter().map(|d| d.page_id).collect();
+        assert_eq!(
+            ids,
+            vec![1],
+            "only the tombstone the peer's summary still reflects should be sent"
+        );
+    }
+
+    /// Review follow-up on delta#43: `compute_delta` populating
+    /// `page_deletions` makes `apply_delta`'s deletion loop reachable via
+    /// real network sync for the first time (previously `compute_delta`
+    /// never emitted one, so only a hand-built delta could exercise it).
+    /// `delete_page`'s `deleted_pages.insert` is last-write-wins, unlike
+    /// `merge`'s `or_insert_with` (first-write-wins) — see the analogous,
+    /// already-pinned `conflicting_tombstone_deleted_at_is_order_dependent_but_page_stays_deleted`
+    /// in `ui/src/freenet_api/operations.rs` for the `merge` path. Both are
+    /// order-dependent in which `deleted_at`/signature ends up recorded, but
+    /// harmless: the page stays deleted either way. Pinning the `apply_delta`
+    /// side explicitly now that it is reachable, not changing the behavior.
+    #[test]
+    fn apply_delta_conflicting_tombstone_is_order_dependent_but_page_stays_deleted() {
+        let owner = gen_key();
+        let params = make_params(&owner);
+        let page = Page::new(1, "Home".into(), "# Hello".into(), 1000, &owner);
+
+        // Order A: local tombstone recorded with the SMALLER value (1000)
+        // first, incoming delta carries the LARGER one (2000).
+        let mut peer_a = SiteState::new(SiteConfig::default(), &owner);
+        peer_a
+            .upsert_page(1, page.clone(), &owner.verifying_key())
+            .unwrap();
+        peer_a
+            .delete_page(
+                &SignedPageDeletion::new(1, 1000, &owner),
+                &owner.verifying_key(),
+            )
+            .unwrap();
+        let delta_a = SiteStateDelta {
+            config: None,
+            page_updates: BTreeMap::new(),
+            page_deletions: vec![SignedPageDeletion::new(1, 2000, &owner)],
+        };
+        peer_a.apply_delta(&delta_a, &params).unwrap();
+
+        // Order B: the SAME two values, but paired the OTHER way around
+        // (local gets the LARGER value first, incoming carries the
+        // SMALLER one). This is what actually proves order-dependence
+        // (last-applied-wins) rather than a max-wins implementation that
+        // would happen to agree with order A's result alone.
+        let mut peer_b = SiteState::new(SiteConfig::default(), &owner);
+        peer_b.upsert_page(1, page, &owner.verifying_key()).unwrap();
+        peer_b
+            .delete_page(
+                &SignedPageDeletion::new(1, 2000, &owner),
+                &owner.verifying_key(),
+            )
+            .unwrap();
+        let delta_b = SiteStateDelta {
+            config: None,
+            page_updates: BTreeMap::new(),
+            page_deletions: vec![SignedPageDeletion::new(1, 1000, &owner)],
+        };
+        peer_b.apply_delta(&delta_b, &params).unwrap();
+
+        // Page stays deleted in BOTH orders (the harmless part).
+        assert!(peer_a.pages.is_empty());
+        assert!(peer_b.pages.is_empty());
+
+        assert_eq!(
+            peer_a.deleted_pages[&1].deleted_at, 2000,
+            "apply_delta overwrites with the incoming tombstone"
+        );
+        assert_eq!(
+            peer_b.deleted_pages[&1].deleted_at, 1000,
+            "apply_delta overwrites with the incoming tombstone even when it is \
+             SMALLER, ruling out max-wins as an alternative explanation"
+        );
+        assert_ne!(
+            peer_a.deleted_pages[&1].deleted_at, peer_b.deleted_pages[&1].deleted_at,
+            "conflicting-tombstone deleted_at is order-dependent (documented, harmless)"
+        );
+    }
+
+    /// A delta can legitimately carry both a config bump and a pending
+    /// deletion in the same message. NOTE: this does NOT pin the `None`
+    /// gate's three-field requirement — with `config` already `Some`, the
+    /// `config.is_none() && ...` check short-circuits to `false` regardless
+    /// of `page_deletions`, so this test would pass identically even if the
+    /// `page_deletions.is_empty()` term were removed from the gate entirely.
+    /// The gate's `page_deletions` term is actually pinned by
+    /// `deletion_pending_relative_to_peer_summary_is_not_an_empty_delta`
+    /// (config `None`, page_updates empty, page_deletions non-empty still
+    /// forces `Some`). This test is a combinatorial sanity check that the
+    /// two fields coexist correctly, not a gate-necessity proof.
+    #[test]
+    fn delta_carries_both_a_config_change_and_a_pending_deletion() {
+        let owner = gen_key();
+        let mut site = SiteState::new(SiteConfig::default(), &owner);
+
+        let page = Page::new(1, "Home".into(), "# Hello".into(), 1000, &owner);
+        site.upsert_page(1, page, &owner.verifying_key()).unwrap();
+
+        // Peer's summary predates both the deletion and the config bump.
+        let peer_summary = site.summarize();
+
+        let deletion = SignedPageDeletion::new(1, 2000, &owner);
+        site.delete_page(&deletion, &owner.verifying_key()).unwrap();
+        site.config = SignedConfig::new(
+            SiteConfig {
+                version: 2,
+                name: "Renamed".into(),
+                description: String::new(),
+            },
+            &owner,
+        );
+
+        let delta = site
+            .compute_delta(&peer_summary)
+            .expect("config bump plus pending deletion must not be None");
+
+        assert!(delta.config.is_some(), "delta should carry the config bump");
+        assert_eq!(delta.page_deletions.len(), 1);
+        assert!(delta.page_updates.is_empty());
+    }
+
+    /// Review follow-up (#18 interaction): `compute_delta` now emits
+    /// tombstones, but `apply_delta`'s page-update loop upserts without
+    /// consulting `deleted_pages` (unlike `merge`, which skips a tombstoned
+    /// id). Under a SIMULTANEOUS bidirectional exchange, that combination
+    /// oscillates instead of converging: whichever peer currently holds the
+    /// page sends it as a page_update (its delta is computed against the
+    /// OTHER peer's summary from BEFORE this round, so it doesn't yet know
+    /// about a same-round deletion), while the peer holding the tombstone
+    /// sends the deletion; each side's incoming page_update resurrects the
+    /// page locally, feeding the same shape into the next round.
+    ///
+    /// This is specifically a CONCURRENT-exchange bug: an alternating
+    /// (ping-pong) exchange converges fine, because each side's compute_delta
+    /// always runs against the OTHER's most recent summary. The test
+    /// therefore snapshots BOTH summaries before applying EITHER delta each
+    /// round, matching how a real heartbeat round works (every peer's
+    /// summary at the start of the round is what every other peer computes
+    /// against) — computing serially (compute A, apply A, compute B against
+    /// A's now-updated state, apply B) would silently degrade this into the
+    /// alternating case and pass regardless of the bug.
+    #[test]
+    fn deletion_converges_under_simultaneous_bidirectional_exchange() {
+        let owner = gen_key();
+        let params = make_params(&owner);
+
+        let mut a = SiteState::new(SiteConfig::default(), &owner);
+        let page = Page::new(1, "Home".into(), "# Hello".into(), 1000, &owner);
+        a.upsert_page(1, page.clone(), &owner.verifying_key())
+            .unwrap();
+
+        // b is a-before-the-deletion: it still has page 1 and doesn't know
+        // a deleted it.
+        let mut b = SiteState::new(SiteConfig::default(), &owner);
+        b.upsert_page(1, page, &owner.verifying_key()).unwrap();
+
+        let deletion = SignedPageDeletion::new(1, 2000, &owner);
+        a.delete_page(&deletion, &owner.verifying_key()).unwrap();
+
+        const MAX_ROUNDS: usize = 10;
+        for round in 0..MAX_ROUNDS {
+            // Snapshot BOTH summaries before applying either delta — see the
+            // doc comment above for why this matters.
+            let a_summary = a.summarize();
+            let b_summary = b.summarize();
+
+            let delta_to_b = a.compute_delta(&b_summary);
+            let delta_to_a = b.compute_delta(&a_summary);
+
+            if delta_to_b.is_none() && delta_to_a.is_none() {
+                assert!(a.pages.is_empty(), "a should have converged with no page 1");
+                assert!(b.pages.is_empty(), "b should have converged with no page 1");
+                assert!(
+                    b.deleted_pages.contains_key(&1),
+                    "the deletion must win, not the page"
+                );
+                return;
+            }
+
+            if let Some(d) = delta_to_b {
+                b.apply_delta(&d, &params).unwrap();
+            }
+            if let Some(d) = delta_to_a {
+                a.apply_delta(&d, &params).unwrap();
+            }
+
+            if round == MAX_ROUNDS - 1 {
+                panic!(
+                    "no fixpoint after {MAX_ROUNDS} rounds of simultaneous exchange; \
+                     a.pages={:?} b.pages={:?}",
+                    a.pages.keys().collect::<Vec<_>>(),
+                    b.pages.keys().collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    /// Second-lens follow-up: the oscillation above isn't limited to a
+    /// stale peer that missed a delete broadcast. The SAME owner deleting a
+    /// DIFFERENT page on each of two devices (e.g. offline edits on a phone
+    /// and a laptop) hits it too: `a` ends up with `pages=[2] tomb=[1]`,
+    /// `b` with `pages=[1] tomb=[2]`, and without the guard each side's
+    /// page_update for its own surviving page resurrects the other's
+    /// deleted page, forever. Same guard, same fixpoint check.
+    #[test]
+    fn concurrent_deletes_of_different_pages_converge() {
+        let owner = gen_key();
+        let params = make_params(&owner);
+
+        let mut a = SiteState::new(SiteConfig::default(), &owner);
+        let page1 = Page::new(1, "One".into(), "# One".into(), 1000, &owner);
+        let page2 = Page::new(2, "Two".into(), "# Two".into(), 1000, &owner);
+        a.upsert_page(1, page1.clone(), &owner.verifying_key())
+            .unwrap();
+        a.upsert_page(2, page2.clone(), &owner.verifying_key())
+            .unwrap();
+
+        // b starts as a's twin (same two pages, e.g. synced before either
+        // device went offline).
+        let mut b = SiteState::new(SiteConfig::default(), &owner);
+        b.upsert_page(1, page1, &owner.verifying_key()).unwrap();
+        b.upsert_page(2, page2, &owner.verifying_key()).unwrap();
+
+        // a deletes page 1 (offline); b deletes page 2 (offline, on a
+        // different device), neither aware of the other's edit.
+        let a_deletion = SignedPageDeletion::new(1, 2000, &owner);
+        a.delete_page(&a_deletion, &owner.verifying_key()).unwrap();
+        let b_deletion = SignedPageDeletion::new(2, 2000, &owner);
+        b.delete_page(&b_deletion, &owner.verifying_key()).unwrap();
+
+        const MAX_ROUNDS: usize = 10;
+        for round in 0..MAX_ROUNDS {
+            let a_summary = a.summarize();
+            let b_summary = b.summarize();
+
+            let delta_to_b = a.compute_delta(&b_summary);
+            let delta_to_a = b.compute_delta(&a_summary);
+
+            if delta_to_b.is_none() && delta_to_a.is_none() {
+                assert!(
+                    !a.pages.contains_key(&1) && !a.pages.contains_key(&2),
+                    "a should have converged with both pages gone"
+                );
+                assert!(
+                    !b.pages.contains_key(&1) && !b.pages.contains_key(&2),
+                    "b should have converged with both pages gone"
+                );
+                assert!(a.deleted_pages.contains_key(&1));
+                assert!(a.deleted_pages.contains_key(&2));
+                assert!(b.deleted_pages.contains_key(&1));
+                assert!(b.deleted_pages.contains_key(&2));
+                return;
+            }
+
+            if let Some(d) = delta_to_b {
+                b.apply_delta(&d, &params).unwrap();
+            }
+            if let Some(d) = delta_to_a {
+                a.apply_delta(&d, &params).unwrap();
+            }
+
+            if round == MAX_ROUNDS - 1 {
+                panic!(
+                    "no fixpoint after {MAX_ROUNDS} rounds; a.pages={:?} b.pages={:?}",
+                    a.pages.keys().collect::<Vec<_>>(),
+                    b.pages.keys().collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     #[test]

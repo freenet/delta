@@ -481,6 +481,52 @@ fn handle_site_state(key: ContractKey, state_bytes: &[u8]) -> bool {
     true
 }
 
+/// Apply a delta to a site's state via the single verified implementation
+/// (`SiteState::apply_delta`, also used by the contract itself), rather than
+/// hand-rolling a second applier here. `handle_site_delta` used to have its
+/// own inline logic that never verified page/deletion/config signatures and
+/// never recorded a tombstone for an applied deletion, so a deleted page
+/// just came back on the next GET, delegate-backup restore, or
+/// legacy-contract sweep (`merge`/the tombstone-aware reconcile had nothing
+/// to skip on, since no tombstone was ever recorded). That was effectively
+/// dead code as long as `compute_delta` never populated `page_deletions`;
+/// this PR makes that path live, which made both gaps live too. That is a
+/// genuine authentication bypass, not just a missed optimization, so it is
+/// fixed by delegating rather than patching the second implementation to
+/// match the first.
+///
+/// A free function (not touching `state::SITES` or any other global) so it
+/// is directly unit-testable, matching this file's existing pattern for
+/// logic that used to be inlined into a signal-touching caller (see
+/// `reconcile_into`, `classify_get_response`).
+///
+/// Returns the resulting site name on success (for the caller to sync onto
+/// `KnownSite::name`), or the verification error on rejection.
+///
+/// Applies to a CLONE and only swaps it in on success. `SiteState::apply_delta`
+/// mutates its fields incrementally (config, then page_updates, then
+/// page_deletions) and returns early via `?` on the first failure, so an
+/// in-place `site_state.apply_delta(...)` would commit whichever fields
+/// verified before the one that didn't — only reachable from a delta whose
+/// earlier fields are validly signed by the real owner but a later field is
+/// forged by a different key, but a "rejected" delta should never leave a
+/// partial mutation behind. The clone keeps this call site atomic; deliberately
+/// NOT changed in `SiteState::apply_delta` itself, since the contract's
+/// `update_state` already discards its `site_state` on `Err` (see
+/// `ContractInterface::update_state`) and the clone belongs where the
+/// in-place, reused `SiteState` actually lives.
+fn apply_delta_to_site_state(
+    site_state: &mut SiteState,
+    delta: &delta_core::SiteStateDelta,
+) -> Result<String, String> {
+    let mut next = site_state.clone();
+    let params = delta_core::SiteParameters::from_owner(&next.owner);
+    next.apply_delta(delta, &params)?;
+    let name = next.config.config.name.clone();
+    *site_state = next;
+    Ok(name)
+}
+
 /// Process a delta update for a site.
 fn handle_site_delta(key: ContractKey, delta_bytes: &[u8]) {
     if delta_bytes.is_empty() {
@@ -503,18 +549,14 @@ fn handle_site_delta(key: ContractKey, delta_bytes: &[u8]) {
     let mut sites = state::SITES.write();
 
     if let Some(site) = sites.get_mut(&prefix) {
-        for (&page_id, page) in &delta.page_updates {
-            site.state.pages.insert(page_id, page.clone());
-            if page_id >= site.state.next_page_id {
-                site.state.next_page_id = page_id + 1;
+        match apply_delta_to_site_state(&mut site.state, &delta) {
+            Ok(name) => site.name = name,
+            Err(e) => {
+                log(&format!(
+                    "Delta: rejected delta for {prefix} (failed verification): {e}"
+                ));
+                return;
             }
-        }
-        for deletion in &delta.page_deletions {
-            site.state.pages.remove(&deletion.page_id);
-        }
-        if let Some(config) = &delta.config {
-            site.state.config = config.clone();
-            site.name = config.config.name.clone();
         }
     }
 
@@ -1626,6 +1668,142 @@ mod tests {
             s.upsert_page(*id, p, &owner.verifying_key()).unwrap();
         }
         s
+    }
+
+    /// Review follow-up: `handle_site_delta` used to apply page updates and
+    /// deletions inline, without verifying signatures or recording a
+    /// tombstone. `apply_delta_to_site_state` now delegates to
+    /// `SiteState::apply_delta`, so this must reject a deletion signed by
+    /// someone other than the site's owner and leave the page untouched.
+    /// This is the client-side half of the authentication #40 added on the
+    /// contract side: without it, a delta arriving over the network could
+    /// delete a page with no valid proof the owner authorized it.
+    #[test]
+    fn apply_delta_to_site_state_rejects_a_deletion_not_signed_by_the_owner() {
+        let owner = key(1);
+        let attacker = key(2);
+        let mut site_state = signed_state(&owner, &[(1, "home", 1_000)]);
+
+        let forged_deletion = delta_core::SignedPageDeletion::new(1, 2_000, &attacker);
+        let delta = delta_core::SiteStateDelta {
+            config: None,
+            page_updates: BTreeMap::new(),
+            page_deletions: vec![forged_deletion],
+        };
+
+        let result = apply_delta_to_site_state(&mut site_state, &delta);
+        assert!(
+            result.is_err(),
+            "a deletion not signed by the site owner must be rejected"
+        );
+        assert!(
+            site_state.pages.contains_key(&1),
+            "the page must survive an unauthenticated deletion attempt"
+        );
+        assert!(
+            !site_state.deleted_pages.contains_key(&1),
+            "no tombstone should be recorded for a rejected deletion"
+        );
+    }
+
+    /// The matching positive case: a genuinely owner-signed deletion is
+    /// applied AND recorded as a tombstone (the second gap the old inline
+    /// logic had: it removed the page from `pages` but never touched
+    /// `deleted_pages`, so the delete was silently undone by the next GET,
+    /// delegate-backup restore, or legacy-contract sweep).
+    #[test]
+    fn apply_delta_to_site_state_applies_and_records_a_valid_deletion() {
+        let owner = key(1);
+        let mut site_state = signed_state(&owner, &[(1, "home", 1_000)]);
+
+        let deletion = delta_core::SignedPageDeletion::new(1, 2_000, &owner);
+        let delta = delta_core::SiteStateDelta {
+            config: None,
+            page_updates: BTreeMap::new(),
+            page_deletions: vec![deletion],
+        };
+
+        let name = apply_delta_to_site_state(&mut site_state, &delta)
+            .expect("an owner-signed deletion must be accepted");
+        assert_eq!(name, site_state.config.config.name);
+        assert!(
+            !site_state.pages.contains_key(&1),
+            "the page must be removed"
+        );
+        assert!(
+            site_state.deleted_pages.contains_key(&1),
+            "the tombstone must be recorded so a later merge/reconcile doesn't resurrect the page"
+        );
+    }
+
+    /// Review follow-up: the two tests above exercise `apply_delta_to_site_state`
+    /// directly, but nothing pinned that `handle_site_delta` actually CALLS
+    /// it. Reverting `handle_site_delta`'s body to the pre-fix inline logic
+    /// (no verification, no tombstone) while leaving the helper untouched
+    /// leaves those two tests green and the whole workspace green — this
+    /// source-scrape pin is what catches that. The length bound guards
+    /// against the `include_str!` self-match trap (this very test's own
+    /// source contains the literal `"fn handle_site_delta("` string it
+    /// splits on, so an unbounded slice would silently include the rest of
+    /// the file instead of failing loudly).
+    #[test]
+    fn handle_site_delta_delegates_to_the_verified_applier() {
+        let src = include_str!("operations.rs");
+        let after = src
+            .split("fn handle_site_delta(")
+            .nth(1)
+            .expect("handle_site_delta must exist");
+        let body = after
+            .split("\n/// Subscribe to a site contract")
+            .next()
+            .expect("the anchor after handle_site_delta must exist");
+        assert!(body.len() < 2000, "slice unbounded ({} bytes)", body.len());
+        assert!(
+            body.contains("apply_delta_to_site_state("),
+            "handle_site_delta must delegate to apply_delta_to_site_state"
+        );
+        assert!(
+            !body.contains("state.pages.insert"),
+            "handle_site_delta must not re-inline unverified page insertion"
+        );
+        assert!(
+            !body.contains("state.pages.remove"),
+            "handle_site_delta must not re-inline unverified page removal"
+        );
+    }
+
+    /// Review follow-up (both lenses independently found this): a delta
+    /// with an EARLIER valid field and a LATER field forged by a different
+    /// key (only constructible by a malicious same-owner key, e.g. a
+    /// compromised secondary signing key) must not leave the valid field's
+    /// mutation applied. The single-field rejection tests above can't catch
+    /// this (nothing else to partially apply at cardinality 1); this uses a
+    /// mixed delta specifically.
+    #[test]
+    fn apply_delta_to_site_state_rejects_a_mixed_valid_and_forged_delta_atomically() {
+        let owner = key(1);
+        let attacker = key(2);
+        let mut site_state = signed_state(&owner, &[(1, "home", 1_000)]);
+        let before = site_state.clone();
+
+        // A validly-signed update to page 1, plus a deletion forged by a
+        // different key.
+        let valid_page = delta_core::Page::new(1, "t".into(), "updated".into(), 2_000, &owner);
+        let mut page_updates = BTreeMap::new();
+        page_updates.insert(1, valid_page);
+        let forged_deletion = delta_core::SignedPageDeletion::new(2, 3_000, &attacker);
+        let delta = delta_core::SiteStateDelta {
+            config: None,
+            page_updates,
+            page_deletions: vec![forged_deletion],
+        };
+
+        let result = apply_delta_to_site_state(&mut site_state, &delta);
+        assert!(result.is_err(), "the forged deletion must cause rejection");
+        assert_eq!(
+            site_state, before,
+            "a rejected delta must not leave the valid field's mutation applied"
+        );
     }
 
     #[test]
