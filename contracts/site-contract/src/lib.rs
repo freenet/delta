@@ -114,20 +114,76 @@ impl ContractInterface for Contract {
 
         let delta = site_state.compute_delta(&peer_summary);
 
-        let mut buf = Vec::new();
-        match delta {
-            Some(d) => into_writer(&d, &mut buf),
-            None => into_writer(
-                &SiteStateDelta {
-                    config: None,
-                    page_updates: std::collections::BTreeMap::new(),
-                    page_deletions: Vec::new(),
-                },
-                &mut buf,
-            ),
-        }
-        .map_err(|e| ContractError::Deser(e.to_string()))?;
+        // `compute_delta` already returns `None` when nothing has changed
+        // relative to the peer's summary. Core's convergence check tests
+        // whether the returned delta bytes are EMPTY, so that `None` must
+        // become a zero-byte `StateDelta`, not a CBOR-encoded placeholder
+        // struct (which is never empty: ciborium writes field names as map
+        // keys, so even an empty `SiteStateDelta` serializes to ~39 bytes).
+        // Do NOT re-introduce a serialized placeholder here.
+        let buf = match delta {
+            Some(d) => {
+                let mut buf = Vec::new();
+                into_writer(&d, &mut buf).map_err(|e| ContractError::Deser(e.to_string()))?;
+                buf
+            }
+            None => Vec::new(),
+        };
 
         Ok(StateDelta::from(buf))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use delta_core::{Page, SiteConfig};
+    use ed25519_dalek::SigningKey;
+
+    fn test_owner() -> SigningKey {
+        SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    /// #5072: `get_state_delta` against a peer that already has the exact
+    /// same state must return an EMPTY delta. Core's convergence check
+    /// (`get_state_delta(our_state, their_summary).is_empty()`) is the only
+    /// signal it uses to decide two peers have converged; a non-empty
+    /// "nothing changed" delta means that signal can never fire.
+    #[test]
+    fn self_delta_against_own_summary_is_empty() {
+        let owner = test_owner();
+
+        let mut site_state = SiteState::new(
+            SiteConfig {
+                name: "My Site".into(),
+                ..Default::default()
+            },
+            &owner,
+        );
+        let page = Page::new(1, "Home".into(), "# Welcome".into(), 1000, &owner);
+        site_state
+            .upsert_page(1, page, &owner.verifying_key())
+            .unwrap();
+
+        let mut state_buf = Vec::new();
+        into_writer(&site_state, &mut state_buf).unwrap();
+
+        let summary =
+            Contract::summarize_state(Parameters::from(Vec::new()), State::from(state_buf.clone()))
+                .expect("summarize_state should succeed");
+
+        let delta = Contract::get_state_delta(
+            Parameters::from(Vec::new()),
+            State::from(state_buf),
+            StateSummary::from(summary.as_ref().to_vec()),
+        )
+        .expect("get_state_delta should succeed");
+
+        assert!(
+            delta.as_ref().is_empty(),
+            "delta against own summary should be empty (0 bytes), got {} bytes: {:?}",
+            delta.as_ref().len(),
+            delta.as_ref()
+        );
     }
 }
