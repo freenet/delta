@@ -441,6 +441,21 @@ impl SiteState {
         delta: &SiteStateDelta,
         params: &SiteParameters,
     ) -> Result<(), String> {
+        // A delta has no owner field of its own to establish or verify
+        // against, unlike a full state (which `merge` can adopt wholesale
+        // once it has cleared `other.verify(params)` against a real owner).
+        // Applying a delta to an uninitialized (placeholder-owner) state
+        // would verify every signature against `placeholder_owner()`, which
+        // is not self-protecting: `is_uninitialized`'s rustdoc already
+        // documents that ed25519-dalek's non-strict `verify` doesn't reject
+        // the placeholder's weak (order-4) key, so a signature under it is
+        // forgeable without any private key. Refuse outright rather than
+        // silently "verifying" against a key nobody controls; first capture
+        // for an unclaimed address happens via `merge`, not `apply_delta`.
+        if self.is_uninitialized() {
+            return Err("cannot apply a delta to an uninitialized site".to_string());
+        }
+
         let owner = self.owner;
 
         if let Some(new_config) = &delta.config {
@@ -472,15 +487,13 @@ impl SiteState {
             }
         }
 
-        // Deletions are applied AFTER updates, deliberately: if a single
-        // delta somehow carries both a page_update and a page_deletion for
-        // the SAME id (only possible today from an already-corrupted state,
-        // e.g. one still recovering from the pre-#18 oscillation bug, since
-        // a well-formed state never has an id in both `pages` and
-        // `deleted_pages` at once), the update would land first and the
-        // deletion removes it again right after. This ordering makes
-        // deletion win deterministically rather than leaving the outcome
-        // dependent on `BTreeMap`/`Vec` iteration order.
+        // Deletions are applied after updates, so if a single delta ever
+        // carries both a page_update and a page_deletion for the same id,
+        // the deletion wins. This is a real tie-break rule, not merely
+        // defense against an already-corrupted input: `verify()` does not
+        // forbid a state having an id in both `pages` and `deleted_pages`
+        // at once (e.g. `upsert_page` called directly, bypassing this
+        // function's guard above, doesn't check `deleted_pages` either).
         for deletion in &delta.page_deletions {
             self.delete_page(deletion, &owner)?;
         }
@@ -961,6 +974,63 @@ mod tests {
     /// staleness backstop as "converged despite differing summary bytes",
     /// permanently suppressing the one heal that would have delivered the
     /// tombstone to a peer that missed the live delete broadcast.
+    /// Review follow-up (F1): `apply_delta` verifies signatures against
+    /// `self.owner`, but a `SiteState::default()` (uninitialized) state has
+    /// `owner == placeholder_owner()` — a `[0u8; 32]` key that decompresses
+    /// to a weak (order-4) point ed25519-dalek's non-strict `verify` does
+    /// not reject. A zero signature verifies for a meaningful fraction of
+    /// messages against it, so a delta could be forged against any site
+    /// whose local state happens to still be the placeholder (e.g. a
+    /// `KnownSite` installed with `state: SiteState::default()` before its
+    /// real content ever arrived). This grinds `deleted_at` for a
+    /// zero-signature `SignedPageDeletion` that verifies under the
+    /// placeholder key (mirroring how the forgery was found in review),
+    /// then confirms `apply_delta` refuses it outright rather than
+    /// "verifying" a signature nobody's private key produced.
+    #[test]
+    fn apply_delta_rejects_a_forged_delta_against_an_uninitialized_state() {
+        let mut site = SiteState::default();
+        assert!(site.is_uninitialized());
+        let params = SiteParameters {
+            prefix: pubkey_to_prefix(&placeholder_owner()),
+        };
+
+        let zero_sig = Signature::from_bytes(&[0u8; 64]);
+        let forged_deletion = (0u64..10_000)
+            .find_map(|deleted_at| {
+                let bytes = deletion_signing_bytes(1, deleted_at);
+                placeholder_owner()
+                    .verify(&bytes, &zero_sig)
+                    .ok()
+                    .map(|()| SignedPageDeletion {
+                        page_id: 1,
+                        deleted_at,
+                        signature: zero_sig,
+                    })
+            })
+            .expect(
+                "a zero-signature deleted_at that verifies under the placeholder \
+                 key should exist well within 10_000 tries (review found one in 4)",
+            );
+
+        let delta = SiteStateDelta {
+            config: None,
+            page_updates: BTreeMap::new(),
+            page_deletions: vec![forged_deletion],
+        };
+
+        let result = site.apply_delta(&delta, &params);
+        assert!(
+            result.is_err(),
+            "a delta must never apply to an uninitialized (placeholder-owner) state"
+        );
+        assert!(site.pages.is_empty());
+        assert!(
+            site.deleted_pages.is_empty(),
+            "the forged tombstone must not be recorded"
+        );
+    }
+
     #[test]
     fn deletion_pending_relative_to_peer_summary_is_not_an_empty_delta() {
         let owner = gen_key();
