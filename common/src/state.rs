@@ -448,6 +448,18 @@ impl SiteState {
         }
 
         for (&page_id, page) in &delta.page_updates {
+            // #18: don't resurrect a page we've already tombstoned. Without
+            // this, a delta that arrives before its sender learns about our
+            // deletion (this round's summary predates it) re-creates the
+            // page here, and if the sender is ALSO stale relative to us in
+            // the same round, the next round flips the roles and oscillates
+            // forever instead of converging. `merge` already has the
+            // equivalent check for full-state application; this is the
+            // matching guard for delta application. See
+            // `deletion_converges_under_simultaneous_bidirectional_exchange`.
+            if self.deleted_pages.contains_key(&page_id) {
+                continue;
+            }
             let dominated = self
                 .pages
                 .get(&page_id)
@@ -1052,8 +1064,16 @@ mod tests {
     }
 
     /// A delta can legitimately carry both a config bump and a pending
-    /// deletion in the same message; the `None` gate must require all three
-    /// fields empty, not just page_updates.
+    /// deletion in the same message. NOTE: this does NOT pin the `None`
+    /// gate's three-field requirement — with `config` already `Some`, the
+    /// `config.is_none() && ...` check short-circuits to `false` regardless
+    /// of `page_deletions`, so this test would pass identically even if the
+    /// `page_deletions.is_empty()` term were removed from the gate entirely.
+    /// The gate's `page_deletions` term is actually pinned by
+    /// `deletion_pending_relative_to_peer_summary_is_not_an_empty_delta`
+    /// (config `None`, page_updates empty, page_deletions non-empty still
+    /// forces `Some`). This test is a combinatorial sanity check that the
+    /// two fields coexist correctly, not a gate-necessity proof.
     #[test]
     fn delta_carries_both_a_config_change_and_a_pending_deletion() {
         let owner = gen_key();
@@ -1083,6 +1103,82 @@ mod tests {
         assert!(delta.config.is_some(), "delta should carry the config bump");
         assert_eq!(delta.page_deletions.len(), 1);
         assert!(delta.page_updates.is_empty());
+    }
+
+    /// Review follow-up (#18 interaction): `compute_delta` now emits
+    /// tombstones, but `apply_delta`'s page-update loop upserts without
+    /// consulting `deleted_pages` (unlike `merge`, which skips a tombstoned
+    /// id). Under a SIMULTANEOUS bidirectional exchange, that combination
+    /// oscillates instead of converging: whichever peer currently holds the
+    /// page sends it as a page_update (its delta is computed against the
+    /// OTHER peer's summary from BEFORE this round, so it doesn't yet know
+    /// about a same-round deletion), while the peer holding the tombstone
+    /// sends the deletion; each side's incoming page_update resurrects the
+    /// page locally, feeding the same shape into the next round.
+    ///
+    /// This is specifically a CONCURRENT-exchange bug: an alternating
+    /// (ping-pong) exchange converges fine, because each side's compute_delta
+    /// always runs against the OTHER's most recent summary. The test
+    /// therefore snapshots BOTH summaries before applying EITHER delta each
+    /// round, matching how a real heartbeat round works (every peer's
+    /// summary at the start of the round is what every other peer computes
+    /// against) — computing serially (compute A, apply A, compute B against
+    /// A's now-updated state, apply B) would silently degrade this into the
+    /// alternating case and pass regardless of the bug.
+    #[test]
+    fn deletion_converges_under_simultaneous_bidirectional_exchange() {
+        let owner = gen_key();
+        let params = make_params(&owner);
+
+        let mut a = SiteState::new(SiteConfig::default(), &owner);
+        let page = Page::new(1, "Home".into(), "# Hello".into(), 1000, &owner);
+        a.upsert_page(1, page.clone(), &owner.verifying_key())
+            .unwrap();
+
+        // b is a-before-the-deletion: it still has page 1 and doesn't know
+        // a deleted it.
+        let mut b = SiteState::new(SiteConfig::default(), &owner);
+        b.upsert_page(1, page, &owner.verifying_key()).unwrap();
+
+        let deletion = SignedPageDeletion::new(1, 2000, &owner);
+        a.delete_page(&deletion, &owner.verifying_key()).unwrap();
+
+        const MAX_ROUNDS: usize = 10;
+        for round in 0..MAX_ROUNDS {
+            // Snapshot BOTH summaries before applying either delta — see the
+            // doc comment above for why this matters.
+            let a_summary = a.summarize();
+            let b_summary = b.summarize();
+
+            let delta_to_b = a.compute_delta(&b_summary);
+            let delta_to_a = b.compute_delta(&a_summary);
+
+            if delta_to_b.is_none() && delta_to_a.is_none() {
+                assert!(a.pages.is_empty(), "a should have converged with no page 1");
+                assert!(b.pages.is_empty(), "b should have converged with no page 1");
+                assert!(
+                    b.deleted_pages.contains_key(&1),
+                    "the deletion must win, not the page"
+                );
+                return;
+            }
+
+            if let Some(d) = delta_to_b {
+                b.apply_delta(&d, &params).unwrap();
+            }
+            if let Some(d) = delta_to_a {
+                a.apply_delta(&d, &params).unwrap();
+            }
+
+            if round == MAX_ROUNDS - 1 {
+                panic!(
+                    "no fixpoint after {MAX_ROUNDS} rounds of simultaneous exchange; \
+                     a.pages={:?} b.pages={:?}",
+                    a.pages.keys().collect::<Vec<_>>(),
+                    b.pages.keys().collect::<Vec<_>>()
+                );
+            }
+        }
     }
 
     #[test]

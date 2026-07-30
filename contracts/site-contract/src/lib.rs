@@ -262,4 +262,95 @@ mod tests {
             "stale peer should have adopted the tombstone"
         );
     }
+
+    /// Review follow-up: `self_delta_against_own_summary_is_empty` proves
+    /// `get_state_delta` can produce empty bytes; this pins the OTHER half
+    /// of the contract this PR now relies on more heavily: `update_state`'s
+    /// `UpdateData::Delta(d)` arm must treat those empty bytes as a no-op
+    /// (`if d.as_ref().is_empty() { continue; }`) rather than attempting a
+    /// CBOR decode. Nothing pinned this before. Deleting the guard leaves
+    /// the whole workspace green today, yet every empty delta this PR now
+    /// routinely emits would fail `update_state` with a deser error instead
+    /// of no-opping.
+    #[test]
+    fn empty_delta_through_update_state_is_a_no_op() {
+        let owner = test_owner();
+        let params = SiteParameters::from_owner(&owner.verifying_key());
+        let mut params_buf = Vec::new();
+        into_writer(&params, &mut params_buf).unwrap();
+
+        let mut site_state = SiteState::new(SiteConfig::default(), &owner);
+        let page = Page::new(1, "Home".into(), "# Welcome".into(), 1000, &owner);
+        site_state
+            .upsert_page(1, page, &owner.verifying_key())
+            .unwrap();
+        let mut state_buf = Vec::new();
+        into_writer(&site_state, &mut state_buf).unwrap();
+
+        let result = Contract::update_state(
+            Parameters::from(params_buf),
+            State::from(state_buf.clone()),
+            vec![UpdateData::Delta(StateDelta::from(Vec::new()))],
+        )
+        .expect("an empty delta must be a no-op, not a decode error");
+
+        let resulting_state = result.unwrap_valid();
+        let resulting = from_reader::<SiteState, &[u8]>(resulting_state.as_ref())
+            .expect("resulting state should deserialize");
+        let original = from_reader::<SiteState, &[u8]>(state_buf.as_slice())
+            .expect("original state should deserialize");
+
+        assert_eq!(
+            resulting, original,
+            "an empty delta must leave the state unchanged"
+        );
+    }
+
+    /// Review follow-up: the ORIGINAL `self_delta_against_own_summary_is_empty`
+    /// fixture never deletes a page, so it can't exercise the
+    /// `page_deletions` branch this PR added to `compute_delta` at all — it
+    /// would stay green even if that branch unconditionally included every
+    /// local tombstone regardless of the peer's summary. This fixture
+    /// deletes a page first, so the state genuinely has a non-empty
+    /// `deleted_pages`, then diffs against its OWN (necessarily
+    /// deletion-unaware, since `summarize()` never reflects tombstones)
+    /// current summary. Dropping the `summary.pages.contains_key(id)` filter
+    /// in `compute_delta` would make a converged site re-emit its whole
+    /// tombstone set on every heartbeat forever; this test would catch that.
+    #[test]
+    fn self_delta_is_empty_for_a_state_that_has_deleted_pages() {
+        let owner = test_owner();
+
+        let mut site_state = SiteState::new(SiteConfig::default(), &owner);
+        let page = Page::new(1, "Home".into(), "# Welcome".into(), 1000, &owner);
+        site_state
+            .upsert_page(1, page, &owner.verifying_key())
+            .unwrap();
+        let deletion = SignedPageDeletion::new(1, 2000, &owner);
+        site_state
+            .delete_page(&deletion, &owner.verifying_key())
+            .unwrap();
+
+        let mut state_buf = Vec::new();
+        into_writer(&site_state, &mut state_buf).unwrap();
+
+        let summary =
+            Contract::summarize_state(Parameters::from(Vec::new()), State::from(state_buf.clone()))
+                .expect("summarize_state should succeed");
+
+        let delta = Contract::get_state_delta(
+            Parameters::from(Vec::new()),
+            State::from(state_buf),
+            StateSummary::from(summary.as_ref().to_vec()),
+        )
+        .expect("get_state_delta should succeed");
+
+        assert!(
+            delta.as_ref().is_empty(),
+            "a converged site with a tombstone must not re-emit it against \
+             its own current summary, got {} bytes: {:?}",
+            delta.as_ref().len(),
+            delta.as_ref()
+        );
+    }
 }
