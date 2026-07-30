@@ -502,13 +502,29 @@ fn handle_site_state(key: ContractKey, state_bytes: &[u8]) -> bool {
 ///
 /// Returns the resulting site name on success (for the caller to sync onto
 /// `KnownSite::name`), or the verification error on rejection.
+///
+/// Applies to a CLONE and only swaps it in on success. `SiteState::apply_delta`
+/// mutates its fields incrementally (config, then page_updates, then
+/// page_deletions) and returns early via `?` on the first failure, so an
+/// in-place `site_state.apply_delta(...)` would commit whichever fields
+/// verified before the one that didn't — only reachable from a delta whose
+/// earlier fields are validly signed by the real owner but a later field is
+/// forged by a different key, but a "rejected" delta should never leave a
+/// partial mutation behind. The clone keeps this call site atomic; deliberately
+/// NOT changed in `SiteState::apply_delta` itself, since the contract's
+/// `update_state` already discards its `site_state` on `Err` (see
+/// `ContractInterface::update_state`) and the clone belongs where the
+/// in-place, reused `SiteState` actually lives.
 fn apply_delta_to_site_state(
     site_state: &mut SiteState,
     delta: &delta_core::SiteStateDelta,
 ) -> Result<String, String> {
-    let params = delta_core::SiteParameters::from_owner(&site_state.owner);
-    site_state.apply_delta(delta, &params)?;
-    Ok(site_state.config.config.name.clone())
+    let mut next = site_state.clone();
+    let params = delta_core::SiteParameters::from_owner(&next.owner);
+    next.apply_delta(delta, &params)?;
+    let name = next.config.config.name.clone();
+    *site_state = next;
+    Ok(name)
 }
 
 /// Process a delta update for a site.
@@ -1717,6 +1733,76 @@ mod tests {
         assert!(
             site_state.deleted_pages.contains_key(&1),
             "the tombstone must be recorded so a later merge/reconcile doesn't resurrect the page"
+        );
+    }
+
+    /// Review follow-up: the two tests above exercise `apply_delta_to_site_state`
+    /// directly, but nothing pinned that `handle_site_delta` actually CALLS
+    /// it. Reverting `handle_site_delta`'s body to the pre-fix inline logic
+    /// (no verification, no tombstone) while leaving the helper untouched
+    /// leaves those two tests green and the whole workspace green — this
+    /// source-scrape pin is what catches that. The length bound guards
+    /// against the `include_str!` self-match trap (this very test's own
+    /// source contains the literal `"fn handle_site_delta("` string it
+    /// splits on, so an unbounded slice would silently include the rest of
+    /// the file instead of failing loudly).
+    #[test]
+    fn handle_site_delta_delegates_to_the_verified_applier() {
+        let src = include_str!("operations.rs");
+        let after = src
+            .split("fn handle_site_delta(")
+            .nth(1)
+            .expect("handle_site_delta must exist");
+        let body = after
+            .split("\n/// Subscribe to a site contract")
+            .next()
+            .expect("the anchor after handle_site_delta must exist");
+        assert!(body.len() < 2000, "slice unbounded ({} bytes)", body.len());
+        assert!(
+            body.contains("apply_delta_to_site_state("),
+            "handle_site_delta must delegate to apply_delta_to_site_state"
+        );
+        assert!(
+            !body.contains("state.pages.insert"),
+            "handle_site_delta must not re-inline unverified page insertion"
+        );
+        assert!(
+            !body.contains("state.pages.remove"),
+            "handle_site_delta must not re-inline unverified page removal"
+        );
+    }
+
+    /// Review follow-up (both lenses independently found this): a delta
+    /// with an EARLIER valid field and a LATER field forged by a different
+    /// key (only constructible by a malicious same-owner key, e.g. a
+    /// compromised secondary signing key) must not leave the valid field's
+    /// mutation applied. The single-field rejection tests above can't catch
+    /// this (nothing else to partially apply at cardinality 1); this uses a
+    /// mixed delta specifically.
+    #[test]
+    fn apply_delta_to_site_state_rejects_a_mixed_valid_and_forged_delta_atomically() {
+        let owner = key(1);
+        let attacker = key(2);
+        let mut site_state = signed_state(&owner, &[(1, "home", 1_000)]);
+        let before = site_state.clone();
+
+        // A validly-signed update to page 1, plus a deletion forged by a
+        // different key.
+        let valid_page = delta_core::Page::new(1, "t".into(), "updated".into(), 2_000, &owner);
+        let mut page_updates = BTreeMap::new();
+        page_updates.insert(1, valid_page);
+        let forged_deletion = delta_core::SignedPageDeletion::new(2, 3_000, &attacker);
+        let delta = delta_core::SiteStateDelta {
+            config: None,
+            page_updates,
+            page_deletions: vec![forged_deletion],
+        };
+
+        let result = apply_delta_to_site_state(&mut site_state, &delta);
+        assert!(result.is_err(), "the forged deletion must cause rejection");
+        assert_eq!(
+            site_state, before,
+            "a rejected delta must not leave the valid field's mutation applied"
         );
     }
 

@@ -487,13 +487,16 @@ impl SiteState {
             }
         }
 
-        // Deletions are applied after updates, so if a single delta ever
-        // carries both a page_update and a page_deletion for the same id,
-        // the deletion wins. This is a real tie-break rule, not merely
-        // defense against an already-corrupted input: `verify()` does not
-        // forbid a state having an id in both `pages` and `deleted_pages`
-        // at once (e.g. `upsert_page` called directly, bypassing this
-        // function's guard above, doesn't check `deleted_pages` either).
+        // Deletions are applied after updates. The #18 guard above is what
+        // actually guarantees deletion wins as an observable property
+        // across an exchange (see
+        // `deletion_converges_under_simultaneous_bidirectional_exchange`):
+        // once a tombstone exists and gets communicated, every later update
+        // for that id is rejected on arrival. This ordering only covers a
+        // narrower, single-call case the guard above can't see yet: if ONE
+        // delta carries both a page_update and a page_deletion for the same
+        // id, applying updates first makes that mixed delta resolve to
+        // deletion-wins too, instead of depending on iteration order.
         for deletion in &delta.page_deletions {
             self.delete_page(deletion, &owner)?;
         }
@@ -1100,6 +1103,83 @@ mod tests {
         assert!(site.compute_delta(&converged_summary).is_none());
     }
 
+    /// Review follow-up: the #18 guard in `apply_delta` (`if
+    /// self.deleted_pages.contains_key(&page_id) { continue; }`) checks the
+    /// SPECIFIC id being applied, not merely "do I have any tombstone at
+    /// all". Neither convergence test can distinguish those two readings,
+    /// since neither delivers a live page alongside an unrelated tombstone.
+    /// A peer holding a tombstone for page 1 must still accept an unrelated
+    /// update to page 2.
+    #[test]
+    fn apply_delta_delivers_unrelated_pages_when_a_tombstone_exists() {
+        let owner = gen_key();
+        let params = make_params(&owner);
+        let mut peer = SiteState::new(SiteConfig::default(), &owner);
+
+        let page1 = Page::new(1, "One".into(), "# One".into(), 1000, &owner);
+        let page2 = Page::new(2, "Two".into(), "# Two".into(), 1000, &owner);
+        peer.upsert_page(1, page1, &owner.verifying_key()).unwrap();
+        peer.upsert_page(2, page2, &owner.verifying_key()).unwrap();
+
+        let deletion = SignedPageDeletion::new(1, 2000, &owner);
+        peer.delete_page(&deletion, &owner.verifying_key()).unwrap();
+
+        // A delta with a newer page 2, no mention of page 1 at all.
+        let page2_v2 = Page::new(2, "Two".into(), "# Two v2".into(), 2000, &owner);
+        let mut page_updates = BTreeMap::new();
+        page_updates.insert(2, page2_v2);
+        let delta = SiteStateDelta {
+            config: None,
+            page_updates,
+            page_deletions: Vec::new(),
+        };
+
+        peer.apply_delta(&delta, &params).unwrap();
+
+        assert_eq!(
+            peer.pages[&2].content, "# Two v2",
+            "an unrelated tombstone must not block an update to a different page"
+        );
+        assert!(!peer.pages.contains_key(&1), "page 1 must stay deleted");
+    }
+
+    /// Review follow-up: the `summary.pages.contains_key(id)` filter in
+    /// `compute_delta` checks the SPECIFIC id, not merely "does the peer's
+    /// summary have any pages at all". Deletes two pages, but the peer's
+    /// summary only still lists one of them (it already learned about the
+    /// other's deletion, or never held it) — only that one tombstone should
+    /// be forwarded, not every locally-known deletion.
+    #[test]
+    fn compute_delta_emits_only_tombstones_the_peer_still_holds() {
+        let owner = gen_key();
+        let mut site = SiteState::new(SiteConfig::default(), &owner);
+
+        let page1 = Page::new(1, "One".into(), "# One".into(), 1000, &owner);
+        let page2 = Page::new(2, "Two".into(), "# Two".into(), 1000, &owner);
+        site.upsert_page(1, page1, &owner.verifying_key()).unwrap();
+        site.upsert_page(2, page2, &owner.verifying_key()).unwrap();
+
+        let deletion1 = SignedPageDeletion::new(1, 2000, &owner);
+        site.delete_page(&deletion1, &owner.verifying_key())
+            .unwrap();
+        let deletion2 = SignedPageDeletion::new(2, 2000, &owner);
+        site.delete_page(&deletion2, &owner.verifying_key())
+            .unwrap();
+
+        let mut peer_summary = SiteStateSummary::default();
+        peer_summary.pages.insert(1, (blake3::hash(b"# One"), 1000));
+
+        let delta = site
+            .compute_delta(&peer_summary)
+            .expect("should have a delta for page 1's tombstone");
+        let ids: Vec<PageId> = delta.page_deletions.iter().map(|d| d.page_id).collect();
+        assert_eq!(
+            ids,
+            vec![1],
+            "only the tombstone the peer's summary still reflects should be sent"
+        );
+    }
+
     /// Review follow-up on delta#43: `compute_delta` populating
     /// `page_deletions` makes `apply_delta`'s deletion loop reachable via
     /// real network sync for the first time (previously `compute_delta`
@@ -1115,33 +1195,63 @@ mod tests {
     fn apply_delta_conflicting_tombstone_is_order_dependent_but_page_stays_deleted() {
         let owner = gen_key();
         let params = make_params(&owner);
-
-        let mut peer = SiteState::new(SiteConfig::default(), &owner);
         let page = Page::new(1, "Home".into(), "# Hello".into(), 1000, &owner);
-        peer.upsert_page(1, page, &owner.verifying_key()).unwrap();
-        // Peer already tombstoned page 1 locally.
-        let local_deletion = SignedPageDeletion::new(1, 1000, &owner);
-        peer.delete_page(&local_deletion, &owner.verifying_key())
-            .unwrap();
 
-        // A delta arrives carrying a DIFFERENT (later) tombstone for the
-        // same page, e.g. from a peer that deleted it independently.
-        let incoming_deletion = SignedPageDeletion::new(1, 2000, &owner);
-        let delta = SiteStateDelta {
+        // Order A: local tombstone recorded with the SMALLER value (1000)
+        // first, incoming delta carries the LARGER one (2000).
+        let mut peer_a = SiteState::new(SiteConfig::default(), &owner);
+        peer_a
+            .upsert_page(1, page.clone(), &owner.verifying_key())
+            .unwrap();
+        peer_a
+            .delete_page(
+                &SignedPageDeletion::new(1, 1000, &owner),
+                &owner.verifying_key(),
+            )
+            .unwrap();
+        let delta_a = SiteStateDelta {
             config: None,
             page_updates: BTreeMap::new(),
-            page_deletions: vec![incoming_deletion],
+            page_deletions: vec![SignedPageDeletion::new(1, 2000, &owner)],
         };
-        peer.apply_delta(&delta, &params).unwrap();
+        peer_a.apply_delta(&delta_a, &params).unwrap();
 
-        assert!(
-            peer.pages.is_empty(),
-            "page must stay deleted regardless of which tombstone wins"
+        // Order B: the SAME two values, but paired the OTHER way around
+        // (local gets the LARGER value first, incoming carries the
+        // SMALLER one). This is what actually proves order-dependence
+        // (last-applied-wins) rather than a max-wins implementation that
+        // would happen to agree with order A's result alone.
+        let mut peer_b = SiteState::new(SiteConfig::default(), &owner);
+        peer_b.upsert_page(1, page, &owner.verifying_key()).unwrap();
+        peer_b
+            .delete_page(
+                &SignedPageDeletion::new(1, 2000, &owner),
+                &owner.verifying_key(),
+            )
+            .unwrap();
+        let delta_b = SiteStateDelta {
+            config: None,
+            page_updates: BTreeMap::new(),
+            page_deletions: vec![SignedPageDeletion::new(1, 1000, &owner)],
+        };
+        peer_b.apply_delta(&delta_b, &params).unwrap();
+
+        // Page stays deleted in BOTH orders (the harmless part).
+        assert!(peer_a.pages.is_empty());
+        assert!(peer_b.pages.is_empty());
+
+        assert_eq!(
+            peer_a.deleted_pages[&1].deleted_at, 2000,
+            "apply_delta overwrites with the incoming tombstone"
         );
         assert_eq!(
-            peer.deleted_pages[&1].deleted_at, 2000,
-            "delete_page overwrites with the incoming tombstone (last-write-wins); \
-             documenting the current behavior, not asserting it as ideal"
+            peer_b.deleted_pages[&1].deleted_at, 1000,
+            "apply_delta overwrites with the incoming tombstone even when it is \
+             SMALLER, ruling out max-wins as an alternative explanation"
+        );
+        assert_ne!(
+            peer_a.deleted_pages[&1].deleted_at, peer_b.deleted_pages[&1].deleted_at,
+            "conflicting-tombstone deleted_at is order-dependent (documented, harmless)"
         );
     }
 
