@@ -131,6 +131,7 @@ cd ui && dx build --release
 cd ..
 cp ui/assets/styles.css target/dx/delta-ui/release/web/public/
 cp ui/assets/main.css target/dx/delta-ui/release/web/public/
+mkdir -p target/webapp
 cd target/dx/delta-ui/release/web/public
 tar -cJf ../../../../../../target/webapp/webapp.tar.xz *
 cd ../../../../../..
