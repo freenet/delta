@@ -66,10 +66,23 @@ EOF
 
 echo ""
 echo "Added $VERSION to $TOML"
+
+# Stage the file we just wrote — see the matching comment in add-migration.sh.
+# A recorded-but-uncommitted contract entry is the same silent failure: sites
+# created under the previous contract key cannot find their state.
+if git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    if git -C "$REPO_ROOT" add "$TOML"; then
+        echo "Staged $TOML (staged, NOT committed)."
+    else
+        echo "WARNING: could not stage $TOML — stage and commit it by hand." >&2
+    fi
+else
+    echo "Not a git repository; skipping staging of $TOML." >&2
+fi
+
 echo ""
 echo "Next steps:"
 echo "  1. Make your code changes (common/, contracts/, etc)"
 echo "  2. ./scripts/sync-wasm.sh          # rebuild and copy new WASMs"
 echo "  3. cargo test -p delta-ui          # verify build + tests"
-echo "  4. git add legacy_contracts.toml ui/public/contracts/"
-echo "  5. git commit"
+echo "  4. git add ui/public/contracts/ && git commit"
