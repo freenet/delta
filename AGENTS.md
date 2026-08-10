@@ -206,11 +206,11 @@ rebuild caused by touching `common/`, even if the contract's own
 source is unchanged — must first record the currently-committed
 contract WASM hash via `./scripts/add-contract-migration.sh`.
 `scripts/check-migration.sh` enforces this: it walks the git history
-of `site_contract.wasm` for the most recent committed state whose
-bytes differ from today's, and refuses to publish unless that
-predecessor hash appears in `legacy_contracts.toml`. The delegate is
-gated identically against `legacy_delegates.toml`. See
-"The migration gate" below for where it runs and what it cannot do.
+of `site_contract.wasm` and refuses to publish unless EVERY committed
+state other than the one shipping now appears in
+`legacy_contracts.toml`. The delegate is gated identically against
+`legacy_delegates.toml`. See "The migration gate" below for where it
+runs and what it cannot do.
 
 ### Delegate WASM Migration
 
@@ -287,28 +287,49 @@ from the "Delegate migration safety" job in `.github/workflows/ci.yml`. For
 each of the delegate and the contract it refuses to report success unless:
 
 - the committed WASM is byte-identical to what this toolchain builds from
-  source, and
-- the most recent *differing* committed state of that WASM — the release this
-  one supersedes — has its hash recorded in the matching `legacy_*.toml`.
+  source;
+- **every** committed generation of that WASM other than the one shipping now
+  has its hash recorded in the matching `legacy_*.toml`; and
+- conversely, every hash the table records is visible in that WASM's git
+  history.
 
-It also refuses when it cannot answer the question: a shallow clone, or a
-non-git checkout, is an error rather than a pass. This is why the CI job sets
-`fetch-depth: 0`.
+It checks every generation rather than only the immediate predecessor because
+single-generation checking is sound only if every earlier generation was
+itself checked when it shipped — which assumes a gate that always worked and
+a branch protection rule that was always on. Neither held: three April 2026
+contract generations were unrecorded on `main`, and a predecessor-only gate
+is structurally incapable of noticing them. The converse rule is what catches
+a **renamed or relocated** WASM path, where `git log -- <new path>` reports a
+single commit and `--follow` does not bridge a rename whose content changed
+in the same commit; without it, relocating `ui/public/contracts/` silently
+re-baselines the gate to one generation and passes.
+
+It also refuses whenever it cannot answer the question rather than reading
+silence as safety: a shallow clone, an untracked WASM, an unborn HEAD, an
+orphan branch, a non-git checkout, or an unreadable git object. This is why
+the CI job sets `fetch-depth: 0`.
 
 **Do not add a second copy of this check.** `Makefile.toml` used to carry an
 inline near-duplicate that only compared the committed WASM against a fresh
 build. That inline copy, not the script, was what the publish path actually
 ran, so the gate the docs promised had never once refused a publish
-(delta#45, delta#46). `scripts/tests/check-migration-test.sh` pins the gate's
-ability to refuse, including the two shapes it was previously broken in; it
-runs in CI and in `preflight`, ahead of the gate itself.
+(delta#45, delta#46). `scripts/tests/check-migration-test.sh` runs in CI and
+in `preflight`, ahead of the gate itself, in three layers: source scrapes that
+the Makefile task delegates to the script and that CI invokes it with full
+history (the *wiring*, which is what was actually broken); end-to-end runs of
+the real script against synthetic repos with a stubbed `build-wasm.sh`, so
+deleting a check from `main()` fails the suite; and unit cases for each
+history shape. An earlier version tested only the helper function and passed
+11/11 with the gate deleted from `main()` entirely — if you add a case, make
+sure it fails when the thing it describes is removed.
 
-What the gate does **not** cover: it verifies that the predecessor hash is
-recorded, not that the recorded entry is correct or that the migration
-actually restores data. A wrong `delegate_key` for a right `code_hash` is
-caught separately by the build assertion in `ui/build.rs`; that the sweep
-reaches the data at all is only ever proven by the browser check (step 9 of
-the rustc-bump procedure).
+What the gate does **not** cover: it verifies that a hash is recorded, not
+that the recorded entry is correct or that the migration actually restores
+data. A wrong `delegate_key` for a right `code_hash` is caught separately by
+the build assertion in `ui/build.rs`; that the sweep reaches the data at all
+is only ever proven by the browser check (step 9 of the rustc-bump
+procedure). It also cannot see a state that was published but never
+committed.
 
 ## Publishing
 
