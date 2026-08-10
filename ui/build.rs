@@ -4,7 +4,16 @@ use std::env;
 use std::fs;
 use std::path::Path;
 
+/// `deny_unknown_fields` is load-bearing, not tidiness. `entry` carries
+/// `#[serde(default)]`, so without it a file whose section was renamed (say
+/// `[[entries]]`) deserializes to an EMPTY list and reports no error at all.
+/// With it, the unknown top-level table is a hard deserialization failure that
+/// names the offending key.
+///
+/// `LegacyEntry` deliberately does NOT need this: none of its fields have
+/// defaults, so a missing or misspelled one already fails loudly.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LegacyDelegates {
     #[serde(default)]
     entry: Vec<LegacyEntry>,
@@ -82,37 +91,43 @@ fn generate_legacy_delegates() {
     // that, with `LEGACY_DELEGATES` baked in as an empty list.
     println!("cargo:rerun-if-changed=../legacy_delegates.toml");
 
-    let toml_content = match fs::read_to_string(&toml_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "cargo:warning=legacy_delegates.toml not found ({}), using empty list",
-                e
-            );
-            let out_dir = env::var("OUT_DIR").unwrap();
-            let dest = Path::new(&out_dir).join("legacy_delegates.rs");
-            fs::write(
-                dest,
-                "pub const LEGACY_DELEGATES: &[([u8; 32], [u8; 32])] = &[];\n",
-            )
-            .unwrap();
-            return;
-        }
-    };
+    // An unreadable file used to warn and emit an empty table. `cargo:warning`
+    // is not a gate — it scrolls past in a release build — and the outcome is
+    // identical to every other route to an empty table: the sweep asks nobody
+    // and every returning user is orphaned. Fail instead.
+    let toml_content = fs::read_to_string(&toml_path).unwrap_or_else(|e| {
+        panic!(
+            "legacy_delegates.toml could not be read ({e}). The migration table \
+             would ship EMPTY, the startup sweep would ask no delegate at all, \
+             and every returning user's sites would be unrecoverable."
+        )
+    });
 
     let parsed: LegacyDelegates =
         toml::from_str(&toml_content).expect("Failed to parse legacy_delegates.toml");
 
-    // `entry` is `#[serde(default)]`, so a table that fails to match the
-    // expected shape — a renamed section, a restructured file — deserializes to
-    // an EMPTY list with no error at all. Shipping that is silent, total
-    // migration failure: the sweep asks nobody, and every returning user sees a
-    // permanently empty "Welcome to Delta". Fail the build instead.
+    // This registry is append-only and can never legitimately be empty: Delta
+    // re-keys its delegate on essentially every release, so predecessors always
+    // exist and must always be retained. An empty table is therefore
+    // unconditionally wrong, whatever produced it, and shipping one is silent
+    // total migration failure — the sweep asks nobody and every returning user
+    // gets a permanently empty "Welcome to Delta".
+    //
+    // Assert on emptiness ITSELF. Do NOT weaken this to a substring check such
+    // as `is_empty() && content.contains("[[entry]]")`: that form passes for
+    // the two cases most likely to arise in practice — a renamed section
+    // (`[[entries]]`, where the substring is simply absent) and a truncated or
+    // emptied file — which is to say it permits precisely what it purports to
+    // forbid. Verified: with that form, renaming the section built cleanly and
+    // emitted `LEGACY_DELEGATES = &[]`.
     assert!(
-        !(parsed.entry.is_empty() && toml_content.contains("[[entry]]")),
-        "legacy_delegates.toml contains [[entry]] sections but none deserialized — \
-         the migration table would ship EMPTY and every user's sites would be \
-         unrecoverable. Check the file's structure against `struct LegacyEntry`."
+        !parsed.entry.is_empty(),
+        "legacy_delegates.toml produced ZERO entries. The migration table would \
+         ship EMPTY, the startup sweep would ask no delegate at all, and every \
+         returning user's sites would be unrecoverable. This registry is \
+         append-only and must never be empty — check the file against \
+         `struct LegacyEntry` (a renamed or restructured section deserializes \
+         to nothing)."
     );
 
     let mut code = String::new();
@@ -163,26 +178,28 @@ fn generate_legacy_contracts() {
     let toml_path = Path::new("..").join("legacy_contracts.toml");
     println!("cargo:rerun-if-changed=../legacy_contracts.toml");
 
-    let toml_content = match fs::read_to_string(&toml_path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!(
-                "cargo:warning=legacy_contracts.toml not found ({}), using empty list",
-                e
-            );
-            let out_dir = env::var("OUT_DIR").unwrap();
-            let dest = Path::new(&out_dir).join("legacy_contracts.rs");
-            fs::write(
-                dest,
-                "pub const LEGACY_CONTRACT_HASHES: &[[u8; 32]] = &[];\n",
-            )
-            .unwrap();
-            return;
-        }
-    };
+    // Same reasoning as `generate_legacy_delegates`: `cargo:warning` is not a
+    // gate, and it is trivially lost in `dx build --release` output. An empty
+    // contract table silently disables the multi-hop state-migration fallback.
+    let toml_content = fs::read_to_string(&toml_path).unwrap_or_else(|e| {
+        panic!(
+            "legacy_contracts.toml could not be read ({e}). The contract \
+             migration table would ship EMPTY and older generations of site \
+             state would silently stop being found."
+        )
+    });
 
     let parsed: LegacyContracts =
         toml::from_str(&toml_content).expect("Failed to parse legacy_contracts.toml");
+
+    // This registry is append-only and can never legitimately be empty.
+    assert!(
+        !parsed.entry.is_empty(),
+        "legacy_contracts.toml produced ZERO entries. The contract migration \
+         table would ship EMPTY and the multi-hop state-migration fallback \
+         would silently stop finding older generations. Check the file against \
+         `struct LegacyContractEntry`."
+    );
 
     let mut code = String::new();
     code.push_str(

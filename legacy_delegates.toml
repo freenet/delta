@@ -10,7 +10,7 @@
 #   delegate_key = BLAKE3(code_hash_bytes) — the delegate key (hex, 64 chars)
 #
 # To add a new entry:  ./scripts/add-migration.sh VERSION "DESCRIPTION"
-# To validate entries: cargo test -p delta-core --test migration_test
+# To validate entries: cargo test -p delta-ui the_baked_delegate_registry
 # To sync WASMs:       ./scripts/sync-wasm.sh
 
 [[entry]]

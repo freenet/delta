@@ -193,6 +193,54 @@ mod tests {
         let out = truncate_for_log(s, 20);
         assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
     }
+
+    // ---- freenet/delta#52: two wasm-only call sites whose deletion is silent ----
+    //
+    // Both live in `connect_to_freenet`, which no host test can execute, so
+    // deleting either compiles clean and leaves every behavioural test green.
+    // Source scrapes are the only available instrument. Needles are assembled
+    // at runtime so this module's own text cannot satisfy them — note this
+    // `mod tests` sits MID-FILE, so `include_str!` sees it too.
+
+    /// Without this call, a page loaded outside a gateway waits out the full
+    /// 90 s fallback on "Looking for your sites" before admitting there is no
+    /// node — and it must stay INSIDE the `!is_gateway` branch, because
+    /// settling unconditionally at the top of the function would mean
+    /// discovery is over before it began, which is #52 restored.
+    #[test]
+    fn the_no_gateway_path_settles_discovery_immediately() {
+        let src = include_str!("connection.rs");
+
+        let start = src
+            .find(&format!("{}{}", "if !is_", "gateway {"))
+            .expect("connect_to_freenet must branch on gateway detection");
+        let rest = &src[start..];
+        let branch = &rest[..rest
+            .find("return;")
+            .expect("the no-gateway branch must return early")];
+
+        let needle = format!("{}{}", "settle_site_", "discovery()");
+        assert!(
+            branch.contains(&needle),
+            "the no-gateway branch must settle discovery before returning, or \
+             the user waits out the hard fallback staring at a spinner"
+        );
+    }
+
+    /// The legacy sweep is fire-once per page load. If the socket dies after
+    /// dispatch but before the replies land, nothing re-probes and a returning
+    /// user is stranded until a full reload.
+    #[test]
+    fn a_dropped_socket_allows_the_legacy_sweep_to_run_again() {
+        let src = include_str!("connection.rs");
+
+        let needle = format!("{}{}", "reset_legacy_migration_", "for_reconnect()");
+        assert!(
+            src.contains(&needle),
+            "the connection error handler must clear the fire-once sweep flag \
+             so the reconnect re-probes the legacy delegates"
+        );
+    }
 }
 
 #[cfg(target_arch = "wasm32")]

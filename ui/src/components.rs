@@ -85,8 +85,8 @@ pub fn App() -> Element {
                         // nothing to show. With sites present but none
                         // selected this pane also renders, and "Looking for
                         // your sites" beside a populated sidebar is nonsense.
-                        let searching = !has_sites
-                            && *state::SITE_DISCOVERY.read() != state::SiteDiscovery::Settled;
+                        let searching =
+                            empty_pane_is_searching(has_sites, *state::SITE_DISCOVERY.read());
                         let (heading, body) = empty_pane_copy(searching);
                         rsx! {
                             main { class: "flex-1 overflow-y-auto bg-panel",
@@ -126,6 +126,23 @@ pub fn App() -> Element {
             }
         }
     }
+}
+
+/// Whether the empty main pane should say Delta is still looking.
+///
+/// Extracted from `App` so the POLARITY is unit-testable. Inline, the
+/// condition was only reachable through RSX that no host test can execute, so
+/// flipping `!=` to `==` inverted #52 exactly — bare "Welcome to Delta" during
+/// recovery, spinner after it finished — while every test stayed green.
+///
+/// Two rules, both load-bearing:
+/// - Never claim to be searching once discovery has `Settled`; that is the
+///   whole point of settling.
+/// - Never claim to be searching when sites are already listed. This pane also
+///   renders with sites present but none selected, and "Looking for your
+///   sites" beside a populated sidebar is nonsense.
+pub(crate) fn empty_pane_is_searching(has_sites: bool, discovery: state::SiteDiscovery) -> bool {
+    !has_sites && discovery != state::SiteDiscovery::Settled
 }
 
 /// Heading and body copy for the empty main pane.
@@ -389,20 +406,126 @@ mod tests {
     #[test]
     fn the_empty_pane_actually_consults_discovery_state() {
         // The copy tests above only prove the two variants differ. The rule
-        // that matters is that `App` picks between them by reading
-        // SITE_DISCOVERY — replacing that read with `false` reintroduces #52
-        // in full while leaving both copy tests green. The needle is assembled
-        // at runtime so this test's own text cannot satisfy it.
+        // that matters is that `App` picks between them by READING
+        // SITE_DISCOVERY into the value it branches on.
+        //
+        // Searching the whole file for the two needles independently is not
+        // enough, and was the earlier form of this test. It passes under:
+        //
+        //     let _unused = *state::SITE_DISCOVERY.read();
+        //     let searching = false;
+        //     let (heading, body) = empty_pane_copy(searching);
+        //
+        // which reintroduces #52 in full — the recovery state never renders
+        // and every returning user sees "Welcome to Delta" again. So isolate
+        // the assignment that computes `searching` and require the read to
+        // occur INSIDE it, i.e. to actually flow into the value.
+        //
+        // Needles are assembled at runtime so this test's own text cannot
+        // satisfy them.
         let src = include_str!("components.rs");
+
+        let marker = format!("{}{}", "let search", "ing =");
+        let start = src
+            .find(&marker)
+            .expect("`App` must compute a `searching` flag for the empty pane");
+        let rest = &src[start..];
+        let assignment = &rest[..rest
+            .find(';')
+            .expect("the `searching` assignment must be `;`-terminated")];
+
+        let predicate = format!("{}{}", "empty_pane_is_", "searching(has_sites,");
+        assert!(
+            assignment.contains(&predicate),
+            "the value `searching` must come from the unit-tested predicate, \
+             not be recomputed inline where its polarity is untestable; \
+             found: {assignment:?}"
+        );
+
         let needle = format!("{}{}", "state::SITE_", "DISCOVERY.read()");
         assert!(
-            src.contains(&needle),
-            "the empty pane must choose its copy from the discovery state"
+            assignment.contains(&needle),
+            "the discovery state must flow INTO the predicate, not merely be \
+             read alongside it; found: {assignment:?}"
         );
+
         let call = format!("{}{}", "empty_pane_", "copy(searching)");
         assert!(
             src.contains(&call),
-            "the chosen state must actually drive the copy"
+            "the computed flag must actually drive the copy"
+        );
+    }
+
+    /// The full truth table for the searching predicate, including the
+    /// polarity a source scrape cannot see. Flipping `!=` to `==` in
+    /// `empty_pane_is_searching` inverts #52 — the bare newcomer welcome shows
+    /// DURING recovery and the spinner shows after it finished — and this is
+    /// the test that catches it.
+    #[test]
+    fn the_searching_predicate_has_the_right_polarity() {
+        use super::empty_pane_is_searching;
+        use crate::state::SiteDiscovery::{Pending, Settled};
+
+        // The #52 case: nothing to show yet and discovery still running.
+        assert!(
+            empty_pane_is_searching(false, Pending),
+            "no sites and discovery outstanding is precisely when we must say \
+             we are still looking"
+        );
+
+        // Discovery finished and found nothing: the newcomer welcome is now
+        // honest.
+        assert!(
+            !empty_pane_is_searching(false, Settled),
+            "once discovery has settled, an empty list honestly means no sites"
+        );
+
+        // Sites present: this pane renders when none is selected, and claiming
+        // to search beside a populated sidebar is nonsense.
+        assert!(!empty_pane_is_searching(true, Pending));
+        assert!(!empty_pane_is_searching(true, Settled));
+    }
+
+    /// The single most safety-critical line in this change, and otherwise
+    /// uncovered: without the `rerun-if-changed` directive, Cargo reuses cached
+    /// build-script output and the bundle ships a STALE migration table, so the
+    /// startup sweep never asks the delegate holding a returning user's data.
+    ///
+    /// This is a source scrape and is labelled as one. It catches deletion of
+    /// the directive; it cannot detect a bundle that already shipped stale.
+    /// A stronger consistency check — comparing the baked-in `LEGACY_DELEGATES`
+    /// against the file on disk — belongs with the wider build-input work and
+    /// may supersede this. Until then this PR does not leave its own core fix
+    /// unguarded on `main`.
+    #[test]
+    fn the_migration_table_is_declared_as_a_build_input() {
+        let src = include_str!("../build.rs");
+        let needle = format!(
+            "{}{}",
+            "cargo:rerun-if-changed=../legacy_", "delegates.toml"
+        );
+        assert!(
+            src.contains(&needle),
+            "ui/build.rs bakes legacy_delegates.toml into the bundle but does \
+             not declare it as a build input, so an edited migration registry \
+             will not invalidate the cached build script and the bundle will \
+             ship a stale table"
+        );
+    }
+
+    /// Without this call the 90 s hard stop never arms, so a node whose
+    /// delegate never answers leaves the user on "Looking for your sites"
+    /// forever. The call is in `App`'s mount effect, which no host test can
+    /// run, so deleting it compiles clean and leaves every other test green.
+    /// Needle assembled at runtime.
+    #[test]
+    fn the_discovery_hard_fallback_is_armed_at_startup() {
+        let src = include_str!("components.rs");
+        let needle = format!("{}{}", "arm_discovery_", "fallback()");
+        assert!(
+            src.contains(&needle),
+            "App must arm the discovery hard fallback at startup, or a node \
+             that never answers pins the user on the searching state forever"
         );
     }
 

@@ -51,8 +51,15 @@ static OWNER_PREFIXES: GlobalSignal<Vec<String>> = GlobalSignal::new(Vec::new);
 /// Whether legacy migration has already been fired. Deferring legacy queries
 /// until the current delegate's KnownSites response arrives guarantees that
 /// a legacy response cannot race ahead of the current one and resurrect
-/// deleted sites. Fires once per page load, unless a dropped connection resets
-/// it (see [`reset_legacy_migration_for_reconnect`]).
+/// deleted sites. Set at most once per sweep dispatch, and cleared by a dropped
+/// connection so the reconnect re-probes (see
+/// [`reset_legacy_migration_for_reconnect`]).
+///
+/// Note it stays `false` forever when `LEGACY_DELEGATES` is empty, because
+/// `fire_legacy_migration` returns before latching. Every reader treats "not
+/// fired" as "a sweep may still be needed", which is harmless when there is
+/// nothing to sweep — but do not start reading this flag as "startup is
+/// complete".
 static LEGACY_MIGRATION_FIRED: GlobalSignal<bool> = GlobalSignal::new(|| false);
 
 /// Whether the CURRENT delegate's `KnownSites` reply has arrived.
@@ -438,14 +445,38 @@ fn arm_discovery_settle_if_ready() {
 /// dispatched but before its replies came back, those replies are lost, and the
 /// reconnect's fresh `KnownSites` round would skip the sweep entirely — leaving
 /// a returning user with no route to their sites short of a full reload. Called
-/// from the connection error handler. Pre-existing; not introduced by #52.
+/// from the connection error handler. Introduced by #52.
+///
+/// The reset is UNCONDITIONAL once the sweep has fired. An earlier version
+/// skipped it when `CURRENT_SITES_LOADED` was set, reading that flag as
+/// "recovery already produced something" — it does not mean that. It is set
+/// whenever the CURRENT delegate held any record or tombstone, which says
+/// nothing about whether any legacy reply arrived. A user whose current
+/// delegate holds two sites while a third lives only in a legacy generation
+/// would have had the sweep suppressed on every reconnect, and the legacy-only
+/// site would never be recovered that session. Re-dispatching a sweep that did
+/// complete is cheap and idempotent; skipping one that did not is data the user
+/// never gets back.
+///
+/// Discovery is also returned to `Pending`, because the sweep it is re-running
+/// is exactly what discovery reports on. Without that, a socket flap after the
+/// grace period settles leaves the UI showing the bare "Welcome to Delta" for
+/// the whole of the second sweep — the precise screen this change exists to
+/// remove, in the scenario this function exists to handle.
 pub fn reset_legacy_migration_for_reconnect() {
     // Bind first: never hold a signal read guard while writing another.
     let fired = *LEGACY_MIGRATION_FIRED.read();
-    let recovered_something = *CURRENT_SITES_LOADED.read();
-    if fired && !recovered_something {
-        log("Delta: connection dropped before legacy discovery produced anything; will re-probe on reconnect");
+    if fired {
+        log("Delta: connection dropped mid-recovery; will re-probe legacy delegates on reconnect");
         *LEGACY_MIGRATION_FIRED.write() = false;
+        *CURRENT_KNOWN_SITES_ANSWERED.write() = false;
+        *DISCOVERY_SETTLE_ARMED.write() = false;
+        state::reopen_site_discovery();
+        // The page-load fallback has very likely already fired by now, and a
+        // reopened discovery with no deadline would strand the spinner if the
+        // second sweep also fails. Arm a fresh one. Extra timers are harmless:
+        // settling is idempotent.
+        arm_discovery_fallback();
     }
 }
 
@@ -1450,6 +1481,53 @@ mod tests {
         }
     }
 
+    /// The baked `LEGACY_DELEGATES` must match `legacy_delegates.toml`.
+    ///
+    /// This is the pin that actually catches the bug #52 turned out to be, and
+    /// it is deliberately NOT a build-script assertion. **A build script's
+    /// `assert!` only runs when the build script runs**, and in the stale case
+    /// Cargo skips it precisely because it believes nothing changed — so an
+    /// assertion inside `build.rs` is structurally incapable of catching a
+    /// stale bake. It guards a different, rarer class (a malformed or absent
+    /// file, where the script does run) and is kept for that.
+    ///
+    /// `include_str!` is recorded in rustc's own dep-info, independently of the
+    /// build script's fingerprint, so this test's copy of the registry is
+    /// always current while the constant is current only if the script really
+    /// re-ran. That asymmetry IS the mechanism: it goes red on a stale bake and
+    /// on an empty one.
+    ///
+    /// Honest limitation: a cold build always runs the build script, so this
+    /// cannot be stale (and cannot fail) in CI or a fresh clone. Its
+    /// discriminating power is on warm incremental builds — which is exactly
+    /// where the bug bites, since `cargo make publish-delta` runs locally
+    /// against a warm `target/`.
+    #[test]
+    fn the_baked_delegate_registry_matches_the_file_on_disk() {
+        let toml = include_str!("../../../legacy_delegates.toml");
+        // Exact match on the trimmed line, so a commented-out `# [[entry]]`
+        // is not counted.
+        let declared = toml.lines().filter(|l| l.trim() == "[[entry]]").count();
+
+        assert!(
+            declared > 0,
+            "legacy_delegates.toml declares no entries at all — this registry \
+             is append-only and can never legitimately be empty"
+        );
+        assert_eq!(
+            LEGACY_DELEGATES.len(),
+            declared,
+            "the baked-in migration table has {} entries but \
+             legacy_delegates.toml declares {}. The bundle would ship a STALE \
+             or EMPTY table, the startup sweep would not ask the delegate \
+             holding a returning user's data, and every returning user would \
+             land on an empty \"Welcome to Delta\". Re-run the build; if that \
+             fixes it, ui/build.rs is missing its rerun-if-changed directive.",
+            LEGACY_DELEGATES.len(),
+            declared
+        );
+    }
+
     #[test]
     fn newest_legacy_delegate_is_the_last_toml_entry() {
         // Only the newest legacy delegate's KnownSites real records are
@@ -1516,6 +1594,44 @@ mod tests {
         assert!(
             body.contains(&needle),
             "the settle timer must not be armed before the current delegate has answered"
+        );
+    }
+
+    /// `fire_legacy_migration` owns its own once-per-page-load latch.
+    ///
+    /// That placement is load-bearing and easy to lose. Its caller is the
+    /// current delegate's `KnownSites` arm, and `register_delegate()` re-issues
+    /// `load_known_sites()` on every reconnect — so the call site fires more
+    /// than once by design. If the internal `if !already_fired` guard is
+    /// dropped, every reconnect re-dispatches all 3xN legacy probes.
+    ///
+    /// The latch must also be taken BEFORE the guard, otherwise it never
+    /// latches at all. Both facts are checked inside the function body only,
+    /// and the needles are assembled at runtime, so this test cannot satisfy
+    /// itself via `include_str!`.
+    #[test]
+    fn the_legacy_sweep_latches_itself_against_repeat_dispatch() {
+        let src = include_str!("delegate.rs");
+        let body = src
+            .split("fn fire_legacy_migration()")
+            .nth(1)
+            .expect("fire_legacy_migration must exist");
+        let body = &body[..body.find("\n}\n").expect("body must be brace-bounded")];
+
+        let latch = format!("{}{}", "LEGACY_MIGRATION_", "FIRED.with_mut(");
+        let guard = format!("{}{}", "if !already_", "fired");
+
+        let latch_at = body
+            .find(&latch)
+            .expect("the sweep must take its own fire-once latch");
+        let guard_at = body.find(&guard).expect(
+            "the sweep must skip dispatch when already fired — its caller runs \
+             again on every reconnect",
+        );
+        assert!(
+            latch_at < guard_at,
+            "the latch must be taken before the guard is consulted, or it never \
+             latches"
         );
     }
 
