@@ -116,6 +116,11 @@ pub fn connect_to_freenet() {
                 web_sys::console::error_1(&truncated.into());
                 *CONNECTION_STATUS.write() =
                     ConnectionStatus::Error("Connection failed".to_string());
+                // The legacy sweep is dispatched at registration and is
+                // fire-once per page load, so a socket that dies before its
+                // replies return would otherwise strand discovery until a full
+                // reload. Let the reconnect re-probe (#52).
+                super::delegate::reset_legacy_migration_for_reconnect();
                 // Schedule a reconnect attempt. Without this, the
                 // WebSocket stays dead until the user refreshes the
                 // iframe — which is what surfaced as Ivvor's "red

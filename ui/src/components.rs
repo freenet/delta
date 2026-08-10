@@ -81,7 +81,12 @@ pub fn App() -> Element {
                     // recovering them from a previous version" — is decided by
                     // `empty_pane_copy`. See freenet/delta#52.
                     {
-                        let searching = *state::SITE_DISCOVERY.read() != state::SiteDiscovery::Settled;
+                        // Only claim to be searching when there is genuinely
+                        // nothing to show. With sites present but none
+                        // selected this pane also renders, and "Looking for
+                        // your sites" beside a populated sidebar is nonsense.
+                        let searching = !has_sites
+                            && *state::SITE_DISCOVERY.read() != state::SiteDiscovery::Settled;
                         let (heading, body) = empty_pane_copy(searching);
                         rsx! {
                             main { class: "flex-1 overflow-y-auto bg-panel",
@@ -378,6 +383,26 @@ mod tests {
         assert!(
             !searching_heading.contains("Welcome"),
             "a returning user mid-recovery must not be welcomed as a newcomer"
+        );
+    }
+
+    #[test]
+    fn the_empty_pane_actually_consults_discovery_state() {
+        // The copy tests above only prove the two variants differ. The rule
+        // that matters is that `App` picks between them by reading
+        // SITE_DISCOVERY — replacing that read with `false` reintroduces #52
+        // in full while leaving both copy tests green. The needle is assembled
+        // at runtime so this test's own text cannot satisfy it.
+        let src = include_str!("components.rs");
+        let needle = format!("{}{}", "state::SITE_", "DISCOVERY.read()");
+        assert!(
+            src.contains(&needle),
+            "the empty pane must choose its copy from the discovery state"
+        );
+        let call = format!("{}{}", "empty_pane_", "copy(searching)");
+        assert!(
+            src.contains(&call),
+            "the chosen state must actually drive the copy"
         );
     }
 
