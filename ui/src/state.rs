@@ -45,6 +45,60 @@ pub static EDITOR_CONTENT: GlobalSignal<String> = GlobalSignal::new(String::new)
 /// Prevents network responses from re-adding them.
 pub static REMOVED_PREFIXES: GlobalSignal<Vec<String>> = GlobalSignal::new(Vec::new);
 
+/// How far the startup search for the user's sites has got.
+///
+/// Delta re-keys its delegate on essentially every release, so a returning
+/// user's first load after an upgrade finds the current delegate empty and has
+/// to recover the site list from a legacy delegate. While that is outstanding
+/// an empty `SITES` means "we have not found them yet", not "you have none" —
+/// and rendering the bare "Welcome to Delta" screen (the same one a brand-new
+/// user sees) is indistinguishable from total data loss. See freenet/delta#52.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SiteDiscovery {
+    /// Still looking. An empty site list must be presented as "searching".
+    Pending,
+    /// Finished. An empty site list now honestly means the user has no sites.
+    Settled,
+}
+
+pub static SITE_DISCOVERY: GlobalSignal<SiteDiscovery> =
+    GlobalSignal::new(|| SiteDiscovery::Pending);
+
+/// Mark startup discovery finished. Idempotent.
+///
+/// Settling is not permanent: `reopen_site_discovery` puts it back to `Pending`
+/// when a genuinely new search starts. Timers must therefore never assume the
+/// state they settle is the one they were armed for — they are deadlines on a
+/// search, not on the page.
+///
+/// Only ever called from wasm paths (delegate discovery / gateway detection),
+/// so the native build sees it as dead — same reason `PENDING_HASH` above is
+/// annotated.
+#[allow(dead_code)]
+pub fn settle_site_discovery() {
+    if *SITE_DISCOVERY.read() != SiteDiscovery::Settled {
+        *SITE_DISCOVERY.write() = SiteDiscovery::Settled;
+    }
+}
+
+/// Reopen discovery because a NEW search is starting — specifically, a
+/// reconnect that re-runs the legacy sweep.
+///
+/// Settling was originally one-way, on the reasoning that a later reconnect
+/// should not put "looking for your sites" back after the user has been shown
+/// the real state. That is wrong when the reconnect genuinely restarts the
+/// search: a socket flap after the grace period leaves the user staring at the
+/// bare "Welcome to Delta" for the entire second sweep — the exact screen
+/// freenet/delta#52 is about, in the exact scenario the reconnect path exists
+/// to handle. Reopening is only correct because it is paired with re-arming the
+/// settle timers; reopening without them would strand the spinner.
+#[allow(dead_code)]
+pub fn reopen_site_discovery() {
+    if *SITE_DISCOVERY.read() != SiteDiscovery::Pending {
+        *SITE_DISCOVERY.write() = SiteDiscovery::Pending;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Initialization
 // ---------------------------------------------------------------------------

@@ -51,8 +51,24 @@ static OWNER_PREFIXES: GlobalSignal<Vec<String>> = GlobalSignal::new(Vec::new);
 /// Whether legacy migration has already been fired. Deferring legacy queries
 /// until the current delegate's KnownSites response arrives guarantees that
 /// a legacy response cannot race ahead of the current one and resurrect
-/// deleted sites.
+/// deleted sites. Set at most once per sweep dispatch, and cleared by a dropped
+/// connection so the reconnect re-probes (see
+/// [`reset_legacy_migration_for_reconnect`]).
+///
+/// Note it stays `false` forever when `LEGACY_DELEGATES` is empty, because
+/// `fire_legacy_migration` returns before latching. Every reader treats "not
+/// fired" as "a sweep may still be needed", which is harmless when there is
+/// nothing to sweep — but do not start reading this flag as "startup is
+/// complete".
 static LEGACY_MIGRATION_FIRED: GlobalSignal<bool> = GlobalSignal::new(|| false);
+
+/// Whether the CURRENT delegate's `KnownSites` reply has arrived.
+///
+/// Distinct from [`CURRENT_SITES_LOADED`], which means "the current delegate
+/// answered AND held state" and can also be set by a legacy contribution. This
+/// one is purely "did the current delegate answer yet", which is what tells the
+/// UI whether an empty site list means "none" or "not found yet" (#52).
+static CURRENT_KNOWN_SITES_ANSWERED: GlobalSignal<bool> = GlobalSignal::new(|| false);
 
 // Tombstones let us persist removed prefixes across refreshes WITHOUT
 // changing the delegate WASM schema — the delegate just stores/returns
@@ -91,6 +107,19 @@ pub fn register_delegate() {
                         // handle_delegate_response) — otherwise a legacy
                         // response could race ahead and resurrect sites the
                         // user removed.
+                        //
+                        // #52 proposed dispatching the sweep here instead, to
+                        // take it off the critical path. Measured on a live
+                        // node, it does not pay: the gap between this point and
+                        // the current delegate's reply is 188-355 ms (cold
+                        // wasmtime compilation of the freshly re-keyed
+                        // delegate), the node answers delegate ops serially so
+                        // early-dispatched legacy probes queue behind that same
+                        // compile anyway, and the ordering rule means their
+                        // results cannot be APPLIED any earlier regardless. The
+                        // measured saving was ~50 ms, against a buffering
+                        // mechanism in the one code path where a mistake
+                        // silently destroys user data. Not worth it.
                         request_public_key();
                         load_known_sites();
                     }
@@ -370,6 +399,167 @@ fn is_newest_legacy_delegate(responding_key: &DelegateKey) -> bool {
     key_matches && hash_matches
 }
 
+/// How long to keep saying we are still looking after the current delegate has
+/// answered. Its reply is what starts the legacy sweep, so this has to cover
+/// the sweep's own round trip.
+#[cfg(target_arch = "wasm32")]
+const DISCOVERY_SETTLE_GRACE_MS: u64 = 6_000;
+
+/// Hard stop on the "looking for your sites" state, armed at page load, for the
+/// case where the current delegate never answers at all.
+///
+/// Deliberately generous: #52 measured a recovery window of minutes, and
+/// flipping to the newcomer welcome while recovery is still running is the exact
+/// harm this whole change exists to remove. The cost of erring long is that a
+/// genuine first-time user sees "Looking for your sites" for a while — with the
+/// "Get Started" button live throughout, so they are never blocked.
+#[cfg(target_arch = "wasm32")]
+const DISCOVERY_SETTLE_FALLBACK_MS: u64 = 90_000;
+
+/// Whether the settle grace timer has already been armed (it is idempotent, but
+/// re-arming on every response would keep pushing the deadline out).
+static DISCOVERY_SETTLE_ARMED: GlobalSignal<bool> = GlobalSignal::new(|| false);
+
+/// Monotonic id of the current discovery round.
+///
+/// Settle timers are `spawn_local` tasks with no cancellation handle, so the
+/// only way to retire one is to make it check on wake whether it still belongs
+/// to the round it was armed for. A reconnect starts a NEW round, and every
+/// timer from the old one must become a no-op.
+///
+/// Deliberately a plain atomic rather than a `GlobalSignal`: nothing renders
+/// from it (it is a cancellation token, not reactive state), and it must be
+/// readable from a plain `#[test]` so the arm/reset/fire sequence can actually
+/// be driven. A `GlobalSignal` needs a Dioxus runtime, which is why every other
+/// test around this code is either a pure function or a source scrape.
+static DISCOVERY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The round id a timer should stamp itself with as it arms.
+fn current_discovery_generation() -> u64 {
+    DISCOVERY_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Start a new discovery round, retiring every timer already in flight.
+fn begin_new_discovery_generation() {
+    DISCOVERY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether a timer armed for `armed_generation` may still settle discovery.
+///
+/// **Idempotence is the wrong property here.** `settle_site_discovery` is
+/// idempotent, so double-settling is harmless — but that says nothing about
+/// WHICH round a callback belongs to. Without this check, a grace timer armed
+/// before a socket drop wakes up mid-way through the SECOND sweep and settles
+/// it, putting the bare "Welcome to Delta" back on screen during recovery: the
+/// exact screen this change exists to remove, in the exact scenario the
+/// reconnect path exists to handle. The 90 s fallback has the same shape, and
+/// because the reset arms a fresh one, a flapping socket accumulates them.
+fn settle_timer_may_fire(armed_generation: u64) -> bool {
+    armed_generation == current_discovery_generation()
+}
+
+/// Arm the "discovery is over" timer once the current delegate has answered —
+/// which is also the moment the legacy sweep is dispatched. Until discovery
+/// settles the UI shows a recovery message instead of the bare "Welcome to
+/// Delta" empty state (#52).
+fn arm_discovery_settle_if_ready() {
+    if !*CURRENT_KNOWN_SITES_ANSWERED.read() {
+        return;
+    }
+    let already_armed = DISCOVERY_SETTLE_ARMED.with_mut(|armed| std::mem::replace(armed, true));
+    if !already_armed {
+        let generation = current_discovery_generation();
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = generation;
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async move {
+            gloo_timers::future::sleep(std::time::Duration::from_millis(DISCOVERY_SETTLE_GRACE_MS))
+                .await;
+            if settle_timer_may_fire(generation) {
+                state::settle_site_discovery();
+            }
+        });
+    }
+}
+
+/// Forget that the legacy sweep ran, so the next successful reconnect re-runs it.
+///
+/// The sweep is fire-once per page load. If the socket dies after it was
+/// dispatched but before its replies came back, those replies are lost, and the
+/// reconnect's fresh `KnownSites` round would skip the sweep entirely — leaving
+/// a returning user with no route to their sites short of a full reload. Called
+/// from the connection error handler. Introduced by #52.
+///
+/// The reset is UNCONDITIONAL once the sweep has fired. An earlier version
+/// skipped it when `CURRENT_SITES_LOADED` was set, reading that flag as
+/// "recovery already produced something" — it does not mean that. It is set
+/// whenever the CURRENT delegate held any record or tombstone, which says
+/// nothing about whether any legacy reply arrived. A user whose current
+/// delegate holds two sites while a third lives only in a legacy generation
+/// would have had the sweep suppressed on every reconnect, and the legacy-only
+/// site would never be recovered that session. Re-dispatching a sweep that did
+/// complete is cheap and idempotent; skipping one that did not is data the user
+/// never gets back.
+///
+/// Discovery is also returned to `Pending`, because the sweep it is re-running
+/// is exactly what discovery reports on. Without that, a socket flap after the
+/// grace period settles leaves the UI showing the bare "Welcome to Delta" for
+/// the whole of the second sweep — the precise screen this change exists to
+/// remove, in the scenario this function exists to handle.
+pub fn reset_legacy_migration_for_reconnect() {
+    // Bind first: never hold a signal read guard while writing another.
+    let fired = *LEGACY_MIGRATION_FIRED.read();
+    if fired {
+        log("Delta: connection dropped mid-recovery; will re-probe legacy delegates on reconnect");
+        *LEGACY_MIGRATION_FIRED.write() = false;
+        *CURRENT_KNOWN_SITES_ANSWERED.write() = false;
+        *DISCOVERY_SETTLE_ARMED.write() = false;
+        state::reopen_site_discovery();
+
+        // ORDER MATTERS. Start the new round FIRST, so every timer still
+        // sleeping from the previous one is retired before anything new is
+        // armed. Reversed, the fresh fallback below would stamp itself with the
+        // OLD round and retire itself an instant later.
+        //
+        // This is not belt-and-braces. Without it, the grace timer armed before
+        // the socket dropped wakes during the SECOND sweep and settles it,
+        // showing the bare "Welcome to Delta" mid-recovery — the screen this
+        // change removes, in the scenario this function handles. Note that
+        // "settling is idempotent" does NOT cover this: idempotence says
+        // nothing about which round a callback belongs to.
+        begin_new_discovery_generation();
+
+        // The page-load fallback has very likely fired by now, and a reopened
+        // discovery with no deadline would strand the spinner if the second
+        // sweep also fails. Arm a fresh one. Accumulating fallbacks across a
+        // flapping socket is harmless because each is stamped with its round
+        // and all but the current one no-op.
+        arm_discovery_fallback();
+    }
+}
+
+/// Arm the hard fallback that ends the "looking for your sites" state no matter
+/// what happens. Called from app start, and again whenever a reconnect starts a
+/// new discovery round.
+///
+/// Stamped with the round it was armed for, so a fallback left over from an
+/// earlier round cannot settle a later one.
+pub fn arm_discovery_fallback() {
+    let generation = current_discovery_generation();
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = generation;
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(async move {
+        gloo_timers::future::sleep(std::time::Duration::from_millis(
+            DISCOVERY_SETTLE_FALLBACK_MS,
+        ))
+        .await;
+        if settle_timer_may_fire(generation) {
+            state::settle_site_discovery();
+        }
+    });
+}
+
 /// Handle a delegate response — route signed objects to the network.
 pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<OutboundDelegateMsg>) {
     let is_legacy = responding_key != current_delegate_key();
@@ -607,10 +797,11 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                     // to query legacy delegates: any legacy KnownSites
                     // response is now either blocked (CURRENT_SITES_LOADED
                     // is set) or merged into a fresh migration path.
-                    if !is_legacy && !*LEGACY_MIGRATION_FIRED.read() {
-                        *LEGACY_MIGRATION_FIRED.write() = true;
+                    if !is_legacy {
+                        *CURRENT_KNOWN_SITES_ANSWERED.write() = true;
                         fire_legacy_migration();
                     }
+                    arm_discovery_settle_if_ready();
                 }
                 DelegateResponse::SiteStateStored => {
                     log("Delta: site state backed up to delegate");
@@ -1047,12 +1238,14 @@ fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
 /// legacy delegate. Old delegates that don't support all requests will error for
 /// those individually, which is fine -- we take whatever we can get.
 fn fire_legacy_migration() {
+    if LEGACY_DELEGATES.is_empty() {
+        return;
+    }
+    let already_fired = LEGACY_MIGRATION_FIRED.with_mut(|fired| std::mem::replace(fired, true));
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = already_fired;
     #[cfg(target_arch = "wasm32")]
-    {
-        if LEGACY_DELEGATES.is_empty() {
-            return;
-        }
-
+    if !already_fired {
         log(&format!(
             "Delta: attempting migration from {} legacy delegate(s)",
             LEGACY_DELEGATES.len()
@@ -1065,6 +1258,17 @@ fn fire_legacy_migration() {
             delta_core::DelegateRequest::GetSigningKey,
         ];
 
+        // NOTE: the send order here is NOT cosmetic, despite looking it.
+        // Every probe is dispatched concurrently, so reordering buys no
+        // measurable time — but with an empty current delegate the FIRST
+        // non-empty legacy reply latches `CURRENT_SITES_LOADED` and calls
+        // `save_known_sites()`, after which `skip_older_legacy` discards every
+        // remaining generation bar the newest. Send order therefore decides
+        // which generation's view is persisted. #52 proposed reversing this to
+        // newest-first; that may well be an improvement (the newest generation
+        // is the one the reconciliation rules already treat as authoritative),
+        // but it is a change to stored data and belongs in its own change with
+        // its own tests, not smuggled in as a latency tweak.
         for (i, (key_bytes, code_hash_bytes)) in LEGACY_DELEGATES.iter().enumerate() {
             for req in &requests {
                 let legacy_code_hash = CodeHash::new(*code_hash_bytes);
@@ -1344,6 +1548,63 @@ mod tests {
         }
     }
 
+    /// The baked `LEGACY_DELEGATES` must match `legacy_delegates.toml`.
+    ///
+    /// This is the pin that actually catches the bug #52 turned out to be, and
+    /// it is deliberately NOT a build-script assertion. **A build script's
+    /// `assert!` only runs when the build script runs**, and in the stale case
+    /// Cargo skips it precisely because it believes nothing changed — so an
+    /// assertion inside `build.rs` is structurally incapable of catching a
+    /// stale bake. It guards a different, rarer class (a malformed or absent
+    /// file, where the script does run) and is kept for that.
+    ///
+    /// `include_str!` is recorded in rustc's own dep-info, independently of the
+    /// build script's fingerprint, so this test's copy of the registry is
+    /// always current while the constant is current only if the script really
+    /// re-ran. That asymmetry IS the mechanism: it goes red on a stale bake and
+    /// on an empty one.
+    ///
+    /// Two limitations, stated precisely because an earlier version of this
+    /// comment understated the test's reach in its own favour:
+    ///
+    /// - A genuinely cold build always runs the build script, so this cannot
+    ///   be stale there. That does NOT mean it is toothless in CI: `ci.yml`
+    ///   caches `target` with `restore-keys: ${{ runner.os }}-cargo-`, so CI
+    ///   runs are routinely warm and the pin does have teeth. Its power is
+    ///   greatest on warm incremental builds — including the local
+    ///   `cargo make publish-delta` against a warm `target/`, which is where
+    ///   the bug actually bites.
+    /// - It observes the HOST bake. `dx build --release` compiles for
+    ///   wasm32-unknown-unknown, which has its own fingerprint and its own
+    ///   `OUT_DIR`, so a host bake being fresh is strong evidence rather than
+    ///   a direct check of the shipped artifact. Nothing here inspects the
+    ///   published bundle.
+    #[test]
+    fn the_baked_delegate_registry_matches_the_file_on_disk() {
+        let toml = include_str!("../../../legacy_delegates.toml");
+        // Exact match on the trimmed line, so a commented-out `# [[entry]]`
+        // is not counted.
+        let declared = toml.lines().filter(|l| l.trim() == "[[entry]]").count();
+
+        assert!(
+            declared > 0,
+            "legacy_delegates.toml declares no entries at all — this registry \
+             is append-only and can never legitimately be empty"
+        );
+        assert_eq!(
+            LEGACY_DELEGATES.len(),
+            declared,
+            "the baked-in migration table has {} entries but \
+             legacy_delegates.toml declares {}. The bundle would ship a STALE \
+             or EMPTY table, the startup sweep would not ask the delegate \
+             holding a returning user's data, and every returning user would \
+             land on an empty \"Welcome to Delta\". Re-run the build; if that \
+             fixes it, ui/build.rs is missing its rerun-if-changed directive.",
+            LEGACY_DELEGATES.len(),
+            declared
+        );
+    }
+
     #[test]
     fn newest_legacy_delegate_is_the_last_toml_entry() {
         // Only the newest legacy delegate's KnownSites real records are
@@ -1389,6 +1650,180 @@ mod tests {
                 panic!("per-prefix key migration must send GetSigningKeyForPrefix, got {other:?}")
             }
         }
+    }
+
+    // ---- freenet/delta#52: when discovery starts, and what it may apply ----
+
+    #[test]
+    fn discovery_settling_is_gated_on_the_current_delegate_answering() {
+        // Until it answers, an empty site list means "not found yet", and
+        // saying "Welcome to Delta" is the data-loss impression #52 is about.
+        // `arm_discovery_settle_if_ready` is not host-callable (it arms a wasm
+        // timer), so pin its guard at the source level; the needle is assembled
+        // at runtime so this test cannot satisfy itself via `include_str!`.
+        let src = include_str!("delegate.rs");
+        let body = src
+            .split("fn arm_discovery_settle_if_ready()")
+            .nth(1)
+            .expect("arm_discovery_settle_if_ready must exist");
+        let body = &body[..body.find("\n}\n").expect("body must be brace-bounded")];
+        let needle = format!("{}{}", "!*CURRENT_KNOWN_SITES_", "ANSWERED.read()");
+        assert!(
+            body.contains(&needle),
+            "the settle timer must not be armed before the current delegate has answered"
+        );
+    }
+
+    /// Serialises the tests that mutate the process-global discovery
+    /// generation, so they cannot interfere with each other under the default
+    /// parallel test runner.
+    static GENERATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The race, driven end to end: arm a timer, reconnect, then let the old
+    /// timer fire.
+    ///
+    /// This is a real behavioural test, not a scrape — the generation counter
+    /// is a plain atomic precisely so the sequence is drivable without a Dioxus
+    /// runtime. Deleting the check in either timer makes the third assertion
+    /// meaningless, and mutating `settle_timer_may_fire` to `true` fails it
+    /// outright.
+    #[test]
+    fn a_timer_from_the_previous_round_cannot_settle_the_current_one() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // t=0: the grace timer arms for the round in progress.
+        let armed_before_drop = current_discovery_generation();
+        assert!(
+            settle_timer_may_fire(armed_before_drop),
+            "a timer must be allowed to settle the round it was armed for"
+        );
+
+        // t=3s: socket drops, reconnect starts a new round.
+        begin_new_discovery_generation();
+
+        // t=6s: the ORIGINAL timer wakes. It must not settle the new round —
+        // doing so puts the bare "Welcome to Delta" back up mid-recovery.
+        assert!(
+            !settle_timer_may_fire(armed_before_drop),
+            "a timer armed before the reconnect must NOT settle the round that \
+             replaced it; settling is idempotent, but idempotence says nothing \
+             about which round a callback belongs to"
+        );
+
+        // A timer armed for the new round still works, or the spinner would
+        // never come down.
+        let armed_after_drop = current_discovery_generation();
+        assert!(
+            settle_timer_may_fire(armed_after_drop),
+            "the reconnect's own timers must still be able to settle"
+        );
+    }
+
+    /// A flapping socket must not resurrect an intermediate round either.
+    #[test]
+    fn only_the_newest_round_may_settle_after_repeated_flaps() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let first = current_discovery_generation();
+        begin_new_discovery_generation();
+        let second = current_discovery_generation();
+        begin_new_discovery_generation();
+        let third = current_discovery_generation();
+
+        assert!(!settle_timer_may_fire(first));
+        assert!(!settle_timer_may_fire(second));
+        assert!(settle_timer_may_fire(third));
+    }
+
+    /// Both timers must consult the guard, and the reset must start the new
+    /// round BEFORE arming the replacement fallback.
+    ///
+    /// The behavioural tests above prove the predicate is right; they cannot
+    /// see whether the wasm-only timer bodies actually call it, nor the
+    /// ordering inside `reset_legacy_migration_for_reconnect`. Needles are
+    /// assembled at runtime.
+    #[test]
+    fn both_settle_timers_are_generation_guarded_and_the_reset_orders_correctly() {
+        let src = include_str!("delegate.rs");
+        let guard = format!("{}{}", "settle_timer_may_", "fire(generation)");
+
+        for func in [
+            "fn arm_discovery_settle_if_ready()",
+            "pub fn arm_discovery_fallback()",
+        ] {
+            let body = src.split(func).nth(1).unwrap_or_else(|| {
+                panic!("{func} must exist");
+            });
+            let body = &body[..body.find("\n}\n").expect("body must be brace-bounded")];
+            assert!(
+                body.contains(&guard),
+                "{func} arms a timer that outlives its round, so it must check \
+                 the generation before settling"
+            );
+        }
+
+        let reset = src
+            .split("pub fn reset_legacy_migration_for_reconnect()")
+            .nth(1)
+            .expect("reset must exist");
+        let reset = &reset[..reset.find("\n}\n").expect("body must be brace-bounded")];
+
+        let bump = format!("{}{}", "begin_new_discovery_", "generation()");
+        let rearm = format!("{}{}", "arm_discovery_", "fallback()");
+        let bump_at = reset
+            .find(&bump)
+            .expect("the reset must start a new discovery round");
+        let rearm_at = reset
+            .find(&rearm)
+            .expect("the reset must arm a replacement fallback");
+        assert!(
+            bump_at < rearm_at,
+            "the new round must start BEFORE the replacement fallback is armed, \
+             or the fallback stamps itself with the round it is replacing and \
+             retires itself immediately"
+        );
+    }
+
+    /// `fire_legacy_migration` owns its own once-per-page-load latch.
+    ///
+    /// That placement is load-bearing and easy to lose. Its caller is the
+    /// current delegate's `KnownSites` arm, and `register_delegate()` re-issues
+    /// `load_known_sites()` on every reconnect — so the call site fires more
+    /// than once by design. If the internal `if !already_fired` guard is
+    /// dropped, every reconnect re-dispatches all 3xN legacy probes.
+    ///
+    /// The latch must also be taken BEFORE the guard, otherwise it never
+    /// latches at all. Both facts are checked inside the function body only,
+    /// and the needles are assembled at runtime, so this test cannot satisfy
+    /// itself via `include_str!`.
+    #[test]
+    fn the_legacy_sweep_latches_itself_against_repeat_dispatch() {
+        let src = include_str!("delegate.rs");
+        let body = src
+            .split("fn fire_legacy_migration()")
+            .nth(1)
+            .expect("fire_legacy_migration must exist");
+        let body = &body[..body.find("\n}\n").expect("body must be brace-bounded")];
+
+        let latch = format!("{}{}", "LEGACY_MIGRATION_", "FIRED.with_mut(");
+        let guard = format!("{}{}", "if !already_", "fired");
+
+        let latch_at = body
+            .find(&latch)
+            .expect("the sweep must take its own fire-once latch");
+        let guard_at = body.find(&guard).expect(
+            "the sweep must skip dispatch when already fired — its caller runs \
+             again on every reconnect",
+        );
+        assert!(
+            latch_at < guard_at,
+            "the latch must be taken before the guard is consulted, or it never \
+             latches"
+        );
     }
 
     #[test]

@@ -26,6 +26,9 @@ pub fn App() -> Element {
         set_document_title("Delta");
         setup_hash_listener();
         freenet_api::connect_to_freenet();
+        // Hard stop on the "looking for your sites" state, so a node that never
+        // answers cannot leave it up forever (#52).
+        freenet_api::delegate::arm_discovery_fallback();
         state::init_from_hash();
     });
 
@@ -73,20 +76,37 @@ pub fn App() -> Element {
                         add_site_dialog::AddSiteDialog {}
                     }
                 } else if !has_sites || !has_current {
-                    // Welcome screen — no sites yet
-                    main { class: "flex-1 overflow-y-auto bg-panel",
-                        div { class: "flex items-center justify-center h-full",
-                            div { class: "text-center max-w-md mx-8",
-                                span { class: "delta-mark inline-flex mb-6 w-16 h-16 text-[32px] rounded-2xl", "\u{0394}" }
-                                h1 { class: "text-2xl font-semibold text-text mb-2", "Welcome to Delta" }
-                                p { class: "text-sm text-text-muted-light mb-8 leading-relaxed",
-                                    "Decentralized publishing on Freenet. Create your own site or visit one using a site code."
-                                }
-                                div { class: "flex gap-3 justify-center",
-                                    button {
-                                        class: "btn-primary px-6 py-3 text-sm",
-                                        onclick: move |_| state::show_add_site_prompt(),
-                                        "Get Started"
+                    // Nothing to show yet. Which of the two very different
+                    // reasons that is — "you have no sites" vs "we are still
+                    // recovering them from a previous version" — is decided by
+                    // `empty_pane_copy`. See freenet/delta#52.
+                    {
+                        // Only claim to be searching when there is genuinely
+                        // nothing to show. With sites present but none
+                        // selected this pane also renders, and "Looking for
+                        // your sites" beside a populated sidebar is nonsense.
+                        let searching =
+                            empty_pane_is_searching(has_sites, *state::SITE_DISCOVERY.read());
+                        let (heading, body) = empty_pane_copy(searching);
+                        rsx! {
+                            main { class: "flex-1 overflow-y-auto bg-panel",
+                                div { class: "flex items-center justify-center h-full",
+                                    div { class: "text-center max-w-md mx-8",
+                                        span { class: "delta-mark inline-flex mb-6 w-16 h-16 text-[32px] rounded-2xl", "\u{0394}" }
+                                        div { class: "flex items-center justify-center gap-3 mb-2",
+                                            if searching {
+                                                div { class: "w-4 h-4 rounded-full border-2 border-text-muted-light border-t-transparent animate-spin" }
+                                            }
+                                            h1 { class: "text-2xl font-semibold text-text", "{heading}" }
+                                        }
+                                        p { class: "text-sm text-text-muted-light mb-8 leading-relaxed", "{body}" }
+                                        div { class: "flex gap-3 justify-center",
+                                            button {
+                                                class: "btn-primary px-6 py-3 text-sm",
+                                                onclick: move |_| state::show_add_site_prompt(),
+                                                "Get Started"
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -105,6 +125,55 @@ pub fn App() -> Element {
                 }
             }
         }
+    }
+}
+
+/// Whether the empty main pane should say Delta is still looking.
+///
+/// Extracted from `App` so the POLARITY is unit-testable. Inline, the
+/// condition was only reachable through RSX that no host test can execute, so
+/// flipping `!=` to `==` inverted #52 exactly — bare "Welcome to Delta" during
+/// recovery, spinner after it finished — while every test stayed green.
+///
+/// Two rules, both load-bearing:
+/// - Never claim to be searching once discovery has `Settled`; that is the
+///   whole point of settling.
+/// - Never claim to be searching when sites are already listed. This pane also
+///   renders with sites present but none selected, and "Looking for your
+///   sites" beside a populated sidebar is nonsense.
+pub(crate) fn empty_pane_is_searching(has_sites: bool, discovery: state::SiteDiscovery) -> bool {
+    !has_sites && discovery != state::SiteDiscovery::Settled
+}
+
+/// Heading and body copy for the empty main pane.
+///
+/// Delta re-keys its delegate on essentially every release, so after an upgrade
+/// a returning user's site list has to be recovered from a legacy delegate. If
+/// the bare "Welcome to Delta" screen is rendered during that window it is the
+/// exact screen a brand-new user sees, so it reads as total data loss — which
+/// once led a tester to file a false "migration is broken" report, and gives a
+/// real user no reason to wait rather than assume everything is gone
+/// (freenet/delta#52).
+///
+/// The searching variant deliberately keeps the "Get Started" button: a genuine
+/// first-time user must never be blocked behind a spinner just because we
+/// cannot yet prove they are one.
+///
+/// Split out of the component so the rule "never show the new-user copy while
+/// discovery is outstanding" is unit-testable.
+pub(crate) fn empty_pane_copy(searching: bool) -> (&'static str, &'static str) {
+    if searching {
+        (
+            "Looking for your sites",
+            "Checking this node for sites saved by an earlier version of Delta. \
+             If you have used Delta before, your sites will appear here shortly — \
+             nothing has been lost.",
+        )
+    } else {
+        (
+            "Welcome to Delta",
+            "Decentralized publishing on Freenet. Create your own site or visit one using a site code.",
+        )
     }
 }
 
@@ -308,5 +377,179 @@ fn handle_hash_navigation() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::empty_pane_copy;
+
+    #[test]
+    fn the_new_user_welcome_is_never_shown_while_discovery_is_outstanding() {
+        // freenet/delta#52. During recovery the screen must not be the one a
+        // brand-new user sees, because that reads as total data loss.
+        let (settled_heading, settled_body) = empty_pane_copy(false);
+        let (searching_heading, searching_body) = empty_pane_copy(true);
+
+        assert_ne!(
+            searching_heading, settled_heading,
+            "the searching state must not reuse the new-user heading"
+        );
+        assert_ne!(searching_body, settled_body);
+        assert_eq!(settled_heading, "Welcome to Delta");
+        assert!(
+            !searching_heading.contains("Welcome"),
+            "a returning user mid-recovery must not be welcomed as a newcomer"
+        );
+    }
+
+    #[test]
+    fn the_empty_pane_actually_consults_discovery_state() {
+        // The copy tests above only prove the two variants differ. The rule
+        // that matters is that `App` picks between them by READING
+        // SITE_DISCOVERY into the value it branches on.
+        //
+        // Searching the whole file for the two needles independently is not
+        // enough, and was the earlier form of this test. It passes under:
+        //
+        //     let _unused = *state::SITE_DISCOVERY.read();
+        //     let searching = false;
+        //     let (heading, body) = empty_pane_copy(searching);
+        //
+        // which reintroduces #52 in full — the recovery state never renders
+        // and every returning user sees "Welcome to Delta" again. So isolate
+        // the assignment that computes `searching` and require the read to
+        // occur INSIDE it, i.e. to actually flow into the value.
+        //
+        // Needles are assembled at runtime so this test's own text cannot
+        // satisfy them.
+        // Whitespace is stripped before matching, per house convention: the
+        // needles otherwise break on a rustfmt rewrap of unrelated code.
+        let src: String = include_str!("components.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+
+        let marker = format!("{}{}", "letsearch", "ing=");
+        let start = src
+            .find(&marker)
+            .expect("`App` must compute a `searching` flag for the empty pane");
+        let rhs = &src[start + marker.len()..];
+        let rhs = &rhs[..rhs
+            .find(';')
+            .expect("the `searching` assignment must be `;`-terminated")];
+
+        // STARTS WITH, not contains. `contains` admits a leading `!`, which
+        // inverts the entire fix while leaving the scrape green — the same
+        // hole this test was written to close, one level up.
+        let predicate = format!("{}{}", "empty_pane_is_", "searching(");
+        assert!(
+            rhs.starts_with(&predicate),
+            "`searching` must be exactly the unit-tested predicate, with no \
+             wrapping or negation — a leading `!` inverts the fix and the \
+             truth table cannot see it; found: {rhs:?}"
+        );
+
+        let needle = format!("{}{}", "state::SITE_", "DISCOVERY.read()");
+        assert!(
+            rhs.contains(&needle),
+            "the discovery state must flow INTO the predicate, not merely be \
+             read alongside it; found: {rhs:?}"
+        );
+
+        let call = format!("{}{}", "empty_pane_", "copy(searching)");
+        assert!(
+            src.contains(&call),
+            "the computed flag must actually drive the copy"
+        );
+    }
+
+    /// The full truth table for the searching predicate, including the
+    /// polarity a source scrape cannot see. Flipping `!=` to `==` in
+    /// `empty_pane_is_searching` inverts #52 — the bare newcomer welcome shows
+    /// DURING recovery and the spinner shows after it finished — and this is
+    /// the test that catches it.
+    #[test]
+    fn the_searching_predicate_has_the_right_polarity() {
+        use super::empty_pane_is_searching;
+        use crate::state::SiteDiscovery::{Pending, Settled};
+
+        // The #52 case: nothing to show yet and discovery still running.
+        assert!(
+            empty_pane_is_searching(false, Pending),
+            "no sites and discovery outstanding is precisely when we must say \
+             we are still looking"
+        );
+
+        // Discovery finished and found nothing: the newcomer welcome is now
+        // honest.
+        assert!(
+            !empty_pane_is_searching(false, Settled),
+            "once discovery has settled, an empty list honestly means no sites"
+        );
+
+        // Sites present: this pane renders when none is selected, and claiming
+        // to search beside a populated sidebar is nonsense.
+        assert!(!empty_pane_is_searching(true, Pending));
+        assert!(!empty_pane_is_searching(true, Settled));
+    }
+
+    /// The single most safety-critical line in this change, and otherwise
+    /// uncovered: without the `rerun-if-changed` directive, Cargo reuses cached
+    /// build-script output and the bundle ships a STALE migration table, so the
+    /// startup sweep never asks the delegate holding a returning user's data.
+    ///
+    /// This is a source scrape and is labelled as one. It catches deletion of
+    /// the directive; it cannot detect a bundle that already shipped stale.
+    /// A stronger consistency check — comparing the baked-in `LEGACY_DELEGATES`
+    /// against the file on disk — belongs with the wider build-input work and
+    /// may supersede this. Until then this PR does not leave its own core fix
+    /// unguarded on `main`.
+    #[test]
+    fn the_migration_table_is_declared_as_a_build_input() {
+        let src = include_str!("../build.rs");
+        let needle = format!(
+            "{}{}",
+            "cargo:rerun-if-changed=../legacy_", "delegates.toml"
+        );
+        assert!(
+            src.contains(&needle),
+            "ui/build.rs bakes legacy_delegates.toml into the bundle but does \
+             not declare it as a build input, so an edited migration registry \
+             will not invalidate the cached build script and the bundle will \
+             ship a stale table"
+        );
+    }
+
+    /// Without this call the 90 s hard stop never arms, so a node whose
+    /// delegate never answers leaves the user on "Looking for your sites"
+    /// forever. The call is in `App`'s mount effect, which no host test can
+    /// run, so deleting it compiles clean and leaves every other test green.
+    /// Needle assembled at runtime.
+    #[test]
+    fn the_discovery_hard_fallback_is_armed_at_startup() {
+        let src = include_str!("components.rs");
+        let needle = format!("{}{}", "arm_discovery_", "fallback()");
+        assert!(
+            src.contains(&needle),
+            "App must arm the discovery hard fallback at startup, or a node \
+             that never answers pins the user on the searching state forever"
+        );
+    }
+
+    #[test]
+    fn the_searching_copy_says_data_is_not_lost() {
+        // The specific harm in #52 is the data-loss impression, so the copy has
+        // to contradict it explicitly rather than just being vaguely busy.
+        let (heading, body) = empty_pane_copy(true);
+        let text = format!("{heading} {body}").to_lowercase();
+        assert!(
+            text.contains("earlier version") || text.contains("previous version"),
+            "must explain that sites are being recovered from an earlier version: {text}"
+        );
+        assert!(
+            text.contains("nothing has been lost"),
+            "must state outright that nothing is lost: {text}"
+        );
     }
 }

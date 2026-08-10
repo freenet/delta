@@ -1907,6 +1907,45 @@ mod tests {
         assert_eq!(a.pages[&1].content, "a");
     }
 
+    /// Same mechanism, same reasoning, as
+    /// `the_baked_delegate_registry_matches_the_file_on_disk` in `delegate.rs`:
+    /// `include_str!` is tracked by rustc's dep-info independently of the build
+    /// script's fingerprint, so a stale or empty bake of
+    /// `LEGACY_CONTRACT_HASHES` goes red here. A build-script assertion cannot
+    /// catch staleness, because in the stale case the script does not run.
+    ///
+    /// A stale contract table means sites whose stored `contract_key_b58` is
+    /// missing or refers to a hash no longer on the network lose their
+    /// multi-hop migration fallback, so their state is simply not found.
+    ///
+    /// Same two limitations as the delegate pin: a genuinely cold build cannot
+    /// be stale, though CI is routinely WARM (`ci.yml` caches `target` with
+    /// `restore-keys`), so this does have teeth there; and it observes the host
+    /// bake, while `dx build --release` uses a separate wasm32 fingerprint and
+    /// `OUT_DIR` — strong evidence about the shipped artifact, not a direct
+    /// check of it.
+    #[test]
+    fn the_baked_contract_registry_matches_the_file_on_disk() {
+        let toml = include_str!("../../../legacy_contracts.toml");
+        let declared = toml.lines().filter(|l| l.trim() == "[[entry]]").count();
+
+        assert!(
+            declared > 0,
+            "legacy_contracts.toml declares no entries at all — this registry \
+             is append-only and can never legitimately be empty"
+        );
+        assert_eq!(
+            LEGACY_CONTRACT_HASHES.len(),
+            declared,
+            "the baked-in contract table has {} entries but \
+             legacy_contracts.toml declares {}. The bundle would ship a STALE \
+             or EMPTY table and the multi-hop state-migration fallback would \
+             silently stop finding older generations.",
+            LEGACY_CONTRACT_HASHES.len(),
+            declared
+        );
+    }
+
     #[test]
     fn newest_legacy_contract_id_is_the_last_entry_and_excludes_current() {
         // The self-heal re-probe must target the newest legacy generation
