@@ -28,7 +28,13 @@ struct LegacyEntry {
     code_hash: String,
 }
 
+/// `deny_unknown_fields` for the same reason as [`LegacyDelegates`]: `entry` is
+/// `#[serde(default)]`, so a renamed section would otherwise deserialize to an
+/// empty list. The emptiness assert does catch that, but reports it as "zero
+/// entries" and points the reader at the file's contents rather than at the
+/// renamed key, which is the actual fault.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LegacyContracts {
     #[serde(default)]
     entry: Vec<LegacyContractEntry>,

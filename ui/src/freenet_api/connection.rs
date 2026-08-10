@@ -92,6 +92,16 @@ pub fn connect_to_freenet() {
                 let msg = format!("WebSocket creation failed: {e:?}");
                 web_sys::console::error_1(&msg.clone().into());
                 *CONNECTION_STATUS.write() = ConnectionStatus::Error(msg);
+                // Without this the retry chain terminates permanently here and
+                // the app is dead until the user refreshes. That is worse than
+                // it looks, because the whole value of
+                // `reset_legacy_migration_for_reconnect` below rests on the
+                // premise that a reconnect WILL happen: the reset reopens
+                // discovery and arms a fresh fallback, and if construction then
+                // fails on the retry, the user waits out the 90 s deadline and
+                // is shown the newcomer welcome with a dead socket and a sweep
+                // that never re-ran (#52).
+                schedule_reconnect();
                 return;
             }
         };
@@ -224,6 +234,34 @@ mod tests {
             branch.contains(&needle),
             "the no-gateway branch must settle discovery before returning, or \
              the user waits out the hard fallback staring at a spinner"
+        );
+    }
+
+    /// Every path that gives up on a socket must schedule a retry.
+    ///
+    /// `reset_legacy_migration_for_reconnect` only has value if a reconnect
+    /// actually happens — it reopens discovery and arms a fresh 90 s deadline
+    /// on the promise of one. A branch that returns without scheduling
+    /// terminates the chain permanently, so the user waits out the deadline
+    /// and gets the newcomer welcome with a dead socket.
+    #[test]
+    fn every_giving_up_path_schedules_a_reconnect() {
+        let src = include_str!("connection.rs");
+        let needle = format!("{}{}", "schedule_", "reconnect()");
+
+        let start = src
+            .find(&format!("{}{}", "web_sys::WebSocket::", "new(&ws_url)"))
+            .expect("connect_to_freenet must construct the socket");
+        let rest = &src[start..];
+        let branch = &rest[..rest
+            .find("};")
+            .expect("the construction match must be brace-terminated")];
+
+        assert!(
+            branch.contains(&needle),
+            "the WebSocket construction failure branch must schedule a \
+             reconnect; without it the retry chain ends and the discovery \
+             reset it feeds is built on a promise that is never kept"
         );
     }
 

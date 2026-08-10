@@ -1564,11 +1564,21 @@ mod tests {
     /// re-ran. That asymmetry IS the mechanism: it goes red on a stale bake and
     /// on an empty one.
     ///
-    /// Honest limitation: a cold build always runs the build script, so this
-    /// cannot be stale (and cannot fail) in CI or a fresh clone. Its
-    /// discriminating power is on warm incremental builds — which is exactly
-    /// where the bug bites, since `cargo make publish-delta` runs locally
-    /// against a warm `target/`.
+    /// Two limitations, stated precisely because an earlier version of this
+    /// comment understated the test's reach in its own favour:
+    ///
+    /// - A genuinely cold build always runs the build script, so this cannot
+    ///   be stale there. That does NOT mean it is toothless in CI: `ci.yml`
+    ///   caches `target` with `restore-keys: ${{ runner.os }}-cargo-`, so CI
+    ///   runs are routinely warm and the pin does have teeth. Its power is
+    ///   greatest on warm incremental builds — including the local
+    ///   `cargo make publish-delta` against a warm `target/`, which is where
+    ///   the bug actually bites.
+    /// - It observes the HOST bake. `dx build --release` compiles for
+    ///   wasm32-unknown-unknown, which has its own fingerprint and its own
+    ///   `OUT_DIR`, so a host bake being fresh is strong evidence rather than
+    ///   a direct check of the shipped artifact. Nothing here inspects the
+    ///   published bundle.
     #[test]
     fn the_baked_delegate_registry_matches_the_file_on_disk() {
         let toml = include_str!("../../../legacy_delegates.toml");

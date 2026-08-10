@@ -1917,6 +1917,13 @@ mod tests {
     /// A stale contract table means sites whose stored `contract_key_b58` is
     /// missing or refers to a hash no longer on the network lose their
     /// multi-hop migration fallback, so their state is simply not found.
+    ///
+    /// Same two limitations as the delegate pin: a genuinely cold build cannot
+    /// be stale, though CI is routinely WARM (`ci.yml` caches `target` with
+    /// `restore-keys`), so this does have teeth there; and it observes the host
+    /// bake, while `dx build --release` uses a separate wasm32 fingerprint and
+    /// `OUT_DIR` — strong evidence about the shipped artifact, not a direct
+    /// check of it.
     #[test]
     fn the_baked_contract_registry_matches_the_file_on_disk() {
         let toml = include_str!("../../../legacy_contracts.toml");

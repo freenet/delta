@@ -423,30 +423,38 @@ mod tests {
         //
         // Needles are assembled at runtime so this test's own text cannot
         // satisfy them.
-        let src = include_str!("components.rs");
+        // Whitespace is stripped before matching, per house convention: the
+        // needles otherwise break on a rustfmt rewrap of unrelated code.
+        let src: String = include_str!("components.rs")
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
 
-        let marker = format!("{}{}", "let search", "ing =");
+        let marker = format!("{}{}", "letsearch", "ing=");
         let start = src
             .find(&marker)
             .expect("`App` must compute a `searching` flag for the empty pane");
-        let rest = &src[start..];
-        let assignment = &rest[..rest
+        let rhs = &src[start + marker.len()..];
+        let rhs = &rhs[..rhs
             .find(';')
             .expect("the `searching` assignment must be `;`-terminated")];
 
-        let predicate = format!("{}{}", "empty_pane_is_", "searching(has_sites,");
+        // STARTS WITH, not contains. `contains` admits a leading `!`, which
+        // inverts the entire fix while leaving the scrape green — the same
+        // hole this test was written to close, one level up.
+        let predicate = format!("{}{}", "empty_pane_is_", "searching(");
         assert!(
-            assignment.contains(&predicate),
-            "the value `searching` must come from the unit-tested predicate, \
-             not be recomputed inline where its polarity is untestable; \
-             found: {assignment:?}"
+            rhs.starts_with(&predicate),
+            "`searching` must be exactly the unit-tested predicate, with no \
+             wrapping or negation — a leading `!` inverts the fix and the \
+             truth table cannot see it; found: {rhs:?}"
         );
 
         let needle = format!("{}{}", "state::SITE_", "DISCOVERY.read()");
         assert!(
-            assignment.contains(&needle),
+            rhs.contains(&needle),
             "the discovery state must flow INTO the predicate, not merely be \
-             read alongside it; found: {assignment:?}"
+             read alongside it; found: {rhs:?}"
         );
 
         let call = format!("{}{}", "empty_pane_", "copy(searching)");
