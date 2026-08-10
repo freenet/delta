@@ -68,6 +68,19 @@ fn generate_build_info() {
 
 fn generate_legacy_delegates() {
     let toml_path = Path::new("..").join("legacy_delegates.toml");
+    // Load-bearing, and it was missing while the equivalent line in
+    // `generate_legacy_contracts` was present. Without it, Cargo re-runs this
+    // script only when build.rs or the git HEAD/index changes — and
+    // `add-migration.sh` edits this file WITHOUT staging it, so the very act
+    // that records a new migration entry does not invalidate the build script.
+    // The bundle then ships a STALE legacy-delegate table: the outgoing
+    // delegate is missing from it, the sweep never asks the delegate that
+    // holds the user's data, and every returning user gets a permanently
+    // empty "Welcome to Delta" screen. That is a far better fit for the
+    // "minutes, or never" recovery reported in #52 than any latency in the
+    // startup sequence — a bundle built this way was observed doing exactly
+    // that, with `LEGACY_DELEGATES` baked in as an empty list.
+    println!("cargo:rerun-if-changed=../legacy_delegates.toml");
 
     let toml_content = match fs::read_to_string(&toml_path) {
         Ok(c) => c,
@@ -89,6 +102,18 @@ fn generate_legacy_delegates() {
 
     let parsed: LegacyDelegates =
         toml::from_str(&toml_content).expect("Failed to parse legacy_delegates.toml");
+
+    // `entry` is `#[serde(default)]`, so a table that fails to match the
+    // expected shape — a renamed section, a restructured file — deserializes to
+    // an EMPTY list with no error at all. Shipping that is silent, total
+    // migration failure: the sweep asks nobody, and every returning user sees a
+    // permanently empty "Welcome to Delta". Fail the build instead.
+    assert!(
+        !(parsed.entry.is_empty() && toml_content.contains("[[entry]]")),
+        "legacy_delegates.toml contains [[entry]] sections but none deserialized — \
+         the migration table would ship EMPTY and every user's sites would be \
+         unrecoverable. Check the file's structure against `struct LegacyEntry`."
+    );
 
     let mut code = String::new();
     code.push_str(

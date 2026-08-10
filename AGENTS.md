@@ -118,29 +118,32 @@ would appear to fail.
 Any change to the KnownSites response handler must preserve both rules;
 the `filter_applicable_tombstones` unit tests pin them.
 
-**Ordering invariant: a legacy KnownSites response is never applied
-before the current delegate's** (`handle_delegate_response` /
-`release_buffered_legacy_responses`). Both rules above are stated in
-terms of "once the current delegate has responded", so applying a legacy
-reply first inverts them: the legacy delegate still lists a site the user
-removed under the current delegate as a live record, and no tombstone is
-known yet to suppress it.
+**Ordering invariant: the legacy sweep is not started until the current
+delegate's KnownSites response has arrived** (`fire_legacy_migration` is
+called from that arm, and nowhere else). Both rules above are stated in
+terms of "once the current delegate has responded", so a legacy reply
+applied first inverts them: the legacy delegate still lists a site the
+user removed under the current delegate as a live record, and no
+tombstone is known yet to suppress it.
 
-Since #52 the legacy sweep is DISPATCHED at delegate registration rather
-than after the current delegate replies — Delta re-keys its delegate on
-essentially every release, and waiting on a request that answers "nothing
-here" by definition put a multi-second stall in front of the only request
-that can find a returning user's sites. The invariant is preserved by
-buffering legacy RESPONSES, not by delaying legacy REQUESTS.
+#52 proposed dispatching the sweep at registration instead, to take it
+off the critical path, with legacy responses buffered to preserve the
+ordering. **Do not do this without new evidence.** Measured on a live
+node across 7 re-keys, the gap it removes is 188-355 ms (cold wasmtime
+compilation of the freshly re-keyed delegate; a warm reload is 66 ms),
+the node answers delegate ops serially so early-dispatched probes queue
+behind that same compile, and the ordering rule means their results
+cannot be applied any sooner anyway — a measured saving of about 50 ms,
+against total time-to-site of well under 1.1 s.
 
-Do NOT release that buffer on a timer. An earlier attempt did, so that a
-pathologically slow current delegate could not hold the sites hostage;
-review found it unsafe. `save_known_sites()` has seven call sites,
-including one the contract-migration sweep reaches with no user action at
-all, and `StoreKnownSites` is a full overwrite of the delegate's stored
-record — so any of them firing inside such a window writes the merged
-list back WITHOUT the current delegate's tombstones and permanently
-resurrects a removed site. The user-visible half of #52 is handled by
+A first attempt also released the buffer on a 2 s deadline, so a slow
+current delegate could not hold the sites hostage. Review found that
+unsafe: `save_known_sites()` has seven call sites, including one the
+contract-migration sweep reaches with no user action at all, and
+`StoreKnownSites` is a full overwrite of the delegate's stored record —
+so any of them firing inside such a window writes the merged list back
+WITHOUT the current delegate's tombstones and permanently resurrects a
+removed site. The user-visible half of #52 is handled by
 `state::SiteDiscovery` instead, which never touches stored data.
 
 ## Reproducible WASM Builds
@@ -214,10 +217,21 @@ When `site_delegate.wasm` changes, the delegate key changes and stored secrets (
 Migration entries in `legacy_delegates.toml` allow the UI to read from old delegate keys:
 1. Before changing delegate code: `./scripts/add-migration.sh VERSION "description"`
 2. Rebuild: `./scripts/sync-wasm.sh`
-3. On startup — immediately after `register_delegate` succeeds, NOT after the current delegate replies — the UI sends GetPublicKey, GetKnownSites, GetSigningKey to every legacy delegate, newest generation first (`legacy_probe_order`, since the delegate immediately preceding the current one is the one that almost always holds the data)
-4. Legacy responses are held until the current delegate's own KnownSites reply lands, then applied in arrival order — see the ordering invariant under "Known-Sites Tombstone Convention"
-5. When legacy KnownSites is applied, GetSiteState is also requested for each prefix from that legacy delegate
-6. If an old delegate responds, signing keys, known sites, and site state backups are migrated to the current delegate
+3. Once the current delegate's KnownSites response arrives (see the ordering invariant under "Known-Sites Tombstone Convention"), the UI sends GetPublicKey, GetKnownSites, GetSigningKey to each legacy delegate. **The send order is load-bearing, not cosmetic:** with an empty current delegate the first non-empty legacy reply latches `CURRENT_SITES_LOADED` and calls `save_known_sites()`, after which `skip_older_legacy` discards every remaining generation bar the newest — so send order decides whose view is persisted. Reordering the sweep is a change to stored data and needs its own tests.
+4. When legacy KnownSites arrives, GetSiteState is also requested for each prefix from that legacy delegate
+5. If an old delegate responds, signing keys, known sites, and site state backups are migrated to the current delegate
+
+**`legacy_delegates.toml` is baked into the UI at build time** by
+`ui/build.rs`, which declares `cargo:rerun-if-changed` on it. That
+directive is load-bearing and was once missing: `add-migration.sh` edits
+the file without staging it, so without it Cargo reuses the cached build
+script output and the bundle ships a STALE migration table — the outgoing
+delegate absent from it, the sweep never asking the delegate that holds
+the user's data, and every returning user landing on a permanently empty
+"Welcome to Delta". The `entry` field is `#[serde(default)]`, so a
+structural mismatch yields an EMPTY table with no error at all; a build
+assertion now fails the build if the file has `[[entry]]` sections and
+none deserialize.
 
 **CRITICAL: Every delegate storage key type must be migrated.** The
 legacy migration in `fire_legacy_migration()` and the KnownSites handler

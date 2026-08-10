@@ -48,24 +48,20 @@ static CURRENT_SITES_LOADED: GlobalSignal<bool> = GlobalSignal::new(|| false);
 /// Used to resolve race: PublicKey may arrive before KnownSites creates the site entry.
 static OWNER_PREFIXES: GlobalSignal<Vec<String>> = GlobalSignal::new(Vec::new);
 
-/// Whether the legacy-delegate sweep has already been dispatched. It fires
-/// once per page load, immediately after the delegate is registered.
+/// Whether legacy migration has already been fired. Deferring legacy queries
+/// until the current delegate's KnownSites response arrives guarantees that
+/// a legacy response cannot race ahead of the current one and resurrect
+/// deleted sites. Fires once per page load, unless a dropped connection resets
+/// it (see [`reset_legacy_migration_for_reconnect`]).
 static LEGACY_MIGRATION_FIRED: GlobalSignal<bool> = GlobalSignal::new(|| false);
 
 /// Whether the CURRENT delegate's `KnownSites` reply has arrived.
 ///
-/// This is the gate on applying anything a legacy delegate said. Distinct from
-/// [`CURRENT_SITES_LOADED`], which means "the current delegate answered AND held
-/// state" and can also be set by a legacy contribution; this one is purely "did
-/// the current delegate answer yet", which is what the ordering rule actually
-/// depends on.
+/// Distinct from [`CURRENT_SITES_LOADED`], which means "the current delegate
+/// answered AND held state" and can also be set by a legacy contribution. This
+/// one is purely "did the current delegate answer yet", which is what tells the
+/// UI whether an empty site list means "none" or "not found yet" (#52).
 static CURRENT_KNOWN_SITES_ANSWERED: GlobalSignal<bool> = GlobalSignal::new(|| false);
-
-/// Legacy-delegate responses that arrived before the current delegate's reply.
-/// Replayed in arrival order once it lands. Bounded by the number of requests
-/// the sweep issues (3 per legacy generation), so it cannot grow without limit.
-static BUFFERED_LEGACY_RESPONSES: GlobalSignal<Vec<(DelegateKey, Vec<OutboundDelegateMsg>)>> =
-    GlobalSignal::new(Vec::new);
 
 // Tombstones let us persist removed prefixes across refreshes WITHOUT
 // changing the delegate WASM schema — the delegate just stores/returns
@@ -98,32 +94,27 @@ pub fn register_delegate() {
                     Ok(_) => {
                         log("Delta: delegate registered");
                         drop(api);
-                        // Load persisted data AND start the legacy sweep in the
-                        // same breath (#52).
+                        // Load persisted data. Legacy migration is deferred
+                        // until the current delegate's KnownSites response
+                        // arrives (see the KnownSites arm of
+                        // handle_delegate_response) — otherwise a legacy
+                        // response could race ahead and resurrect sites the
+                        // user removed.
                         //
-                        // This used to wait for the current delegate's
-                        // KnownSites reply before even asking the legacy
-                        // delegates anything. Delta re-keys its delegate on
-                        // essentially every release, so on a returning user's
-                        // first load after an upgrade that reply is "nothing
-                        // here" BY DEFINITION — the delegate was created
-                        // moments ago — and every millisecond spent waiting for
-                        // it was pure latency in front of the only request that
-                        // could actually find the user's sites.
-                        //
-                        // The ordering guarantee that gating bought (a legacy
-                        // reply must not be applied before the current
-                        // delegate's, or a site the user removed can be
-                        // resurrected) is preserved EXACTLY, by buffering legacy
-                        // RESPONSES instead of delaying legacy REQUESTS — see
-                        // `release_buffered_legacy_responses`. What is saved is
-                        // a whole round trip: the legacy replies are already
-                        // back, or nearly so, at the moment the current
-                        // delegate answers, instead of only being asked for
-                        // then.
+                        // #52 proposed dispatching the sweep here instead, to
+                        // take it off the critical path. Measured on a live
+                        // node, it does not pay: the gap between this point and
+                        // the current delegate's reply is 188-355 ms (cold
+                        // wasmtime compilation of the freshly re-keyed
+                        // delegate), the node answers delegate ops serially so
+                        // early-dispatched legacy probes queue behind that same
+                        // compile anyway, and the ordering rule means their
+                        // results cannot be APPLIED any earlier regardless. The
+                        // measured saving was ~50 ms, against a buffering
+                        // mechanism in the one code path where a mistake
+                        // silently destroys user data. Not worth it.
                         request_public_key();
                         load_known_sites();
-                        fire_legacy_migration();
                     }
                     Err(e) => log(&format!("Delta: delegate registration failed: {e:?}")),
                 }
@@ -401,84 +392,9 @@ fn is_newest_legacy_delegate(responding_key: &DelegateKey) -> bool {
     key_matches && hash_matches
 }
 
-/// Which delegate a response came from, and whether the current delegate has
-/// already replied. A named struct rather than two `bool` arguments because the
-/// two are trivially transposable at a call site and the resulting inversion
-/// would silently disable the ordering rule while still compiling.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ResponseOrdering {
-    is_legacy: bool,
-    current_delegate_answered: bool,
-}
-
-/// Whether a delegate response must be held back rather than applied now.
-///
-/// Only LEGACY responses are ever buffered, and only until the current delegate
-/// replies. The current delegate's own responses are always applied
-/// immediately — buffering one would deadlock the buffer, since its arrival is
-/// the only thing that releases it.
-fn should_buffer_legacy_response(ordering: ResponseOrdering) -> bool {
-    ordering.is_legacy && !ordering.current_delegate_answered
-}
-
-/// Handle a delegate response — route signed objects to the network.
-///
-/// Legacy responses are buffered until the current delegate's `KnownSites`
-/// reply lands. Before #52 the same ordering was achieved by not SENDING the
-/// legacy requests until then; buffering the responses instead means the
-/// requests are already in flight — and usually already answered — at that
-/// moment, which removes a whole serial round trip while leaving the order in
-/// which results are APPLIED exactly as it was.
-pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<OutboundDelegateMsg>) {
-    let is_legacy = responding_key != current_delegate_key();
-    let ordering = ResponseOrdering {
-        is_legacy,
-        current_delegate_answered: *CURRENT_KNOWN_SITES_ANSWERED.read(),
-    };
-    if should_buffer_legacy_response(ordering) {
-        BUFFERED_LEGACY_RESPONSES.with_mut(|buf| buf.push((responding_key, values)));
-        return;
-    }
-    apply_delegate_response(responding_key, is_legacy, values);
-}
-
-/// Replay everything the legacy delegates said while we were waiting for the
-/// current delegate. Called once, from the current delegate's `KnownSites` arm.
-///
-/// The wait exists because a legacy `KnownSites` reply applied before the
-/// current delegate's can resurrect a site the user removed: the removal lives
-/// in the current delegate as a tombstone, while the older delegate still lists
-/// the site as a real record.
-///
-/// An earlier version of this change also released the buffer on a short
-/// deadline, so that a pathologically slow current delegate could not hold the
-/// user's sites hostage. That was withdrawn: `save_known_sites()` has seven call
-/// sites — including one the migration sweep reaches with no user action at all
-/// — and any of them firing during such a window writes the merged list back to
-/// the current delegate WITHOUT its tombstones, which is a full overwrite of the
-/// stored record and permanently resurrects a removed site. Releasing only on
-/// the current delegate's reply keeps the applied order, and therefore the
-/// persisted result, identical to the pre-#52 behaviour. The user-visible half
-/// of #52 is handled by [`state::SiteDiscovery`] instead, which does not touch
-/// stored data at all.
-fn release_buffered_legacy_responses() {
-    let buffered = BUFFERED_LEGACY_RESPONSES.with_mut(std::mem::take);
-    if !buffered.is_empty() {
-        log(&format!(
-            "Delta: applying {} legacy delegate response(s) that arrived while \
-             the current delegate was still answering",
-            buffered.len()
-        ));
-    }
-    for (key, values) in buffered {
-        apply_delegate_response(key, true, values);
-    }
-}
-
 /// How long to keep saying we are still looking after the current delegate has
-/// answered. Its reply is what releases the buffered legacy results, so the
-/// sites usually appear within milliseconds of it; this covers legacy replies
-/// that had not arrived by then.
+/// answered. Its reply is what starts the legacy sweep, so this has to cover
+/// the sweep's own round trip.
 #[cfg(target_arch = "wasm32")]
 const DISCOVERY_SETTLE_GRACE_MS: u64 = 6_000;
 
@@ -497,18 +413,12 @@ const DISCOVERY_SETTLE_FALLBACK_MS: u64 = 90_000;
 /// re-arming on every response would keep pushing the deadline out).
 static DISCOVERY_SETTLE_ARMED: GlobalSignal<bool> = GlobalSignal::new(|| false);
 
-/// True once startup discovery has reported and the UI may honestly say "you
-/// have no sites". Split out as a pure function so the condition is testable.
-fn discovery_ready_to_settle(current_delegate_answered: bool) -> bool {
-    current_delegate_answered
-}
-
 /// Arm the "discovery is over" timer once the current delegate has answered —
-/// which is also the moment every buffered legacy result is applied. Until
-/// discovery settles the UI shows a recovery message instead of the bare
-/// "Welcome to Delta" empty state (#52).
+/// which is also the moment the legacy sweep is dispatched. Until discovery
+/// settles the UI shows a recovery message instead of the bare "Welcome to
+/// Delta" empty state (#52).
 fn arm_discovery_settle_if_ready() {
-    if !discovery_ready_to_settle(*CURRENT_KNOWN_SITES_ANSWERED.read()) {
+    if !*CURRENT_KNOWN_SITES_ANSWERED.read() {
         return;
     }
     let already_armed = DISCOVERY_SETTLE_ARMED.with_mut(|armed| std::mem::replace(armed, true));
@@ -522,26 +432,20 @@ fn arm_discovery_settle_if_ready() {
     }
 }
 
-/// Forget that the legacy sweep ran, so the next successful registration
-/// re-dispatches it.
+/// Forget that the legacy sweep ran, so the next successful reconnect re-runs it.
 ///
-/// `register_delegate` now fires the sweep as soon as the RegisterDelegate frame
-/// is written, which proves nothing about the node having processed anything. If
-/// the socket then dies before the legacy replies come back, those replies are
-/// lost — and without this reset the reconnect would skip the sweep entirely
-/// (it is fire-once per page load), leaving a returning user with no way to
-/// recover short of a full reload. Called from the connection error handler.
+/// The sweep is fire-once per page load. If the socket dies after it was
+/// dispatched but before its replies came back, those replies are lost, and the
+/// reconnect's fresh `KnownSites` round would skip the sweep entirely — leaving
+/// a returning user with no route to their sites short of a full reload. Called
+/// from the connection error handler. Pre-existing; not introduced by #52.
 pub fn reset_legacy_migration_for_reconnect() {
     // Bind first: never hold a signal read guard while writing another.
     let fired = *LEGACY_MIGRATION_FIRED.read();
-    let answered = *CURRENT_KNOWN_SITES_ANSWERED.read();
-    if fired && !answered {
-        // Only worth re-running while the sweep's results have not yet been
-        // applied. Once the current delegate has answered and the buffer has
-        // been released, a re-probe would just duplicate work.
-        log("Delta: connection dropped before legacy discovery completed; will re-probe on reconnect");
+    let recovered_something = *CURRENT_SITES_LOADED.read();
+    if fired && !recovered_something {
+        log("Delta: connection dropped before legacy discovery produced anything; will re-probe on reconnect");
         *LEGACY_MIGRATION_FIRED.write() = false;
-        BUFFERED_LEGACY_RESPONSES.write().clear();
     }
 }
 
@@ -558,11 +462,9 @@ pub fn arm_discovery_fallback() {
     });
 }
 
-fn apply_delegate_response(
-    responding_key: DelegateKey,
-    is_legacy: bool,
-    values: Vec<OutboundDelegateMsg>,
-) {
+/// Handle a delegate response — route signed objects to the network.
+pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<OutboundDelegateMsg>) {
+    let is_legacy = responding_key != current_delegate_key();
     for msg in values {
         if let OutboundDelegateMsg::ApplicationMessage(app_msg) = msg {
             let response: DelegateResponse = match from_reader(app_msg.payload.as_slice()) {
@@ -793,14 +695,13 @@ fn apply_delegate_response(
                         }
                     }
 
+                    // Once the current delegate has responded, it is safe
+                    // to query legacy delegates: any legacy KnownSites
+                    // response is now either blocked (CURRENT_SITES_LOADED
+                    // is set) or merged into a fresh migration path.
                     if !is_legacy {
-                        // The current delegate has now spoken, so its removal
-                        // set is known and everything the legacy delegates said
-                        // can be applied against it — in exactly the order the
-                        // pre-#52 code would have applied it, because nothing
-                        // legacy has been applied before this point.
                         *CURRENT_KNOWN_SITES_ANSWERED.write() = true;
-                        release_buffered_legacy_responses();
+                        fire_legacy_migration();
                     }
                     arm_discovery_settle_if_ready();
                 }
@@ -1259,16 +1160,18 @@ fn fire_legacy_migration() {
             delta_core::DelegateRequest::GetSigningKey,
         ];
 
-        // Newest generation first (#52). Every probe is dispatched
-        // concurrently, so this does not change how long the sweep takes as a
-        // whole — but the delegate immediately preceding the current one is
-        // overwhelmingly the one actually holding the user's sites, and it is
-        // also the only legacy generation whose real records get unioned once
-        // the current delegate is authoritative (`is_newest_legacy_delegate`).
-        // Putting it at the head of the send queue makes it the most likely to
-        // answer first, which is the answer that ends the wait.
-        for i in legacy_probe_order(LEGACY_DELEGATES.len()) {
-            let (key_bytes, code_hash_bytes) = &LEGACY_DELEGATES[i];
+        // NOTE: the send order here is NOT cosmetic, despite looking it.
+        // Every probe is dispatched concurrently, so reordering buys no
+        // measurable time — but with an empty current delegate the FIRST
+        // non-empty legacy reply latches `CURRENT_SITES_LOADED` and calls
+        // `save_known_sites()`, after which `skip_older_legacy` discards every
+        // remaining generation bar the newest. Send order therefore decides
+        // which generation's view is persisted. #52 proposed reversing this to
+        // newest-first; that may well be an improvement (the newest generation
+        // is the one the reconciliation rules already treat as authoritative),
+        // but it is a change to stored data and belongs in its own change with
+        // its own tests, not smuggled in as a latency tweak.
+        for (i, (key_bytes, code_hash_bytes)) in LEGACY_DELEGATES.iter().enumerate() {
             for req in &requests {
                 let legacy_code_hash = CodeHash::new(*code_hash_bytes);
                 let legacy_delegate_key = DelegateKey::new(*key_bytes, legacy_code_hash);
@@ -1454,14 +1357,6 @@ fn log(msg: &str) {
     eprintln!("{msg}");
 }
 
-/// The order in which the legacy generations are probed: newest first.
-/// `LEGACY_DELEGATES` is oldest-first (it is appended to on every re-key), so
-/// the last entry is the delegate immediately preceding the current one, which
-/// is the one that almost always holds the returning user's sites.
-fn legacy_probe_order(len: usize) -> Vec<usize> {
-    (0..len).rev().collect()
-}
-
 /// Decide which tombstones from a KnownSites response should actually be
 /// applied to local state, given whether the response came from a legacy
 /// delegate, whether the current delegate has already been loaded, and
@@ -1605,112 +1500,22 @@ mod tests {
     // ---- freenet/delta#52: when discovery starts, and what it may apply ----
 
     #[test]
-    fn legacy_discovery_starts_at_registration_not_after_the_current_delegate_replies() {
-        // The whole point of #52. If `register_delegate` ever goes back to
-        // waiting for the current delegate's KnownSites reply before asking the
-        // legacy delegates anything, a returning user is once again staring at
-        // an empty screen for the duration of a request that answers "nothing
-        // here" by definition on a freshly re-keyed delegate.
-        //
-        // The needle is assembled at runtime so this test's own source text
-        // cannot satisfy the assertion via `include_str!`.
+    fn discovery_settling_is_gated_on_the_current_delegate_answering() {
+        // Until it answers, an empty site list means "not found yet", and
+        // saying "Welcome to Delta" is the data-loss impression #52 is about.
+        // `arm_discovery_settle_if_ready` is not host-callable (it arms a wasm
+        // timer), so pin its guard at the source level; the needle is assembled
+        // at runtime so this test cannot satisfy itself via `include_str!`.
         let src = include_str!("delegate.rs");
         let body = src
-            .split("pub fn register_delegate()")
+            .split("fn arm_discovery_settle_if_ready()")
             .nth(1)
-            .expect("register_delegate must exist");
-        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
-        let needle = format!("{}{}", "fire_legacy_", "migration();");
+            .expect("arm_discovery_settle_if_ready must exist");
+        let body = &body[..body.find("\n}\n").expect("body must be brace-bounded")];
+        let needle = format!("{}{}", "!*CURRENT_KNOWN_SITES_", "ANSWERED.read()");
         assert!(
             body.contains(&needle),
-            "register_delegate must dispatch the legacy sweep itself, not defer it \
-             to the current delegate's KnownSites handler"
-        );
-    }
-
-    #[test]
-    fn a_legacy_response_is_buffered_until_the_current_delegate_answers() {
-        let case = |is_legacy, current_delegate_answered| {
-            should_buffer_legacy_response(ResponseOrdering {
-                is_legacy,
-                current_delegate_answered,
-            })
-        };
-        assert!(case(true, false), "this is the whole ordering rule");
-        assert!(!case(true, true));
-        // Buffering the current delegate's own response would deadlock the
-        // buffer — its arrival is the only thing that releases it.
-        assert!(!case(false, false));
-        assert!(!case(false, true));
-    }
-
-    #[test]
-    fn the_ordering_flags_cannot_be_transposed_at_the_call_site() {
-        // `should_buffer_legacy_response` used to take two bare `bool`s, which
-        // a call site can silently swap — inverting the gate while still
-        // compiling, with every unit test green. The named struct makes that a
-        // type error; this pins that the struct is what the call site builds.
-        let src = include_str!("delegate.rs");
-        let handler = src
-            .split("pub fn handle_delegate_response(")
-            .nth(1)
-            .expect("handle_delegate_response must exist");
-        let handler = &handler[..handler
-            .find("\n}\n")
-            .expect("handle_delegate_response body must be brace-bounded")];
-        let needle = format!("{}{}", "Response", "Ordering {");
-        assert!(
-            handler.contains(&needle),
-            "handle_delegate_response must build the ordering with named fields"
-        );
-    }
-
-    #[test]
-    fn discovery_settles_only_once_the_current_delegate_has_answered() {
-        // Until then an empty site list means "not found yet", and saying
-        // "Welcome to Delta" is the data-loss impression #52 is about.
-        assert!(!discovery_ready_to_settle(false));
-        assert!(discovery_ready_to_settle(true));
-    }
-
-    #[test]
-    fn legacy_generations_are_probed_newest_first() {
-        // `LEGACY_DELEGATES` is oldest-first, so newest-first means descending
-        // index. The newest legacy delegate is the one that almost always holds
-        // a returning user's sites.
-        assert_eq!(legacy_probe_order(4), vec![3, 2, 1, 0]);
-        assert_eq!(legacy_probe_order(1), vec![0]);
-        assert!(legacy_probe_order(0).is_empty());
-
-        // And it really is the last table entry that `is_newest_legacy_delegate`
-        // privileges, so probing in this order front-loads that generation.
-        let order = legacy_probe_order(LEGACY_DELEGATES.len());
-        let first = order.first().expect("legacy table must be populated");
-        let (key, hash) = &LEGACY_DELEGATES[*first];
-        assert!(is_newest_legacy_delegate(&DelegateKey::new(
-            *key,
-            CodeHash::new(*hash)
-        )));
-    }
-
-    #[test]
-    fn the_sweep_actually_uses_the_newest_first_order() {
-        // `fire_legacy_migration`'s body is `#[cfg(target_arch = "wasm32")]`, so
-        // reverting its loop to plain `.enumerate()` would compile, leave
-        // `legacy_probe_order` used only by its own test (no dead-code warning),
-        // and keep every host test green. Pin the call site.
-        let src = include_str!("delegate.rs");
-        let body = src
-            .split("fn fire_legacy_migration()")
-            .nth(1)
-            .expect("fire_legacy_migration must exist");
-        let body = &body[..body
-            .find("\n}\n")
-            .expect("fire_legacy_migration body must be brace-bounded")];
-        let needle = format!("{}{}", "legacy_probe_", "order(");
-        assert!(
-            body.contains(&needle),
-            "the sweep must iterate via legacy_probe_order, not the raw table order"
+            "the settle timer must not be armed before the current delegate has answered"
         );
     }
 
