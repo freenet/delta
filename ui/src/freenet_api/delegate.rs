@@ -420,6 +420,44 @@ const DISCOVERY_SETTLE_FALLBACK_MS: u64 = 90_000;
 /// re-arming on every response would keep pushing the deadline out).
 static DISCOVERY_SETTLE_ARMED: GlobalSignal<bool> = GlobalSignal::new(|| false);
 
+/// Monotonic id of the current discovery round.
+///
+/// Settle timers are `spawn_local` tasks with no cancellation handle, so the
+/// only way to retire one is to make it check on wake whether it still belongs
+/// to the round it was armed for. A reconnect starts a NEW round, and every
+/// timer from the old one must become a no-op.
+///
+/// Deliberately a plain atomic rather than a `GlobalSignal`: nothing renders
+/// from it (it is a cancellation token, not reactive state), and it must be
+/// readable from a plain `#[test]` so the arm/reset/fire sequence can actually
+/// be driven. A `GlobalSignal` needs a Dioxus runtime, which is why every other
+/// test around this code is either a pure function or a source scrape.
+static DISCOVERY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The round id a timer should stamp itself with as it arms.
+fn current_discovery_generation() -> u64 {
+    DISCOVERY_GENERATION.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Start a new discovery round, retiring every timer already in flight.
+fn begin_new_discovery_generation() {
+    DISCOVERY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether a timer armed for `armed_generation` may still settle discovery.
+///
+/// **Idempotence is the wrong property here.** `settle_site_discovery` is
+/// idempotent, so double-settling is harmless — but that says nothing about
+/// WHICH round a callback belongs to. Without this check, a grace timer armed
+/// before a socket drop wakes up mid-way through the SECOND sweep and settles
+/// it, putting the bare "Welcome to Delta" back on screen during recovery: the
+/// exact screen this change exists to remove, in the exact scenario the
+/// reconnect path exists to handle. The 90 s fallback has the same shape, and
+/// because the reset arms a fresh one, a flapping socket accumulates them.
+fn settle_timer_may_fire(armed_generation: u64) -> bool {
+    armed_generation == current_discovery_generation()
+}
+
 /// Arm the "discovery is over" timer once the current delegate has answered —
 /// which is also the moment the legacy sweep is dispatched. Until discovery
 /// settles the UI shows a recovery message instead of the bare "Welcome to
@@ -430,11 +468,16 @@ fn arm_discovery_settle_if_ready() {
     }
     let already_armed = DISCOVERY_SETTLE_ARMED.with_mut(|armed| std::mem::replace(armed, true));
     if !already_armed {
+        let generation = current_discovery_generation();
+        #[cfg(not(target_arch = "wasm32"))]
+        let _ = generation;
         #[cfg(target_arch = "wasm32")]
-        wasm_bindgen_futures::spawn_local(async {
+        wasm_bindgen_futures::spawn_local(async move {
             gloo_timers::future::sleep(std::time::Duration::from_millis(DISCOVERY_SETTLE_GRACE_MS))
                 .await;
-            state::settle_site_discovery();
+            if settle_timer_may_fire(generation) {
+                state::settle_site_discovery();
+            }
         });
     }
 }
@@ -472,24 +515,48 @@ pub fn reset_legacy_migration_for_reconnect() {
         *CURRENT_KNOWN_SITES_ANSWERED.write() = false;
         *DISCOVERY_SETTLE_ARMED.write() = false;
         state::reopen_site_discovery();
-        // The page-load fallback has very likely already fired by now, and a
-        // reopened discovery with no deadline would strand the spinner if the
-        // second sweep also fails. Arm a fresh one. Extra timers are harmless:
-        // settling is idempotent.
+
+        // ORDER MATTERS. Start the new round FIRST, so every timer still
+        // sleeping from the previous one is retired before anything new is
+        // armed. Reversed, the fresh fallback below would stamp itself with the
+        // OLD round and retire itself an instant later.
+        //
+        // This is not belt-and-braces. Without it, the grace timer armed before
+        // the socket dropped wakes during the SECOND sweep and settles it,
+        // showing the bare "Welcome to Delta" mid-recovery — the screen this
+        // change removes, in the scenario this function handles. Note that
+        // "settling is idempotent" does NOT cover this: idempotence says
+        // nothing about which round a callback belongs to.
+        begin_new_discovery_generation();
+
+        // The page-load fallback has very likely fired by now, and a reopened
+        // discovery with no deadline would strand the spinner if the second
+        // sweep also fails. Arm a fresh one. Accumulating fallbacks across a
+        // flapping socket is harmless because each is stamped with its round
+        // and all but the current one no-op.
         arm_discovery_fallback();
     }
 }
 
 /// Arm the hard fallback that ends the "looking for your sites" state no matter
-/// what happens. Called once, from app start.
+/// what happens. Called from app start, and again whenever a reconnect starts a
+/// new discovery round.
+///
+/// Stamped with the round it was armed for, so a fallback left over from an
+/// earlier round cannot settle a later one.
 pub fn arm_discovery_fallback() {
+    let generation = current_discovery_generation();
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = generation;
     #[cfg(target_arch = "wasm32")]
-    wasm_bindgen_futures::spawn_local(async {
+    wasm_bindgen_futures::spawn_local(async move {
         gloo_timers::future::sleep(std::time::Duration::from_millis(
             DISCOVERY_SETTLE_FALLBACK_MS,
         ))
         .await;
-        state::settle_site_discovery();
+        if settle_timer_may_fire(generation) {
+            state::settle_site_discovery();
+        }
     });
 }
 
@@ -1594,6 +1661,120 @@ mod tests {
         assert!(
             body.contains(&needle),
             "the settle timer must not be armed before the current delegate has answered"
+        );
+    }
+
+    /// Serialises the tests that mutate the process-global discovery
+    /// generation, so they cannot interfere with each other under the default
+    /// parallel test runner.
+    static GENERATION_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The race, driven end to end: arm a timer, reconnect, then let the old
+    /// timer fire.
+    ///
+    /// This is a real behavioural test, not a scrape — the generation counter
+    /// is a plain atomic precisely so the sequence is drivable without a Dioxus
+    /// runtime. Deleting the check in either timer makes the third assertion
+    /// meaningless, and mutating `settle_timer_may_fire` to `true` fails it
+    /// outright.
+    #[test]
+    fn a_timer_from_the_previous_round_cannot_settle_the_current_one() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        // t=0: the grace timer arms for the round in progress.
+        let armed_before_drop = current_discovery_generation();
+        assert!(
+            settle_timer_may_fire(armed_before_drop),
+            "a timer must be allowed to settle the round it was armed for"
+        );
+
+        // t=3s: socket drops, reconnect starts a new round.
+        begin_new_discovery_generation();
+
+        // t=6s: the ORIGINAL timer wakes. It must not settle the new round —
+        // doing so puts the bare "Welcome to Delta" back up mid-recovery.
+        assert!(
+            !settle_timer_may_fire(armed_before_drop),
+            "a timer armed before the reconnect must NOT settle the round that \
+             replaced it; settling is idempotent, but idempotence says nothing \
+             about which round a callback belongs to"
+        );
+
+        // A timer armed for the new round still works, or the spinner would
+        // never come down.
+        let armed_after_drop = current_discovery_generation();
+        assert!(
+            settle_timer_may_fire(armed_after_drop),
+            "the reconnect's own timers must still be able to settle"
+        );
+    }
+
+    /// A flapping socket must not resurrect an intermediate round either.
+    #[test]
+    fn only_the_newest_round_may_settle_after_repeated_flaps() {
+        let _guard = GENERATION_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let first = current_discovery_generation();
+        begin_new_discovery_generation();
+        let second = current_discovery_generation();
+        begin_new_discovery_generation();
+        let third = current_discovery_generation();
+
+        assert!(!settle_timer_may_fire(first));
+        assert!(!settle_timer_may_fire(second));
+        assert!(settle_timer_may_fire(third));
+    }
+
+    /// Both timers must consult the guard, and the reset must start the new
+    /// round BEFORE arming the replacement fallback.
+    ///
+    /// The behavioural tests above prove the predicate is right; they cannot
+    /// see whether the wasm-only timer bodies actually call it, nor the
+    /// ordering inside `reset_legacy_migration_for_reconnect`. Needles are
+    /// assembled at runtime.
+    #[test]
+    fn both_settle_timers_are_generation_guarded_and_the_reset_orders_correctly() {
+        let src = include_str!("delegate.rs");
+        let guard = format!("{}{}", "settle_timer_may_", "fire(generation)");
+
+        for func in [
+            "fn arm_discovery_settle_if_ready()",
+            "pub fn arm_discovery_fallback()",
+        ] {
+            let body = src.split(func).nth(1).unwrap_or_else(|| {
+                panic!("{func} must exist");
+            });
+            let body = &body[..body.find("\n}\n").expect("body must be brace-bounded")];
+            assert!(
+                body.contains(&guard),
+                "{func} arms a timer that outlives its round, so it must check \
+                 the generation before settling"
+            );
+        }
+
+        let reset = src
+            .split("pub fn reset_legacy_migration_for_reconnect()")
+            .nth(1)
+            .expect("reset must exist");
+        let reset = &reset[..reset.find("\n}\n").expect("body must be brace-bounded")];
+
+        let bump = format!("{}{}", "begin_new_discovery_", "generation()");
+        let rearm = format!("{}{}", "arm_discovery_", "fallback()");
+        let bump_at = reset
+            .find(&bump)
+            .expect("the reset must start a new discovery round");
+        let rearm_at = reset
+            .find(&rearm)
+            .expect("the reset must arm a replacement fallback");
+        assert!(
+            bump_at < rearm_at,
+            "the new round must start BEFORE the replacement fallback is armed, \
+             or the fallback stamps itself with the round it is replacing and \
+             retires itself immediately"
         );
     }
 
