@@ -45,6 +45,39 @@ pub static EDITOR_CONTENT: GlobalSignal<String> = GlobalSignal::new(String::new)
 /// Prevents network responses from re-adding them.
 pub static REMOVED_PREFIXES: GlobalSignal<Vec<String>> = GlobalSignal::new(Vec::new);
 
+/// How far the startup search for the user's sites has got.
+///
+/// Delta re-keys its delegate on essentially every release, so a returning
+/// user's first load after an upgrade finds the current delegate empty and has
+/// to recover the site list from a legacy delegate. While that is outstanding
+/// an empty `SITES` means "we have not found them yet", not "you have none" —
+/// and rendering the bare "Welcome to Delta" screen (the same one a brand-new
+/// user sees) is indistinguishable from total data loss. See freenet/delta#52.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SiteDiscovery {
+    /// Still looking. An empty site list must be presented as "searching".
+    Pending,
+    /// Finished. An empty site list now honestly means the user has no sites.
+    Settled,
+}
+
+pub static SITE_DISCOVERY: GlobalSignal<SiteDiscovery> =
+    GlobalSignal::new(|| SiteDiscovery::Pending);
+
+/// Mark startup discovery finished. Idempotent, and one-way: discovery never
+/// returns to `Pending`, so a later reconnect cannot put the "looking for your
+/// sites" message back up after the user has already been shown the real state.
+///
+/// Only ever called from wasm paths (delegate discovery / gateway detection),
+/// so the native build sees it as dead — same reason `PENDING_HASH` above is
+/// annotated.
+#[allow(dead_code)]
+pub fn settle_site_discovery() {
+    if *SITE_DISCOVERY.read() != SiteDiscovery::Settled {
+        *SITE_DISCOVERY.write() = SiteDiscovery::Settled;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Initialization
 // ---------------------------------------------------------------------------

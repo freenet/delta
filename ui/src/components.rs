@@ -26,6 +26,9 @@ pub fn App() -> Element {
         set_document_title("Delta");
         setup_hash_listener();
         freenet_api::connect_to_freenet();
+        // Hard stop on the "looking for your sites" state, so a node that never
+        // answers cannot leave it up forever (#52).
+        freenet_api::delegate::arm_discovery_fallback();
         state::init_from_hash();
     });
 
@@ -73,20 +76,32 @@ pub fn App() -> Element {
                         add_site_dialog::AddSiteDialog {}
                     }
                 } else if !has_sites || !has_current {
-                    // Welcome screen — no sites yet
-                    main { class: "flex-1 overflow-y-auto bg-panel",
-                        div { class: "flex items-center justify-center h-full",
-                            div { class: "text-center max-w-md mx-8",
-                                span { class: "delta-mark inline-flex mb-6 w-16 h-16 text-[32px] rounded-2xl", "\u{0394}" }
-                                h1 { class: "text-2xl font-semibold text-text mb-2", "Welcome to Delta" }
-                                p { class: "text-sm text-text-muted-light mb-8 leading-relaxed",
-                                    "Decentralized publishing on Freenet. Create your own site or visit one using a site code."
-                                }
-                                div { class: "flex gap-3 justify-center",
-                                    button {
-                                        class: "btn-primary px-6 py-3 text-sm",
-                                        onclick: move |_| state::show_add_site_prompt(),
-                                        "Get Started"
+                    // Nothing to show yet. Which of the two very different
+                    // reasons that is — "you have no sites" vs "we are still
+                    // recovering them from a previous version" — is decided by
+                    // `empty_pane_copy`. See freenet/delta#52.
+                    {
+                        let searching = *state::SITE_DISCOVERY.read() != state::SiteDiscovery::Settled;
+                        let (heading, body) = empty_pane_copy(searching);
+                        rsx! {
+                            main { class: "flex-1 overflow-y-auto bg-panel",
+                                div { class: "flex items-center justify-center h-full",
+                                    div { class: "text-center max-w-md mx-8",
+                                        span { class: "delta-mark inline-flex mb-6 w-16 h-16 text-[32px] rounded-2xl", "\u{0394}" }
+                                        div { class: "flex items-center justify-center gap-3 mb-2",
+                                            if searching {
+                                                div { class: "w-4 h-4 rounded-full border-2 border-text-muted-light border-t-transparent animate-spin" }
+                                            }
+                                            h1 { class: "text-2xl font-semibold text-text", "{heading}" }
+                                        }
+                                        p { class: "text-sm text-text-muted-light mb-8 leading-relaxed", "{body}" }
+                                        div { class: "flex gap-3 justify-center",
+                                            button {
+                                                class: "btn-primary px-6 py-3 text-sm",
+                                                onclick: move |_| state::show_add_site_prompt(),
+                                                "Get Started"
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -105,6 +120,38 @@ pub fn App() -> Element {
                 }
             }
         }
+    }
+}
+
+/// Heading and body copy for the empty main pane.
+///
+/// Delta re-keys its delegate on essentially every release, so after an upgrade
+/// a returning user's site list has to be recovered from a legacy delegate. If
+/// the bare "Welcome to Delta" screen is rendered during that window it is the
+/// exact screen a brand-new user sees, so it reads as total data loss — which
+/// once led a tester to file a false "migration is broken" report, and gives a
+/// real user no reason to wait rather than assume everything is gone
+/// (freenet/delta#52).
+///
+/// The searching variant deliberately keeps the "Get Started" button: a genuine
+/// first-time user must never be blocked behind a spinner just because we
+/// cannot yet prove they are one.
+///
+/// Split out of the component so the rule "never show the new-user copy while
+/// discovery is outstanding" is unit-testable.
+pub(crate) fn empty_pane_copy(searching: bool) -> (&'static str, &'static str) {
+    if searching {
+        (
+            "Looking for your sites",
+            "Checking this node for sites saved by an earlier version of Delta. \
+             If you have used Delta before, your sites will appear here shortly — \
+             nothing has been lost.",
+        )
+    } else {
+        (
+            "Welcome to Delta",
+            "Decentralized publishing on Freenet. Create your own site or visit one using a site code.",
+        )
     }
 }
 
@@ -308,5 +355,45 @@ fn handle_hash_navigation() {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::empty_pane_copy;
+
+    #[test]
+    fn the_new_user_welcome_is_never_shown_while_discovery_is_outstanding() {
+        // freenet/delta#52. During recovery the screen must not be the one a
+        // brand-new user sees, because that reads as total data loss.
+        let (settled_heading, settled_body) = empty_pane_copy(false);
+        let (searching_heading, searching_body) = empty_pane_copy(true);
+
+        assert_ne!(
+            searching_heading, settled_heading,
+            "the searching state must not reuse the new-user heading"
+        );
+        assert_ne!(searching_body, settled_body);
+        assert_eq!(settled_heading, "Welcome to Delta");
+        assert!(
+            !searching_heading.contains("Welcome"),
+            "a returning user mid-recovery must not be welcomed as a newcomer"
+        );
+    }
+
+    #[test]
+    fn the_searching_copy_says_data_is_not_lost() {
+        // The specific harm in #52 is the data-loss impression, so the copy has
+        // to contradict it explicitly rather than just being vaguely busy.
+        let (heading, body) = empty_pane_copy(true);
+        let text = format!("{heading} {body}").to_lowercase();
+        assert!(
+            text.contains("earlier version") || text.contains("previous version"),
+            "must explain that sites are being recovered from an earlier version: {text}"
+        );
+        assert!(
+            text.contains("nothing has been lost"),
+            "must state outright that nothing is lost: {text}"
+        );
     }
 }

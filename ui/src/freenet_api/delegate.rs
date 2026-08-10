@@ -48,11 +48,53 @@ static CURRENT_SITES_LOADED: GlobalSignal<bool> = GlobalSignal::new(|| false);
 /// Used to resolve race: PublicKey may arrive before KnownSites creates the site entry.
 static OWNER_PREFIXES: GlobalSignal<Vec<String>> = GlobalSignal::new(Vec::new);
 
-/// Whether legacy migration has already been fired. Deferring legacy queries
-/// until the current delegate's KnownSites response arrives guarantees that
-/// a legacy response cannot race ahead of the current one and resurrect
-/// deleted sites.
+/// Whether the legacy-delegate sweep has already been dispatched. It fires
+/// once per page load, immediately after the delegate is registered.
 static LEGACY_MIGRATION_FIRED: GlobalSignal<bool> = GlobalSignal::new(|| false);
+
+/// Whether the CURRENT delegate's `KnownSites` reply has arrived at all.
+///
+/// Distinct from [`CURRENT_SITES_LOADED`], which means "the current delegate
+/// answered AND held state" and can also be set by a legacy contribution. This
+/// one is purely "did the current delegate answer yet", which is what the
+/// ordering rules below actually depend on.
+static CURRENT_KNOWN_SITES_ANSWERED: GlobalSignal<bool> = GlobalSignal::new(|| false);
+
+/// Whether legacy-delegate responses may be applied yet. See
+/// [`open_legacy_gate`] for the ordering hazard this protects and why the gate
+/// has a deadline rather than waiting unconditionally.
+static LEGACY_GATE_OPEN: GlobalSignal<bool> = GlobalSignal::new(|| false);
+
+/// Legacy-delegate responses that arrived while the gate was still closed.
+/// Replayed in arrival order when it opens.
+static BUFFERED_LEGACY_RESPONSES: GlobalSignal<Vec<(DelegateKey, Vec<OutboundDelegateMsg>)>> =
+    GlobalSignal::new(Vec::new);
+
+/// Sites restored from a LEGACY delegate before the current delegate answered.
+///
+/// These are provisional, not live user intent: see the tombstone rules in
+/// [`effective_live_prefixes`].
+static PROVISIONAL_LEGACY_PREFIXES: GlobalSignal<Vec<String>> = GlobalSignal::new(Vec::new);
+
+/// A legacy contribution is waiting to be written back to the current delegate,
+/// held until the current delegate's own `KnownSites` reply has been applied.
+/// See [`should_defer_known_sites_save`].
+static DEFERRED_KNOWN_SITES_SAVE: GlobalSignal<bool> = GlobalSignal::new(|| false);
+
+/// How long to hold legacy-delegate responses when the CURRENT delegate has not
+/// answered yet.
+///
+/// A healthy delegate op is a local, sub-second round trip, so on every normal
+/// load the current delegate answers long before this and the pre-#52 ordering
+/// is preserved exactly. The deadline exists only for the pathological case
+/// issue #52 is about, where the current delegate's reply takes minutes: waiting
+/// on it unconditionally is what made a returning user stare at an empty
+/// "Welcome to Delta" screen. Once it expires we apply what the legacy
+/// delegates said, but we still refuse to PERSIST the merged view until the
+/// current delegate has spoken (see [`should_defer_known_sites_save`]), so a
+/// removal recorded only in the current delegate can never be lost.
+#[cfg(target_arch = "wasm32")]
+const LEGACY_GATE_DEADLINE_MS: u64 = 2_000;
 
 // Tombstones let us persist removed prefixes across refreshes WITHOUT
 // changing the delegate WASM schema — the delegate just stores/returns
@@ -85,14 +127,29 @@ pub fn register_delegate() {
                     Ok(_) => {
                         log("Delta: delegate registered");
                         drop(api);
-                        // Load persisted data. Legacy migration is deferred
-                        // until the current delegate's KnownSites response
-                        // arrives (see the KnownSites arm of
-                        // handle_delegate_response) — otherwise a legacy
-                        // response could race ahead and resurrect sites the
-                        // user removed.
+                        // Load persisted data AND start the legacy sweep in the
+                        // same breath (#52).
+                        //
+                        // This used to wait for the current delegate's
+                        // KnownSites reply before even asking the legacy
+                        // delegates anything. Delta re-keys its delegate on
+                        // essentially every release, so on a returning user's
+                        // first load after an upgrade that reply is "nothing
+                        // here" BY DEFINITION — the delegate was created
+                        // moments ago — and every millisecond spent waiting for
+                        // it was pure latency in front of the only request that
+                        // could actually find the user's sites.
+                        //
+                        // The ordering guarantee that gating bought (a legacy
+                        // reply must not be applied before the current
+                        // delegate's, or a site the user removed can be
+                        // resurrected) is preserved by buffering legacy
+                        // RESPONSES instead of delaying legacy REQUESTS — see
+                        // `open_legacy_gate`.
                         request_public_key();
                         load_known_sites();
+                        fire_legacy_migration();
+                        schedule_legacy_gate_deadline();
                     }
                     Err(e) => log(&format!("Delta: delegate registration failed: {e:?}")),
                 }
@@ -370,9 +427,150 @@ fn is_newest_legacy_delegate(responding_key: &DelegateKey) -> bool {
     key_matches && hash_matches
 }
 
+/// Whether a delegate response must be held back rather than applied now.
+///
+/// Only LEGACY responses are ever buffered, and only until the gate opens. The
+/// current delegate's own responses are always applied immediately — buffering
+/// one would deadlock the gate, since the current delegate answering is the
+/// primary thing that opens it.
+fn should_buffer_legacy_response(is_legacy: bool, gate_open: bool) -> bool {
+    is_legacy && !gate_open
+}
+
 /// Handle a delegate response — route signed objects to the network.
+///
+/// Legacy responses are buffered until [`open_legacy_gate`] fires. Before #52
+/// the same ordering was achieved by not SENDING the legacy requests until the
+/// current delegate replied; buffering the responses instead means the requests
+/// are already in flight (and usually already answered) by the time the gate
+/// opens.
 pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<OutboundDelegateMsg>) {
     let is_legacy = responding_key != current_delegate_key();
+    if should_buffer_legacy_response(is_legacy, *LEGACY_GATE_OPEN.read()) {
+        BUFFERED_LEGACY_RESPONSES.with_mut(|buf| buf.push((responding_key, values)));
+        return;
+    }
+    apply_delegate_response(responding_key, is_legacy, values);
+}
+
+/// Open the legacy gate and replay everything the legacy delegates already said.
+///
+/// The gate exists because a legacy `KnownSites` reply applied before the
+/// current delegate's can resurrect a site the user removed: the removal lives
+/// in the current delegate as a tombstone, and the older delegate still lists
+/// the site as a real record. Opening on the current delegate's reply is the
+/// correct, ordering-preserving trigger; opening on the deadline is the escape
+/// hatch for the #52 case where that reply is minutes away and the user is
+/// meanwhile looking at what appears to be total data loss.
+///
+/// Applying a legacy reply early is still safe for the user's DATA, because the
+/// write-back to the current delegate stays deferred (see
+/// [`should_defer_known_sites_save`]) and the sites it restores are marked
+/// provisional (see [`effective_live_prefixes`]), so the current delegate's
+/// tombstones still win when they finally arrive.
+fn open_legacy_gate(reason: &str) {
+    if *LEGACY_GATE_OPEN.read() {
+        return;
+    }
+    *LEGACY_GATE_OPEN.write() = true;
+    arm_discovery_settle_if_ready();
+    let buffered = BUFFERED_LEGACY_RESPONSES.with_mut(std::mem::take);
+    if !buffered.is_empty() {
+        log(&format!(
+            "Delta: applying {} buffered legacy delegate response(s) ({reason})",
+            buffered.len()
+        ));
+    }
+    for (key, values) in buffered {
+        apply_delegate_response(key, true, values);
+    }
+}
+
+/// Arm the fallback that opens the legacy gate even if the current delegate
+/// never answers. See [`LEGACY_GATE_DEADLINE_MS`].
+#[cfg(target_arch = "wasm32")]
+fn schedule_legacy_gate_deadline() {
+    wasm_bindgen_futures::spawn_local(async {
+        gloo_timers::future::sleep(std::time::Duration::from_millis(LEGACY_GATE_DEADLINE_MS)).await;
+        if !*CURRENT_KNOWN_SITES_ANSWERED.read() {
+            log(
+                "Delta: current delegate has not answered yet; applying legacy \
+                 delegate results now and deferring the write-back",
+            );
+        }
+        open_legacy_gate("deadline");
+    });
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn schedule_legacy_gate_deadline() {}
+
+/// Whether the merged site list must be held back rather than written to the
+/// current delegate now.
+///
+/// (#52) Legacy discovery now starts immediately, so a legacy `KnownSites`
+/// reply can land BEFORE the current delegate's. Persisting at that point would
+/// write a site list assembled without knowledge of the current delegate's
+/// tombstones, so a site the user removed under the current delegate would be
+/// written back as a live record and stay resurrected forever. Deferring the
+/// write keeps the persisted result identical to the pre-#52 ordering; only the
+/// on-screen appearance is allowed to run ahead.
+fn should_defer_known_sites_save(current_known_sites_answered: bool) -> bool {
+    !current_known_sites_answered
+}
+
+/// How long to keep telling the user we are still looking, once discovery has
+/// actually finished its round trips. A legacy delegate that holds the user's
+/// sites answers well inside this.
+#[cfg(target_arch = "wasm32")]
+const DISCOVERY_SETTLE_GRACE_MS: u64 = 4_000;
+
+/// Hard stop on the "looking for your sites" state, armed at page load. Without
+/// it a node that never answers would leave the message up forever.
+#[cfg(target_arch = "wasm32")]
+const DISCOVERY_SETTLE_FALLBACK_MS: u64 = 30_000;
+
+/// Whether the settle grace timer has already been armed (it is idempotent, but
+/// re-arming on every response would keep pushing the deadline out).
+static DISCOVERY_SETTLE_ARMED: GlobalSignal<bool> = GlobalSignal::new(|| false);
+
+/// Arm the "discovery is over" timer once both halves of startup discovery have
+/// reported: the current delegate has answered, and the legacy sweep's results
+/// are ungated. Until discovery settles the UI shows a recovery message instead
+/// of the bare "Welcome to Delta" empty state (#52).
+fn arm_discovery_settle_if_ready() {
+    if !*CURRENT_KNOWN_SITES_ANSWERED.read() || !*LEGACY_GATE_OPEN.read() {
+        return;
+    }
+    let already_armed = DISCOVERY_SETTLE_ARMED.with_mut(|armed| std::mem::replace(armed, true));
+    if !already_armed {
+        #[cfg(target_arch = "wasm32")]
+        wasm_bindgen_futures::spawn_local(async {
+            gloo_timers::future::sleep(std::time::Duration::from_millis(DISCOVERY_SETTLE_GRACE_MS))
+                .await;
+            state::settle_site_discovery();
+        });
+    }
+}
+
+/// Arm the hard fallback that ends the "looking for your sites" state no matter
+/// what happens. Called once, from app start.
+pub fn arm_discovery_fallback() {
+    #[cfg(target_arch = "wasm32")]
+    wasm_bindgen_futures::spawn_local(async {
+        gloo_timers::future::sleep(std::time::Duration::from_millis(
+            DISCOVERY_SETTLE_FALLBACK_MS,
+        ))
+        .await;
+        state::settle_site_discovery();
+    });
+}
+
+fn apply_delegate_response(
+    responding_key: DelegateKey,
+    is_legacy: bool,
+    values: Vec<OutboundDelegateMsg>,
+) {
     for msg in values {
         if let OutboundDelegateMsg::ApplicationMessage(app_msg) = msg {
             let response: DelegateResponse = match from_reader(app_msg.payload.as_slice()) {
@@ -482,10 +680,21 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                     //    is the primary defense; this is the guardrail for
                     //    ordering races between save_known_sites and a
                     //    load_known_sites response already in flight.
+                    //
+                    // 3. (#52) A site restored from a LEGACY delegate before
+                    //    the current delegate answered is NOT live user intent
+                    //    for the purposes of rule 2 — see
+                    //    `effective_live_prefixes`.
+                    let provisional_owned: Vec<String> = PROVISIONAL_LEGACY_PREFIXES.read().clone();
                     let tombstones_to_apply: Vec<_> = {
+                        let provisional: std::collections::HashSet<&str> =
+                            provisional_owned.iter().map(String::as_str).collect();
                         let live_sites = state::SITES.read();
-                        let live_prefixes: std::collections::HashSet<&str> =
-                            live_sites.keys().map(String::as_str).collect();
+                        let live_prefixes = effective_live_prefixes(
+                            live_sites.keys().map(String::as_str),
+                            is_legacy,
+                            &provisional,
+                        );
                         filter_applicable_tombstones(
                             &tombstones,
                             is_legacy,
@@ -576,7 +785,25 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                         } else {
                             Vec::new()
                         };
-                        restore_known_sites(real_records);
+                        let inserted = restore_known_sites(real_records);
+                        // (#52) Sites a legacy delegate brought back before the
+                        // current delegate answered are provisional: they must
+                        // not veto the current delegate's tombstones when those
+                        // finally arrive. Only newly-INSERTED prefixes are
+                        // marked — a site that was already live came from a real
+                        // user action (visit/create/import) and keeps its veto.
+                        if is_legacy
+                            && !*CURRENT_KNOWN_SITES_ANSWERED.read()
+                            && !inserted.is_empty()
+                        {
+                            PROVISIONAL_LEGACY_PREFIXES.with_mut(|p| {
+                                for prefix in inserted {
+                                    if !p.contains(&prefix) {
+                                        p.push(prefix);
+                                    }
+                                }
+                            });
+                        }
                         // If legacy contributed ANY state — real records OR
                         // tombstones — persist the merged view to the current
                         // delegate so it survives a refresh. Without this, a
@@ -584,7 +811,17 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                         // those tombstones back out of REMOVED_PREFIXES on
                         // next load and resurrect removed sites.
                         if is_legacy && (has_real || has_tombstones) {
-                            save_known_sites();
+                            if should_defer_known_sites_save(*CURRENT_KNOWN_SITES_ANSWERED.read()) {
+                                // (#52) The current delegate has not answered
+                                // yet, so we do not know its removal set.
+                                // Writing now could persist a site whose
+                                // tombstone we have not seen, turning a
+                                // transient display of a removed site into a
+                                // permanent resurrection. Hold the write.
+                                *DEFERRED_KNOWN_SITES_SAVE.write() = true;
+                            } else {
+                                save_known_sites();
+                            }
                             *CURRENT_SITES_LOADED.write() = true;
                             // Fetch backed-up site state from this legacy
                             // delegate. If the network GETs all fail (state
@@ -603,14 +840,25 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                         }
                     }
 
-                    // Once the current delegate has responded, it is safe
-                    // to query legacy delegates: any legacy KnownSites
-                    // response is now either blocked (CURRENT_SITES_LOADED
-                    // is set) or merged into a fresh migration path.
-                    if !is_legacy && !*LEGACY_MIGRATION_FIRED.read() {
-                        *LEGACY_MIGRATION_FIRED.write() = true;
-                        fire_legacy_migration();
+                    if !is_legacy {
+                        // The current delegate has now spoken, so its removal
+                        // set is known and everything the legacy delegates said
+                        // can be applied against it.
+                        *CURRENT_KNOWN_SITES_ANSWERED.write() = true;
+                        // Any provisional restore has now been reconciled with
+                        // the current delegate's tombstones above; from here on
+                        // those sites are ordinary live sites.
+                        PROVISIONAL_LEGACY_PREFIXES.write().clear();
+                        open_legacy_gate("current delegate answered");
+                        // Flush a write-back the deadline path had to hold.
+                        // Runs AFTER the gate so the persisted view includes
+                        // every buffered legacy contribution.
+                        if DEFERRED_KNOWN_SITES_SAVE.with_mut(|d| std::mem::replace(d, false)) {
+                            log("Delta: persisting recovered site list now that the current delegate has answered");
+                            save_known_sites();
+                        }
                     }
+                    arm_discovery_settle_if_ready();
                 }
                 DelegateResponse::SiteStateStored => {
                     log("Delta: site state backed up to delegate");
@@ -909,7 +1157,13 @@ fn send_to_delegate_key(request: &delta_core::DelegateRequest, delegate_key: Del
 
 /// Restore known sites from delegate-persisted records.
 /// For each site, creates a placeholder entry and sends GET+SUBSCRIBE.
-fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
+///
+/// Returns the prefixes this call newly INSERTED into `SITES` (i.e. excluding
+/// records that were skipped as removed or that were already live). The caller
+/// uses that to mark a legacy restore as provisional (#52); a site that was
+/// already live got there by user action and must not be marked.
+fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) -> Vec<String> {
+    let mut inserted = Vec::new();
     for record in records {
         // Tombstones must be partitioned out before this call — seeing one
         // here means a new caller bypassed the partition in
@@ -980,6 +1234,7 @@ fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
         state::SITES.with_mut(|sites| {
             sites.insert(prefix.clone(), site);
         });
+        inserted.push(prefix.clone());
 
         // Enter the initial-capture window for this prefix. Incoming state
         // responses are reconciled via a tombstone-aware merge
@@ -1040,6 +1295,8 @@ fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
             });
         }
     }
+
+    inserted
 }
 
 /// Attempt to migrate data from legacy delegate versions.
@@ -1047,8 +1304,11 @@ fn restore_known_sites(records: Vec<delta_core::KnownSiteRecord>) {
 /// legacy delegate. Old delegates that don't support all requests will error for
 /// those individually, which is fine -- we take whatever we can get.
 fn fire_legacy_migration() {
+    let already_fired = LEGACY_MIGRATION_FIRED.with_mut(|fired| std::mem::replace(fired, true));
+    #[cfg(not(target_arch = "wasm32"))]
+    let _ = already_fired;
     #[cfg(target_arch = "wasm32")]
-    {
+    if !already_fired {
         if LEGACY_DELEGATES.is_empty() {
             return;
         }
@@ -1065,7 +1325,16 @@ fn fire_legacy_migration() {
             delta_core::DelegateRequest::GetSigningKey,
         ];
 
-        for (i, (key_bytes, code_hash_bytes)) in LEGACY_DELEGATES.iter().enumerate() {
+        // Newest generation first (#52). Every probe is dispatched
+        // concurrently, so this does not change how long the sweep takes as a
+        // whole — but the delegate immediately preceding the current one is
+        // overwhelmingly the one actually holding the user's sites, and it is
+        // also the only legacy generation whose real records get unioned once
+        // the current delegate is authoritative (`is_newest_legacy_delegate`).
+        // Putting it at the head of the send queue makes it the most likely to
+        // answer first, which is the answer that ends the wait.
+        for i in legacy_probe_order(LEGACY_DELEGATES.len()) {
+            let (key_bytes, code_hash_bytes) = &LEGACY_DELEGATES[i];
             for req in &requests {
                 let legacy_code_hash = CodeHash::new(*code_hash_bytes);
                 let legacy_delegate_key = DelegateKey::new(*key_bytes, legacy_code_hash);
@@ -1251,6 +1520,40 @@ fn log(msg: &str) {
     eprintln!("{msg}");
 }
 
+/// The order in which the legacy generations are probed: newest first.
+/// `LEGACY_DELEGATES` is oldest-first (it is appended to on every re-key), so
+/// the last entry is the delegate immediately preceding the current one, which
+/// is the one that almost always holds the returning user's sites.
+fn legacy_probe_order(len: usize) -> Vec<usize> {
+    (0..len).rev().collect()
+}
+
+/// The set of prefixes that count as "live" for tombstone rule 2 ("a live site
+/// always beats a stale removal record").
+///
+/// Rule 2 exists to protect LIVE USER INTENT — a site the user just visited,
+/// created, or imported must not be deleted again by a stale tombstone. A site
+/// that a LEGACY delegate restored before the current delegate had answered is
+/// not user intent (#52): it is a guess made while the authoritative removal set
+/// was still unknown. Letting it count as live would make it veto the current
+/// delegate's tombstone for the same prefix, silently losing a removal. So for
+/// the CURRENT delegate's response those provisional prefixes are excluded.
+///
+/// For a LEGACY response every live prefix still counts, which is exactly the
+/// pre-#52 behaviour (before this change, no legacy reply could ever be
+/// processed before the current delegate's, so no prefix was ever provisional).
+fn effective_live_prefixes<'a, I>(
+    live: I,
+    is_legacy: bool,
+    provisional: &std::collections::HashSet<&str>,
+) -> std::collections::HashSet<&'a str>
+where
+    I: Iterator<Item = &'a str>,
+{
+    live.filter(|prefix| is_legacy || !provisional.contains(prefix))
+        .collect()
+}
+
 /// Decide which tombstones from a KnownSites response should actually be
 /// applied to local state, given whether the response came from a legacy
 /// delegate, whether the current delegate has already been loaded, and
@@ -1266,6 +1569,9 @@ fn log(msg: &str) {
 ///    the user via `visit_site` / `create_new_site` / `import_site_key`) is
 ///    always dropped, regardless of source. Live intent beats a stale
 ///    removal record.
+///
+/// `live_prefixes` is produced by [`effective_live_prefixes`], which is what
+/// keeps rule 2 from being satisfied by a merely provisional legacy restore.
 fn filter_applicable_tombstones(
     tombstones: &[delta_core::KnownSiteRecord],
     is_legacy: bool,
@@ -1389,6 +1695,111 @@ mod tests {
                 panic!("per-prefix key migration must send GetSigningKeyForPrefix, got {other:?}")
             }
         }
+    }
+
+    // ---- freenet/delta#52: when discovery starts, and what it may apply ----
+
+    #[test]
+    fn legacy_discovery_starts_at_registration_not_after_the_current_delegate_replies() {
+        // The whole point of #52. If `register_delegate` ever goes back to
+        // waiting for the current delegate's KnownSites reply before asking the
+        // legacy delegates anything, a returning user is once again staring at
+        // an empty screen for the duration of a request that answers "nothing
+        // here" by definition on a freshly re-keyed delegate.
+        //
+        // The needle is assembled at runtime so this test's own source text
+        // cannot satisfy the assertion via `include_str!`.
+        let src = include_str!("delegate.rs");
+        let body = src
+            .split("pub fn register_delegate()")
+            .nth(1)
+            .expect("register_delegate must exist");
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        let needle = format!("{}{}", "fire_legacy_", "migration();");
+        assert!(
+            body.contains(&needle),
+            "register_delegate must dispatch the legacy sweep itself, not defer it \
+             to the current delegate's KnownSites handler"
+        );
+    }
+
+    #[test]
+    fn only_legacy_responses_are_buffered_and_only_until_the_gate_opens() {
+        assert!(should_buffer_legacy_response(true, false));
+        assert!(!should_buffer_legacy_response(true, true));
+        // Buffering the current delegate's own response would deadlock the
+        // gate — its arrival is the primary thing that opens it.
+        assert!(!should_buffer_legacy_response(false, false));
+        assert!(!should_buffer_legacy_response(false, true));
+    }
+
+    #[test]
+    fn known_sites_write_back_waits_for_the_current_delegate() {
+        // Applying a legacy reply early is a display decision and is allowed.
+        // PERSISTING it early is not: the current delegate's tombstones are the
+        // authoritative removal set, and writing a merged list without them
+        // turns a transient display of a removed site into a permanent
+        // resurrection.
+        assert!(should_defer_known_sites_save(false));
+        assert!(!should_defer_known_sites_save(true));
+    }
+
+    #[test]
+    fn provisional_legacy_sites_do_not_veto_current_delegate_tombstones() {
+        let live = ["visited-by-user", "restored-from-legacy"];
+        let provisional: HashSet<&str> = ["restored-from-legacy"].into_iter().collect();
+
+        // Handling the CURRENT delegate's response: the provisionally-restored
+        // site must NOT count as live, so its tombstone still applies.
+        let effective = effective_live_prefixes(live.iter().copied(), false, &provisional);
+        assert!(
+            effective.contains("visited-by-user"),
+            "a site the user actually visited keeps its rule-2 veto"
+        );
+        assert!(
+            !effective.contains("restored-from-legacy"),
+            "a site guessed from a legacy delegate before the current one \
+             answered must not veto the current delegate's removal record"
+        );
+
+        // Handling a LEGACY response: unchanged from pre-#52 behaviour.
+        let effective_legacy = effective_live_prefixes(live.iter().copied(), true, &provisional);
+        assert!(effective_legacy.contains("restored-from-legacy"));
+        assert!(effective_legacy.contains("visited-by-user"));
+    }
+
+    #[test]
+    fn with_nothing_provisional_the_live_set_is_unchanged() {
+        // Regression guard for the common path: on a healthy load the current
+        // delegate answers first, nothing is ever provisional, and the
+        // tombstone rules must behave exactly as they did before #52.
+        let live = ["aaa", "bbb"];
+        let provisional: HashSet<&str> = HashSet::new();
+        for is_legacy in [false, true] {
+            let effective = effective_live_prefixes(live.iter().copied(), is_legacy, &provisional);
+            assert_eq!(effective.len(), 2);
+            assert!(effective.contains("aaa") && effective.contains("bbb"));
+        }
+    }
+
+    #[test]
+    fn legacy_generations_are_probed_newest_first() {
+        // `LEGACY_DELEGATES` is oldest-first, so newest-first means descending
+        // index. The newest legacy delegate is the one that almost always holds
+        // a returning user's sites.
+        assert_eq!(legacy_probe_order(4), vec![3, 2, 1, 0]);
+        assert_eq!(legacy_probe_order(1), vec![0]);
+        assert!(legacy_probe_order(0).is_empty());
+
+        // And it really is the last table entry that `is_newest_legacy_delegate`
+        // privileges, so probing in this order front-loads that generation.
+        let order = legacy_probe_order(LEGACY_DELEGATES.len());
+        let first = order.first().expect("legacy table must be populated");
+        let (key, hash) = &LEGACY_DELEGATES[*first];
+        assert!(is_newest_legacy_delegate(&DelegateKey::new(
+            *key,
+            CodeHash::new(*hash)
+        )));
     }
 
     #[test]

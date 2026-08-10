@@ -80,6 +80,9 @@ pub fn connect_to_freenet() {
         if !is_gateway {
             web_sys::console::log_1(&"Delta: not on gateway, skipping WebSocket connection".into());
             *CONNECTION_STATUS.write() = ConnectionStatus::Disconnected;
+            // No node, so no delegate discovery will ever run. Settle now
+            // rather than leaving "looking for your sites" up forever (#52).
+            crate::state::settle_site_discovery();
             return;
         }
 
