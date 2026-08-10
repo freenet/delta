@@ -54,6 +54,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Load-bearing. The gate finds the previous release's WASM by walking
+          # this file's git history; the default depth-1 checkout has no history
+          # to walk, so the gate would find no predecessor and pass everything.
+          # check-migration.sh refuses outright on a shallow clone rather than
+          # reporting that silence as safety, so lowering this fails CI loudly
+          # instead of quietly disarming it.
+          fetch-depth: 0
 
       - name: Install Rust
         # See note in the `check` job: pin lives in rust-toolchain.toml.
@@ -75,44 +83,16 @@ jobs:
       - name: Print toolchain (for diagnostics if hashes mismatch)
         run: rustc --version --verbose
 
-      - name: Verify delegate WASM matches source
-        run: |
-          ./scripts/build-wasm.sh -p site-delegate
-          COMMITTED=$(b3sum ui/public/contracts/site_delegate.wasm | cut -d' ' -f1)
-          BUILT=$(b3sum target/wasm32-unknown-unknown/release/site_delegate.wasm | cut -d' ' -f1)
-          if [ "$COMMITTED" != "$BUILT" ]; then
-            echo "::error::Committed delegate WASM does not match what this toolchain produced from source."
-            echo "  committed: $COMMITTED"
-            echo "  built:     $BUILT"
-            echo ""
-            echo "If you intentionally changed delegate code, run:"
-            echo "  ./scripts/add-migration.sh V_N \"<short description>\""
-            echo "  ./scripts/sync-wasm.sh"
-            echo ""
-            echo "If this CI failure surprises you (no delegate change in this PR),"
-            echo "the toolchain may have drifted from rust-toolchain.toml. The runner"
-            echo "above prints rustc --version --verbose; compare against:"
-            echo "  $(grep '^channel' rust-toolchain.toml || echo '(rust-toolchain.toml not found)')"
-            exit 1
-          fi
+      - name: Prove the migration gate can still refuse
+        # Runs before the gate itself: a gate that has lost its ability to
+        # refuse would otherwise report "Safe to publish" and be believed.
+        run: ./scripts/tests/check-migration-test.sh
 
-      - name: Verify contract WASM matches source
-        run: |
-          ./scripts/build-wasm.sh -p site-contract
-          COMMITTED=$(b3sum ui/public/contracts/site_contract.wasm | cut -d' ' -f1)
-          BUILT=$(b3sum target/wasm32-unknown-unknown/release/site_contract.wasm | cut -d' ' -f1)
-          if [ "$COMMITTED" != "$BUILT" ]; then
-            echo "::error::Committed contract WASM does not match what this toolchain produced from source."
-            echo "  committed: $COMMITTED"
-            echo "  built:     $BUILT"
-            echo ""
-            echo "If you intentionally changed contract code or common/, run:"
-            echo "  ./scripts/add-contract-migration.sh C_N \"<short description>\""
-            echo "  ./scripts/sync-wasm.sh"
-            echo ""
-            echo "If this CI failure surprises you (no contract / common/ change in"
-            echo "this PR), the toolchain may have drifted from rust-toolchain.toml."
-            echo "The runner above prints rustc --version --verbose; compare against:"
-            echo "  $(grep '^channel' rust-toolchain.toml || echo '(rust-toolchain.toml not found)')"
-            exit 1
-          fi
+      - name: Migration safety gate
+        # The single implementation, shared with `cargo make publish-delta`.
+        # It rebuilds both WASMs from source, refuses if the committed bytes
+        # don't match, and refuses if either WASM's predecessor hash is missing
+        # from legacy_delegates.toml / legacy_contracts.toml. Previously this
+        # job only did the rebuild half, so a PR that changed a WASM correctly
+        # but recorded no migration entry shipped green (delta#46).
+        run: ./scripts/check-migration.sh

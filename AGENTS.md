@@ -150,7 +150,7 @@ removed site. The user-visible half of #52 is handled by
 
 The repo pins rustc via `rust-toolchain.toml` (currently `1.94.1`). This is **load-bearing for the migration system**: the delegate key is `BLAKE3(BLAKE3(wasm) || params)`, so any change in WASM bytes — including bytes produced by an LLVM upgrade in a newer rustc — produces a new delegate key and orphans every user's stored data unless a migration entry is recorded first.
 
-The migration-safety check in `.github/workflows/ci.yml` rebuilds the WASMs from source on each PR and refuses to merge if the committed hashes don't match. With a pinned toolchain CI and local always agree, so the gate provides real signal.
+The migration-safety job in `.github/workflows/ci.yml` runs `scripts/check-migration.sh` on each PR: it rebuilds the WASMs from source and refuses to merge if the committed hashes don't match, and separately refuses if a changed WASM's predecessor hash was never recorded in `legacy_delegates.toml` / `legacy_contracts.toml` (see "The migration gate"). With a pinned toolchain CI and local always agree, so the gate provides real signal.
 
 The same pattern is used in `freenet/river` and `freenet/freenet-core`. Don't let the pin drift past those sibling repos without coordinating, since a Freenet dApp ecosystem with mismatched toolchain pins will silently produce different hashes for shared dependencies.
 
@@ -204,11 +204,13 @@ so a slower response from an older hash can't overwrite fresh state.
 Any commit that changes `site_contract.wasm` — including an incidental
 rebuild caused by touching `common/`, even if the contract's own
 source is unchanged — must first record the currently-committed
-contract WASM hash via `./scripts/add-contract-migration.sh`. The
-`check-migration.sh` preflight script enforces this by comparing the
-previous git-tracked hash against the entries in
-`legacy_contracts.toml` and refusing to publish if the predecessor
-is missing.
+contract WASM hash via `./scripts/add-contract-migration.sh`.
+`scripts/check-migration.sh` enforces this: it walks the git history
+of `site_contract.wasm` for the most recent committed state whose
+bytes differ from today's, and refuses to publish unless that
+predecessor hash appears in `legacy_contracts.toml`. The delegate is
+gated identically against `legacy_delegates.toml`. See
+"The migration gate" below for where it runs and what it cannot do.
 
 ### Delegate WASM Migration
 
@@ -262,8 +264,9 @@ misses a prefix, the NotFound fallback catches it.
 # 3. Rebuild WASMs
 ./scripts/sync-wasm.sh
 
-# 4. Build and publish (preflight check-migration.sh runs automatically
-#    and refuses to publish if a previous hash was not recorded)
+# 4. Build and publish. `publish-delta` depends on `preflight`, which runs
+#    scripts/check-migration.sh and aborts the whole chain — before anything
+#    is signed or published — if either WASM's predecessor hash is missing.
 cargo make publish-delta
 
 # 5. Commit everything
@@ -271,6 +274,41 @@ git add legacy_delegates.toml legacy_contracts.toml ui/public/contracts/ common/
 git commit -m "fix: description with delegate migration"
 git push
 ```
+
+Steps 4 and 5 may also be done in the other order (commit and merge first,
+publish from `main` afterwards, as the rustc-bump procedure does). The gate
+finds the predecessor by walking git history, so it works either way.
+
+### The migration gate
+
+`scripts/check-migration.sh` is the **only** implementation of the gate. It
+runs from `cargo make publish-delta` (via `preflight` → `check-migration`) and
+from the "Delegate migration safety" job in `.github/workflows/ci.yml`. For
+each of the delegate and the contract it refuses to report success unless:
+
+- the committed WASM is byte-identical to what this toolchain builds from
+  source, and
+- the most recent *differing* committed state of that WASM — the release this
+  one supersedes — has its hash recorded in the matching `legacy_*.toml`.
+
+It also refuses when it cannot answer the question: a shallow clone, or a
+non-git checkout, is an error rather than a pass. This is why the CI job sets
+`fetch-depth: 0`.
+
+**Do not add a second copy of this check.** `Makefile.toml` used to carry an
+inline near-duplicate that only compared the committed WASM against a fresh
+build. That inline copy, not the script, was what the publish path actually
+ran, so the gate the docs promised had never once refused a publish
+(delta#45, delta#46). `scripts/tests/check-migration-test.sh` pins the gate's
+ability to refuse, including the two shapes it was previously broken in; it
+runs in CI and in `preflight`, ahead of the gate itself.
+
+What the gate does **not** cover: it verifies that the predecessor hash is
+recorded, not that the recorded entry is correct or that the migration
+actually restores data. A wrong `delegate_key` for a right `code_hash` is
+caught separately by the build assertion in `ui/build.rs`; that the sweep
+reaches the data at all is only ever proven by the browser check (step 9 of
+the rustc-bump procedure).
 
 ## Publishing
 
