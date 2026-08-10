@@ -574,20 +574,34 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                     continue;
                 }
             };
-            // Offer the reply to any in-flight `freenet-migrate` round-trip
-            // FIRST. Delta's protocol has no request ids (adding one would
-            // change the delegate WASM and re-key it), so the migration
-            // correlates replies by (delegate key, reply kind) and consumes the
-            // ones it is awaiting. Consuming them here also keeps a reply the
-            // migration asked for from being applied a second time by the
-            // handling below. See `delegate_migration::wasm_transport`.
+            // Offer the reply to any in-flight `freenet-migrate` round-trip, and
+            // then FALL THROUGH to the normal handling regardless.
+            //
+            // Delta's delegate protocol has no request ids — adding one would
+            // change the delegate WASM and re-key it, the exact event this
+            // migration exists to survive — so the migration correlates replies
+            // by (delegate key, reply kind).
+            //
+            // The fall-through is load-bearing, not laziness. The hand-rolled
+            // sweep in `fire_legacy_migration` runs CONCURRENTLY with the
+            // migration, from this same trigger, and probes the same legacy
+            // delegates with overlapping request kinds. If the migration
+            // CONSUMED a reply, the sweep would never see it: a stolen
+            // `KnownSites` reply would silently skip the sweep's restore for
+            // that generation, so a legacy site would not appear in the UI on
+            // the first load after a re-key — a user-visible regression caused
+            // purely by adding the migration. Falling through keeps the
+            // adoption strictly ADDITIVE.
+            //
+            // Double-handling is safe: the sweep's handlers are exactly the ones
+            // that already run for these replies today, and all of them are
+            // idempotent (tombstone-aware site merge, per-prefix key re-store,
+            // tombstone-aware state reconcile).
             #[cfg(target_arch = "wasm32")]
-            if crate::freenet_api::delegate_migration::wasm_transport::offer_response(
+            crate::freenet_api::delegate_migration::wasm_transport::offer_response(
                 &responding_key,
                 &response,
-            ) {
-                continue;
-            }
+            );
 
             match response {
                 DelegateResponse::KeyStored => {
