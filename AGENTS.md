@@ -233,6 +233,23 @@ structural mismatch yields an EMPTY table with no error at all; a build
 assertion now fails the build if the file has `[[entry]]` sections and
 none deserialize.
 
+**A worktree is the WRONG instrument for reproducing a build-caching or
+publish-path problem.** `ui/build.rs` is only cached as designed in a
+normal checkout. In a git worktree `.git` is a FILE pointing at
+`.git/worktrees/<name>`, so a hardcoded `../.git/HEAD` does not resolve,
+and Cargo treats an unresolvable `rerun-if-changed` target as
+permanently dirty — the script re-ran on every build and every generated
+table was always fresh. The paths are now resolved via `git rev-parse
+--git-path` so both layouts cache identically, but the general point
+outlives that fix: `cargo make publish-delta` runs from the main
+checkout, so any staleness bug lives there. The repo's own convention of
+always working in a worktree structurally concealed the missing
+`legacy_delegates.toml` directive above from every agent who
+investigated it. If you are asked to reproduce something about build
+caching, generated files, or publishing, reproduce it in a clean clone
+or the main checkout — following the worktree convention guarantees you
+cannot see it.
+
 **CRITICAL: Every delegate storage key type must be migrated.** The
 legacy migration in `fire_legacy_migration()` and the KnownSites handler
 must cover ALL storage operations the delegate supports. If a new storage
