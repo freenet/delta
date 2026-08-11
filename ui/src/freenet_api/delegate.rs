@@ -62,6 +62,35 @@ static OWNER_PREFIXES: GlobalSignal<Vec<String>> = GlobalSignal::new(Vec::new);
 /// complete".
 static LEGACY_MIGRATION_FIRED: GlobalSignal<bool> = GlobalSignal::new(|| false);
 
+/// Whether the `freenet-migrate` secret carry-forward has been started this
+/// page load.
+///
+/// This latch is load-bearing, not tidiness. `start_delegate_secret_migration`
+/// is called from the current delegate's `KnownSites` arm, and the migration's
+/// own read-merge-write sends `GetKnownSites` to that same delegate — whose
+/// reply falls through into that arm (deliberately, so the shipped sweep still
+/// sees it). Without a latch that is a self-retrigger loop: each run spawns
+/// another run, one per data-bearing predecessor.
+///
+/// It does not self-limit in the environment that matters. In the production
+/// gateway iframe `localStorage` is unavailable and each run builds a fresh
+/// `BrowserMarkers::default()`, so no marker ever reports `AlreadyMigrated`
+/// and the recursion never terminates — it just keeps multiple runs concurrent
+/// in the shared reply registry, which is exactly where same-kind reply
+/// correlation gets dangerous. In dev, working `localStorage` halts it after
+/// about two rounds, which is why testing by hand does not reveal it.
+static SECRET_MIGRATION_FIRED: GlobalSignal<bool> = GlobalSignal::new(|| false);
+
+/// Claim the once-per-page-load right to run the secret migration.
+///
+/// Returns `true` for the first caller and `false` for every later one. Split
+/// out from [`start_delegate_secret_migration`] so the latch can be tested on
+/// the host: the starter itself is `wasm32`-only, and an untested latch is how
+/// the loop above shipped in the first place.
+fn claim_secret_migration_slot() -> bool {
+    !SECRET_MIGRATION_FIRED.with_mut(|fired| std::mem::replace(fired, true))
+}
+
 /// Whether the CURRENT delegate's `KnownSites` reply has arrived.
 ///
 /// Distinct from [`CURRENT_SITES_LOADED`], which means "the current delegate
@@ -512,6 +541,10 @@ pub fn reset_legacy_migration_for_reconnect() {
     if fired {
         log("Delta: connection dropped mid-recovery; will re-probe legacy delegates on reconnect");
         *LEGACY_MIGRATION_FIRED.write() = false;
+        // Re-arm the secret carry-forward too. A socket flap can strand it
+        // mid-walk with predecessors unread, and its own markers do not
+        // persist in the iframe, so without this the retry never happens.
+        *SECRET_MIGRATION_FIRED.write() = false;
         *CURRENT_KNOWN_SITES_ANSWERED.write() = false;
         *DISCOVERY_SETTLE_ARMED.write() = false;
         state::reopen_site_discovery();
@@ -574,6 +607,37 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                     continue;
                 }
             };
+            // Offer the reply to any in-flight `freenet-migrate` round-trip, and
+            // then FALL THROUGH to the normal handling regardless.
+            //
+            // Delta's delegate protocol has no request ids — adding one would
+            // change the delegate WASM and re-key it, the exact event this
+            // migration exists to survive — so the migration correlates replies
+            // by (delegate key, reply kind, and whatever identity the reply
+            // itself carries); see `delegate_migration::correlation` for why
+            // kind alone is not sound while this sweep runs concurrently.
+            //
+            // The fall-through is load-bearing, not laziness. The hand-rolled
+            // sweep in `fire_legacy_migration` runs CONCURRENTLY with the
+            // migration, from this same trigger, and probes the same legacy
+            // delegates with overlapping request kinds. If the migration
+            // CONSUMED a reply, the sweep would never see it: a stolen
+            // `KnownSites` reply would silently skip the sweep's restore for
+            // that generation, so a legacy site would not appear in the UI on
+            // the first load after a re-key — a user-visible regression caused
+            // purely by adding the migration. Falling through keeps the
+            // adoption strictly ADDITIVE.
+            //
+            // Double-handling is safe: the sweep's handlers are exactly the ones
+            // that already run for these replies today, and all of them are
+            // idempotent (tombstone-aware site merge, per-prefix key re-store,
+            // tombstone-aware state reconcile).
+            #[cfg(target_arch = "wasm32")]
+            crate::freenet_api::delegate_migration::wasm_transport::offer_response(
+                &responding_key,
+                &response,
+            );
+
             match response {
                 DelegateResponse::KeyStored => {
                     log("Delta: signing key stored in delegate");
@@ -799,6 +863,14 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                     // is set) or merged into a fresh migration path.
                     if !is_legacy {
                         *CURRENT_KNOWN_SITES_ANSWERED.write() = true;
+                        // The `freenet-migrate` secret carry-forward is started
+                        // from the SAME arm, and nowhere else, so it inherits the
+                        // ordering invariant documented in AGENTS.md
+                        // ("Known-Sites Tombstone Convention"): the current
+                        // delegate has already answered, so a predecessor's reply
+                        // can no longer be applied ahead of it and resurrect a
+                        // site the user removed.
+                        start_delegate_secret_migration();
                         fire_legacy_migration();
                     }
                     arm_discovery_settle_if_ready();
@@ -1066,6 +1138,82 @@ fn send_signing_request(request: &delta_core::DelegateRequest) {
         );
     }
     send_to_delegate_key(request, signing_target(current_has_key));
+}
+
+/// Public wrapper so the `freenet-migrate` transport can address a specific
+/// delegate. Same fire-and-forget send the rest of this module uses; the
+/// migration layers request/reply correlation on top of it.
+pub fn send_to_delegate_key_pub(request: &delta_core::DelegateRequest, delegate_key: DelegateKey) {
+    send_to_delegate_key(request, delegate_key);
+}
+
+/// Carry predecessor delegates' secrets forward onto the current delegate, via
+/// `freenet-migrate`'s delegate half.
+///
+/// Runs once the current delegate has answered, alongside the hand-rolled sweep
+/// in [`fire_legacy_migration`] rather than replacing it yet. That staging is
+/// deliberate and mirrors how Delta adopted the CONTRACT half (see the driver
+/// header in `super::operations`): the library owns the walk order, marker
+/// bookkeeping, never-clobber writes and per-predecessor classification, while
+/// the existing sweep continues to own the UI-state restoration it also does
+/// (site list reconciliation, contract GETs, hash-route replay) — which is not
+/// what the library migrates. Both paths are idempotent and never-clobber, so
+/// running both is safe; retiring the hand-rolled secret probing is a follow-up
+/// once this is field-validated.
+pub fn start_delegate_secret_migration() {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use super::delegate_migration as migration;
+
+        if LEGACY_DELEGATES.is_empty() {
+            return;
+        }
+        // Once per page load. See SECRET_MIGRATION_FIRED: this call site is
+        // re-entered by the migration's own GetKnownSites reply, so without
+        // the latch each run spawns another, unbounded in the iframe.
+        if !claim_secret_migration_slot() {
+            return;
+        }
+        let lineage = migration::delta_delegate_lineage(LEGACY_DELEGATES);
+        let successor = current_delegate_key();
+        // Seed the locally-known prefixes so a site whose key is stranded in a
+        // predecessor is probed even when that predecessor's own known-sites
+        // list is empty or unsupported.
+        let known_prefixes: Vec<String> = state::SITES.read().keys().cloned().collect();
+
+        wasm_bindgen_futures::spawn_local(async move {
+            let channel = migration::wasm_transport::WasmChannel;
+            let mut markers = migration::wasm_transport::BrowserMarkers::default();
+            let report = migration::run_delegate_migration(
+                &channel,
+                &mut markers,
+                successor,
+                &lineage,
+                known_prefixes,
+            )
+            .await;
+
+            // `imported_total()` under-reports and can read zero for a migration
+            // that recovered everything (freenet-migrate#16), so it is NOT
+            // rendered as "recovered N secrets". Log the classification instead.
+            log(&format!(
+                "Delta: delegate secret migration finished — complete={}, retry_may_help={}, \
+                 predecessors={}",
+                report.is_complete(),
+                report.retry_may_help(),
+                report.predecessors.len()
+            ));
+            if report.any_unresponsive() {
+                // The freenet/river#204 gate: some predecessor could not be
+                // reached, so its data may exist and simply could not be
+                // migrated. Never treat this as a clean fresh install.
+                log(
+                    "Delta: some predecessor delegates did not respond; their data may exist \
+                     but could not be migrated automatically",
+                );
+            }
+        });
+    }
 }
 
 fn send_to_delegate_key(request: &delta_core::DelegateRequest, delegate_key: DelegateKey) {
