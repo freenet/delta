@@ -176,3 +176,39 @@ fn format_build_time_local() -> String {
         BUILD_TIMESTAMP_ISO.to_string()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    /// `ui/build.rs` must not hardcode paths inside `.git/`.
+    ///
+    /// In a git worktree `.git` is a FILE, so `../.git/HEAD` does not resolve,
+    /// and Cargo treats an unresolvable `rerun-if-changed` target as
+    /// permanently dirty — the build script then re-runs on every build in a
+    /// worktree and caches only in the main checkout. That asymmetry hid a
+    /// stale-migration-table bug from every investigator following the repo's
+    /// own "always use a worktree" convention, because the one layout where
+    /// caching was live is the main checkout, where releases are cut.
+    ///
+    /// Scraping the source is the only instrument available: a build script's
+    /// directives are consumed by Cargo, not observable from a unit test. No
+    /// self-match risk here — the scraped file is `build.rs`, a different file
+    /// from the one this test lives in, so this test's own literals can never
+    /// appear in the text being searched.
+    #[test]
+    fn build_script_resolves_git_paths_instead_of_hardcoding_them() {
+        let src = include_str!("../../build.rs");
+
+        assert!(
+            !src.contains("rerun-if-changed=../.git/"),
+            "build.rs hardcodes a path inside .git/, which does not resolve in \
+             a git worktree and makes the build script permanently dirty there. \
+             Use `git rev-parse --git-path` so it works in both layouts."
+        );
+        assert!(
+            src.contains("--git-path"),
+            "build.rs must resolve git metadata paths via \
+             `git rev-parse --git-path` so they are correct in both a normal \
+             checkout and a worktree"
+        );
+    }
+}
