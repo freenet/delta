@@ -1737,6 +1737,67 @@ mod tests {
 
     // --- adapter: decisions must be safe under mis-correlation ---
 
+    /// The last-write gate in `import_signing_key`, pinned directly: bytes
+    /// that do not derive the supplied prefix are refused BEFORE any delegate
+    /// round-trip, permanently (the keypair IS the site identity, so the
+    /// verdict is stable across versions — never retryable). Every current
+    /// caller derives the prefix from the bytes first, so this gate is
+    /// defence in depth against a future caller trusting a request-side label
+    /// again — and an unpinned defence-in-depth guard is worth nothing,
+    /// because the change it exists to catch would delete or bypass it
+    /// silently. Deleting the gate makes this test fail.
+    #[test]
+    fn a_key_is_never_written_under_a_prefix_it_does_not_derive() {
+        use freenet_migrate::RetryAdvice;
+
+        let fixture = diff::Fixture {
+            predecessors: Vec::new(),
+            successor: diff::DelegateFixture::modern(),
+        };
+        let node = diff::FakeNode::new(&fixture);
+        let mut markers = diff::MemoryMarkers::default();
+        let mut io = DeltaSuccessorIo::new(
+            &node,
+            &mut markers,
+            diff::delegate_key(diff::successor_key_bytes()),
+            None,
+        );
+
+        // Bytes that derive prefix_of_seed(2), offered under p1's slot.
+        let p1 = diff::prefix_of_seed(1);
+        let foreign = diff::signing_key_seed(2).to_vec();
+        let result = diff::block_on(io.import_signing_key(p1.clone(), foreign));
+        assert!(
+            matches!(
+                &result,
+                ItemWrite::Failed {
+                    error: WriteError::Malformed("signing key"),
+                    retry: RetryAdvice::Permanent,
+                }
+            ),
+            "a foreign key under p1 must be refused permanently, got {result:?}"
+        );
+        assert!(
+            node.log.borrow().is_empty(),
+            "the gate must refuse before ANY delegate round-trip — it may not \
+             depend on what the (possibly mis-correlated) channel answers"
+        );
+        assert!(
+            node.successor_state().per_prefix_keys.is_empty(),
+            "nothing may be written to the slot"
+        );
+
+        // Control: the gate must not over-block — the same bytes under the
+        // prefix they DO derive import normally.
+        let own = diff::prefix_of_seed(2);
+        let result = diff::block_on(io.import_signing_key(own.clone(), diff::signing_key_seed(2).to_vec()));
+        assert!(matches!(result, ItemWrite::Written), "got {result:?}");
+        assert_eq!(
+            node.successor_state().per_prefix_keys.get(&own),
+            Some(&diff::signing_key_seed(2)),
+        );
+    }
+
     /// Defect 3, the successor half — the data-loss headline. While the
     /// migration imports p1's key, its "does the successor already hold p1's
     /// key?" probe is answered by a reply carrying ANOTHER site's key (a
@@ -1843,6 +1904,62 @@ mod tests {
             Some(&diff::signing_key_seed(9)),
             "the recovered key must land under the prefix it actually derives"
         );
+    }
+
+    /// The same gate reached the way it will actually be reached in the field,
+    /// rather than by a direct call (see
+    /// `a_key_is_never_written_under_a_prefix_it_does_not_derive` for the unit
+    /// half): a predecessor whose `delta:signing_key:{p1}` slot ALREADY holds a
+    /// different site's key.
+    ///
+    /// That is not hypothetical — it is precisely the wreckage a pre-fix build
+    /// could have written, since the old probe path attributed a
+    /// legacy-fallback reply to the probed prefix. So the first thing this
+    /// migration must not do is faithfully copy that corruption forward, where
+    /// never-clobber would then refuse to correct it forever.
+    #[test]
+    fn a_mis_slotted_predecessor_key_is_not_copied_forward() {
+        let p1 = diff::prefix_of_seed(1);
+        let q = diff::prefix_of_seed(9);
+        let mut predecessor = diff::DelegateFixture::modern();
+        // Mis-slotted: p1's slot holds q's key.
+        predecessor
+            .per_prefix_keys
+            .insert(p1.clone(), diff::signing_key_seed(9));
+        predecessor.known_sites = vec![diff::site(&p1, "Mis-slotted")];
+        let fixture = diff::Fixture {
+            predecessors: vec![predecessor],
+            successor: diff::DelegateFixture::modern(),
+        };
+        let node = diff::FakeNode::new(&fixture);
+
+        let mut markers = diff::MemoryMarkers::default();
+        let _report = diff::block_on(run_delegate_migration(
+            &node,
+            &mut markers,
+            diff::delegate_key(diff::successor_key_bytes()),
+            &fixture.lineage(),
+            Vec::new(),
+        ));
+
+        let landed = node.successor_state();
+        assert_ne!(
+            landed.per_prefix_keys.get(&p1),
+            Some(&diff::signing_key_seed(9)),
+            "a key that does not derive p1 must never be written under p1, \
+             however it reached the writer — copying a predecessor's existing \
+             mis-slotting forward makes the corruption permanent, because \
+             never-clobber then refuses to correct it"
+        );
+        // Whatever the writer decides to do with such an item, the one thing it
+        // may not do is honour the slot it was labelled with.
+        if let Some(landed_under_q) = landed.per_prefix_keys.get(&q) {
+            assert_eq!(
+                landed_under_q,
+                &diff::signing_key_seed(9),
+                "if the key is re-homed at all, it goes to the prefix it derives"
+            );
+        }
     }
 
     /// Defect 1's residual (the lead analysis called `GetKnownSites`
