@@ -57,53 +57,25 @@ fi
 description = "Rebuild and copy contract/delegate WASMs to committed locations"
 script = "./scripts/sync-wasm.sh"
 
+# Delegates to scripts/check-migration.sh rather than reimplementing it. This
+# task used to carry its own inline copy that only compared the committed WASM
+# against a fresh build, so `cargo make publish-delta` -- the documented publish
+# path -- never ran the predecessor check at all and published happily with a
+# migration entry missing (delta#46). Keep this a one-line delegation: the gate
+# has exactly one implementation, and this is not it.
 [tasks.check-migration]
-description = "Verify delegate WASM is up-to-date and migration entries exist"
-script = '''
-#!/bin/bash
-set -euo pipefail
+description = "Migration safety gate: committed WASMs match source and their predecessors are recorded"
+script = "./scripts/check-migration.sh"
 
-echo "=== Pre-publish delegate WASM check ==="
-
-# 1. Rebuild delegate from source
-./scripts/build-wasm.sh -p site-delegate 2>/dev/null
-
-COMMITTED="ui/public/contracts/site_delegate.wasm"
-BUILT="target/wasm32-unknown-unknown/release/site_delegate.wasm"
-TOML="legacy_delegates.toml"
-
-COMMITTED_HASH=$(b3sum "$COMMITTED" | cut -d' ' -f1)
-BUILT_HASH=$(b3sum "$BUILT" | cut -d' ' -f1)
-
-if [ "$COMMITTED_HASH" = "$BUILT_HASH" ]; then
-    echo "Delegate WASM is up-to-date (hash: ${COMMITTED_HASH:0:16}...)."
-    exit 0
-fi
-
-echo ""
-echo "!!! DELEGATE WASM HAS CHANGED !!!"
-echo "  committed: $COMMITTED_HASH"
-echo "  built:     $BUILT_HASH"
-echo ""
-
-# Check if the OLD (committed) hash is in legacy_delegates.toml
-if grep -qF "$COMMITTED_HASH" "$TOML"; then
-    echo "Old hash is already in $TOML. Run ./scripts/sync-wasm.sh to update."
-    exit 1
-fi
-
-echo "Old hash is NOT in $TOML. You must add a migration entry first!"
-echo ""
-echo "Run these commands:"
-echo "  ./scripts/add-migration.sh VERSION \"DESCRIPTION\""
-echo "  ./scripts/sync-wasm.sh"
-echo ""
-exit 1
-'''
+[tasks.test-migration-gate]
+description = "Prove the migration gate still refuses an unrecorded predecessor"
+script = "./scripts/tests/check-migration-test.sh"
 
 [tasks.preflight]
 description = "Run all checks before publishing"
-dependencies = ["check-migration"]
+# test-migration-gate runs BEFORE check-migration: a gate that has lost its
+# ability to refuse would otherwise report "Safe to publish" and be believed.
+dependencies = ["test-migration-gate", "check-migration"]
 script = '''
 #!/bin/bash
 set -euo pipefail

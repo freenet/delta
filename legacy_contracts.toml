@@ -20,6 +20,23 @@
 #   Run this BEFORE modifying `common/` or the contract so that the
 #   committed `ui/public/contracts/site_contract.wasm` is still the
 #   old release's WASM when its hash is recorded.
+#   To record a generation that is already committed (so neither the
+#   working tree nor HEAD still holds it), pass --hash <64-hex>; the
+#   hash is verified against the WASM's git history before being written.
+#
+# Entry ORDER is chronological by when each entry was added, not by the
+# age of the generation it names. C8-C10 are a retroactive backfill of
+# three April 2026 generations, so they name the OLDEST states in the
+# file. Order does not affect behaviour: ui/build.rs emits every entry
+# and the sweep probes all of them.
+#
+# This file was created on 2026-04-12 (commit df4fbe9) and backfilled
+# from git history at that time. That backfill was incomplete: it
+# recorded C1/C2/C3 but skipped three sibling generations from the same
+# fortnight, which went unnoticed until 2026-08 because the release gate
+# only ever compared the single immediately-preceding generation.
+# check-migration.sh now audits EVERY committed generation against this
+# file in both directions, which is what surfaced them.
 
 [[entry]]
 version = "C1"
@@ -62,3 +79,21 @@ version = "C7"
 description = "Before self-delta empty-bytes fix + deletion-propagation via compute_delta (delta#43)"
 date = "2026-07-30"
 code_hash = "192b171dc49e97c3b7ac014fcd7d932d6275b6917c944a76a2aec86613a6f8d2"
+
+[[entry]]
+version = "C8"
+description = "Backfill: per-site signing key WASM (b459862, live 2026-04-09), superseded by signed page order"
+date = "2026-08-10"
+code_hash = "64595b28b031014b36c0efd584ded78159c5ec584b5abd984c733696fd9e1915"
+
+[[entry]]
+version = "C9"
+description = "Backfill: tombstone page-deletion WASM (4f236a5, live 2026-04-06 to 04-09)"
+date = "2026-08-10"
+code_hash = "fd0e78e98d082269537c05e9c150cb88b95552e7b286f80242a2edf26637266f"
+
+[[entry]]
+version = "C10"
+description = "Backfill: initial gateway-publish WASM (ccb0b9f, live 2026-04-02), predates the 10-char-prefix parameters refactor"
+date = "2026-08-10"
+code_hash = "d2034ea8d646885e2fd9ff04c9cb5506686cbeeb06a67ecc8a6eeca643991794"
