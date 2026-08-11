@@ -113,7 +113,7 @@ impl Fixture {
 }
 
 /// A deterministic distinct 32-byte value per generation.
-fn gen_hash(generation: usize) -> [u8; 32] {
+pub fn gen_hash(generation: usize) -> [u8; 32] {
     let mut out = [0u8; 32];
     out[0] = 0xA0 | (generation as u8);
     out[31] = generation as u8;
@@ -121,27 +121,29 @@ fn gen_hash(generation: usize) -> [u8; 32] {
 }
 
 /// The successor's own key, distinct from every generation's.
-fn successor_key_bytes() -> [u8; 32] {
+pub fn successor_key_bytes() -> [u8; 32] {
     [0xFF; 32]
 }
 
-fn delegate_key(bytes: [u8; 32]) -> DelegateKey {
+/// A `DelegateKey` whose key and code hash are both `bytes`.
+pub fn delegate_key(bytes: [u8; 32]) -> DelegateKey {
     DelegateKey::new(bytes, CodeHash::new(bytes))
 }
 
 /// A deterministic, VALID Ed25519 signing key seed, so `pubkey_to_prefix`
 /// round-trips (the legacy-slot arm re-derives a prefix from the key).
-fn signing_key_seed(tag: u8) -> [u8; 32] {
+pub fn signing_key_seed(tag: u8) -> [u8; 32] {
     [tag; 32]
 }
 
 /// The site prefix a `signing_key_seed(tag)` actually belongs to.
-fn prefix_of_seed(tag: u8) -> String {
+pub fn prefix_of_seed(tag: u8) -> String {
     let sk = ed25519_dalek::SigningKey::from_bytes(&signing_key_seed(tag));
     delta_core::pubkey_to_prefix(&sk.verifying_key())
 }
 
-fn site(prefix: &str, name: &str) -> KnownSiteRecord {
+/// A live `KnownSiteRecord` for `prefix`.
+pub fn site(prefix: &str, name: &str) -> KnownSiteRecord {
     KnownSiteRecord {
         prefix: prefix.to_string(),
         name: name.to_string(),
@@ -287,9 +289,20 @@ impl FakeNode {
                     // V6/V7 cannot deserialize this variant at all.
                     return DelegateResponse::Error("unsupported request".into());
                 }
-                match store.per_prefix_keys.get(&prefix) {
+                // The real delegate's `load_signing_key(Some(prefix))` FALLS
+                // BACK to the legacy single slot when no per-prefix key is
+                // stored — so a genuine reply to this request can carry a
+                // DIFFERENT site's key. Modelling that is load-bearing for the
+                // mis-attribution tests.
+                match store
+                    .per_prefix_keys
+                    .get(&prefix)
+                    .or(store.legacy_key.as_ref())
+                {
                     Some(seed) => DelegateResponse::SigningKey(seed.to_vec()),
-                    None => DelegateResponse::Error("no signing key stored".into()),
+                    None => {
+                        DelegateResponse::Error("no signing key stored -- store key first".into())
+                    }
                 }
             }
             DelegateRequest::GetSiteState { prefix } => match store.site_states.get(&prefix) {
@@ -297,7 +310,10 @@ impl FakeNode {
                     prefix,
                     state_bytes: bytes.clone(),
                 },
-                None => DelegateResponse::Error("no state stored".into()),
+                // The real delegate's exact absence string (frozen in the
+                // deployed WASM); the adapter distinguishes it from other
+                // errors, so the fake must reproduce it faithfully.
+                None => DelegateResponse::Error(format!("no backed-up state for site {prefix}")),
             },
             DelegateRequest::StoreSigningKey { key_bytes, prefix } => {
                 let Ok(seed) = <[u8; 32]>::try_from(key_bytes.as_slice()) else {
@@ -355,7 +371,7 @@ impl MigrationMarkerStore for MemoryMarkers {
 /// Poll a future to completion. Every future in this test is driven by the
 /// synchronous [`FakeNode`], so it is ready on the first poll; a `Pending` here
 /// means the fixture grew a genuinely async path and this needs a real executor.
-fn block_on<F: Future>(fut: F) -> F::Output {
+pub fn block_on<F: Future>(fut: F) -> F::Output {
     use core::task::{Context, Poll, Waker};
     let mut fut = core::pin::pin!(fut);
     let mut cx = Context::from_waker(Waker::noop());
@@ -654,10 +670,23 @@ mod tests {
     }
 
     /// Never-clobber, directly: the successor's own key for a prefix must win
-    /// over a predecessor's different key for the SAME prefix. The library does
+    /// over a predecessor's different key for the SAME slot. The library does
     /// NOT enforce this — under `UnionAllGenerations` it rests entirely on the
     /// writer, and an overwriting writer would install the OLDEST generation's
     /// value with a clean report.
+    ///
+    /// The fixture necessarily stores keys that do NOT derive the slot's
+    /// prefix: a genuine `delta:signing_key:{p}` always holds p's one true
+    /// keypair, identical in every generation, so a same-slot CONTEST between
+    /// different keys only exists where some slot was mis-written (the
+    /// correlation corruption the adapter now guards against). The adoption
+    /// therefore does not compare-and-decline these in place — it re-homes
+    /// each recovered key under the prefix its bytes derive, which protects
+    /// the successor's slot just as absolutely (nothing may write a foreign
+    /// key there) while also repairing the mis-slotted values. The shipped
+    /// sweep's oracle is not consulted here: its transcription attributes
+    /// per-prefix probe replies to the probed slot, which is exactly the
+    /// attribution bug, so agreement would pin the wrong behaviour.
     #[test]
     fn successor_key_is_never_clobbered() {
         let prefix = prefix_of_seed(1);
@@ -681,11 +710,22 @@ mod tests {
             predecessors: vec![older, newer],
             successor,
         };
-        let landed = assert_agree(&fixture, "never-clobber");
+        let (landed, _) = run_adoption(&fixture);
         assert_eq!(
             landed.signing_keys.get(&prefix),
             Some(&signing_key_seed(1)),
             "the successor's own key must survive a union walk over two predecessors"
+        );
+        // The predecessors' mis-slotted keys are re-homed, not lost and not
+        // written over the successor's slot.
+        assert_eq!(
+            landed.signing_keys.get(&prefix_of_seed(8)),
+            Some(&signing_key_seed(8)),
+            "a recovered key lands under the prefix its bytes derive"
+        );
+        assert_eq!(
+            landed.signing_keys.get(&prefix_of_seed(9)),
+            Some(&signing_key_seed(9)),
         );
     }
 
@@ -756,19 +796,24 @@ mod tests {
     // DIVERGENCES — asserted, not tuned away
     // -----------------------------------------------------------------------
 
-    /// **Divergence 1 (adoption is better).** The shipped sweep's `SigningKey`
-    /// arm calls `store_signing_key` UNCONDITIONALLY, with no never-clobber
-    /// check, and the responses from several legacy delegates arrive
-    /// concurrently. So when two generations hold DIFFERENT keys for the same
-    /// prefix, which one ends up stored depends on WebSocket arrival order — it
-    /// is nondeterministic in production.
+    /// **Divergence 1 (adoption is better).** A prefix can only ever be
+    /// "contested" by keys that do not derive it — a genuine
+    /// `delta:signing_key:{p}` always holds p's one true keypair — so a
+    /// contested slot is by construction a MIS-SLOTTED one (the correlation
+    /// corruption, or a pre-fix probe-attribution write). What lands then
+    /// depends on the implementation:
     ///
-    /// The adoption is deterministic: the newest generation's value wins,
-    /// because the writer is never-clobber and the library walks newest-first.
+    /// * The shipped sweep's `SigningKey` arm re-derives a key's prefix from
+    ///   its bytes, but the model's per-prefix probe transcription — and the
+    ///   pre-fix adoption, measured — attributed the reply to the PROBED slot,
+    ///   with no never-clobber check, so concurrent legacy responses raced and
+    ///   the LAST one to arrive won the slot: nondeterministic in production.
+    /// * The adoption is deterministic and content-addressed: each recovered
+    ///   key lands under the prefix its bytes derive, the contested slot is
+    ///   never written with a foreign key at all, and between generations the
+    ///   newest wins (never-clobber, newest-first walk).
     ///
     /// The fixtures cannot make these agree, and they should not be made to.
-    /// This test pins the adoption's determinism and documents that the shipped
-    /// behaviour is the racy one.
     #[test]
     fn divergence_shipped_sweep_last_response_wins() {
         let prefix = prefix_of_seed(5);
@@ -793,12 +838,22 @@ mod tests {
         let (landed, _) = run_adoption(&fixture);
         assert_eq!(
             landed.signing_keys.get(&prefix),
+            None,
+            "the contested slot must never be written with a key that does not derive it"
+        );
+        assert_eq!(
+            landed.signing_keys.get(&prefix_of_seed(7)),
             Some(&signing_key_seed(7)),
-            "the adoption must deterministically prefer the NEWEST generation's key"
+            "each recovered key must land under its own derived prefix"
+        );
+        assert_eq!(
+            landed.signing_keys.get(&prefix_of_seed(6)),
+            Some(&signing_key_seed(6)),
         );
 
-        // The shipped model walks oldest-first and takes the first key it finds,
-        // which is the OLDER one — one of the two orders production can produce.
+        // The shipped model walks oldest-first and takes the first key it finds
+        // for the probed slot, which is the OLDER one — one of the orders
+        // production could produce.
         let (old_landed, _) = shipped_sweep(&fixture);
         assert_eq!(
             old_landed.signing_keys.get(&prefix),

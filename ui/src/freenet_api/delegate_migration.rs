@@ -110,9 +110,16 @@ pub const SECRET_SITE_STATE_PREFIX: &str = "delta:site_state:";
 /// Delta's production transport is fire-and-forget (`send_to_delegate_key`
 /// pushes a `ClientRequest` and the reply lands later in the global
 /// [`super::delegate::handle_delegate_response`]), so the wasm implementation
-/// correlates replies by `(delegate_key, response-kind)`. Abstracting it here is
-/// what lets the whole adapter — and the differential against the shipped sweep
-/// — run natively in unit tests rather than only in a browser.
+/// correlates replies via the [`correlation`] registry: by delegate key, reply
+/// kind, and whatever identity the reply itself carries — the protocol has no
+/// request ids, and the concurrently-running legacy sweep sends the same
+/// request kinds to the same delegates, so a same-kind reply is NOT proof it
+/// answers this request. Callers must therefore treat a reply as evidence only
+/// of what its content proves (see [`DeltaSuccessorIo::has_signing_key`] and
+/// [`DeltaPredecessorIo::fetch_secrets`] for the two places that matters).
+/// Abstracting the round-trip here is what lets the whole adapter — and the
+/// differential against the shipped sweep — run natively in unit tests rather
+/// than only in a browser.
 ///
 /// # Contract
 ///
@@ -287,6 +294,20 @@ impl<C: DeltaDelegateChannel> PredecessorSecretsIo for DeltaPredecessorIo<'_, C>
         }
 
         // 3. Per-site signing keys and state backups.
+        //
+        // Replies are attributed by their CONTENT, never by the request they
+        // are assumed to answer. A `SigningKey` reply names no prefix, and two
+        // real senders can put a differently-owned key on this await: the
+        // delegate's own legacy-single-slot fallback (a sequential fact of the
+        // shipped WASM), and a mis-correlated reply to one of the concurrent
+        // sweep's probes. Slotting such bytes under the PROBED prefix wrote
+        // another site's key into `delta:signing_key:{probed}` — permanent
+        // wrong-key corruption once never-clobber seals it. Deriving the slot
+        // from the key bytes makes every genuine key land under its true
+        // prefix no matter which request its reply actually answered. (A key
+        // whose true owner was thereby not probed loses nothing either: the
+        // same reply falls through to the sweep's `SigningKey` arm, which
+        // re-stores it content-addressed as well.)
         for prefix in &prefixes {
             if let Some(DelegateResponse::SigningKey(bytes)) = self
                 .channel
@@ -298,12 +319,24 @@ impl<C: DeltaDelegateChannel> PredecessorSecretsIo for DeltaPredecessorIo<'_, C>
                 )
                 .await?
             {
-                if !bytes.is_empty() {
-                    pairs.push((per_prefix_signing_key(prefix).into_bytes(), bytes));
+                if let Some(derived) = signing_key_prefix(&bytes) {
+                    let slot = per_prefix_signing_key(&derived).into_bytes();
+                    // Distinct probes can surface the same key (the fallback
+                    // serves it for every keyless prefix); emit it once.
+                    if !pairs.iter().any(|(key, _)| *key == slot) {
+                        pairs.push((slot, bytes));
+                    }
                 }
             }
 
-            if let Some(DelegateResponse::SiteState { state_bytes, .. }) = self
+            // A `SiteState` reply DOES echo its prefix; trust the echo, not
+            // the request. (The wasm registry already rejects a mismatched
+            // echo, so there the two always agree; a non-wasm channel gets the
+            // same attribution safety from this.)
+            if let Some(DelegateResponse::SiteState {
+                prefix: echoed,
+                state_bytes,
+            }) = self
                 .channel
                 .request(
                     predecessor,
@@ -314,7 +347,10 @@ impl<C: DeltaDelegateChannel> PredecessorSecretsIo for DeltaPredecessorIo<'_, C>
                 .await?
             {
                 if !state_bytes.is_empty() {
-                    pairs.push((site_state_key(prefix).into_bytes(), state_bytes));
+                    let slot = site_state_key(&echoed).into_bytes();
+                    if !pairs.iter().any(|(key, _)| *key == slot) {
+                        pairs.push((slot, state_bytes));
+                    }
                 }
             }
         }
@@ -326,6 +362,25 @@ impl<C: DeltaDelegateChannel> PredecessorSecretsIo for DeltaPredecessorIo<'_, C>
 /// The delegate's per-site signing-key slot name for `prefix`.
 pub fn per_prefix_signing_key(prefix: &str) -> String {
     format!("{SECRET_SIGNING_KEY_PREFIX}{prefix}")
+}
+
+/// The site prefix `key_bytes` ACTUALLY belongs to, derived from its public
+/// half. `None` if the bytes are not a 32-byte Ed25519 seed.
+///
+/// A site's identity IS its keypair (`prefix = base58(pubkey)[..10]`), so a
+/// signing key carries its own attribution. That is the module's defence
+/// against every form of mis-labelled key: the delegate's `SigningKey` reply
+/// names no prefix, the reply stream carries no request ids, and the real
+/// delegate's `load_signing_key` even FALLS BACK to the legacy single slot —
+/// so the reply to `GetSigningKeyForPrefix { p }` can legitimately carry a
+/// different site's key. Trusting the request's prefix would write that key
+/// under `delta:signing_key:p`, permanently (never-clobber) breaking the site;
+/// deriving the prefix from the key bytes makes a wrong-slot write impossible
+/// regardless of which request a reply actually answered.
+pub fn signing_key_prefix(key_bytes: &[u8]) -> Option<String> {
+    let arr: [u8; 32] = key_bytes.try_into().ok()?;
+    let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
+    Some(delta_core::pubkey_to_prefix(&sk.verifying_key()))
 }
 
 /// The delegate's state-backup slot name for `prefix`.
@@ -471,6 +526,21 @@ pub struct DeltaSuccessorIo<'a, C: DeltaDelegateChannel, M: MigrationMarkerStore
     markers: &'a mut M,
     successor: DelegateKey,
     newest_generation: Option<u32>,
+    /// Every known-sites contribution this RUN has already merged toward the
+    /// successor, accumulated across predecessors.
+    ///
+    /// The read half of the read-merge-write cannot be trusted to be fresh:
+    /// its `GetKnownSites` await can be resolved by a mis-correlated reply
+    /// whose snapshot predates this run's own previous `StoreKnownSites` (the
+    /// concurrent sweep reads the same delegate). Since `StoreKnownSites`
+    /// REPLACES the whole list, merging against such a stale base would roll
+    /// an earlier generation's sites back off the delegate. Folding this
+    /// accumulator into every base makes the run's merges MONOTONE: a stale
+    /// read can no longer unwind them. (What it does NOT defend: a stale base
+    /// missing a concurrent USER change — that read-modify-write race predates
+    /// this module, sits outside the migration's own writes, and tombstone
+    /// precedence in `merge_known_sites` bounds it for removals.)
+    contributed_sites: Vec<KnownSiteRecord>,
 }
 
 impl<'a, C: DeltaDelegateChannel, M: MigrationMarkerStore> DeltaSuccessorIo<'a, C, M> {
@@ -491,6 +561,7 @@ impl<'a, C: DeltaDelegateChannel, M: MigrationMarkerStore> DeltaSuccessorIo<'a, 
             markers,
             successor,
             newest_generation,
+            contributed_sites: Vec::new(),
         }
     }
 
@@ -533,17 +604,47 @@ impl<'a, C: DeltaDelegateChannel, M: MigrationMarkerStore> DeltaSuccessorIo<'a, 
             .map_err(|e| WriteError::Transport(format!("{e:?}")))
     }
 
-    /// Whether the successor already holds a signing key for `prefix`.
+    /// Whether the successor already holds **`prefix`'s own** signing key.
+    ///
+    /// `true` requires the reply's key bytes to DERIVE `prefix` (see
+    /// [`signing_key_prefix`]). A non-empty `SigningKey` reply carrying some
+    /// other site's key is answered `false`, because it is one of two things,
+    /// and "the successor holds p's key" is neither:
+    ///
+    /// * the delegate's legacy-single-slot FALLBACK (no per-prefix key is
+    ///   stored, so importing one is exactly right — per-prefix wins over
+    ///   legacy in the delegate's own `select_key_bytes`); or
+    /// * a MIS-CORRELATED reply to a concurrent sweep probe for another
+    ///   prefix (`SigningKey` carries no prefix, so the reply registry cannot
+    ///   reject it). Answering `true` here was the false-`AlreadyAuthoritative`
+    ///   data loss: p's key never imported, report clean.
+    ///
+    /// Answering `false` on a mis-correlated reply is safe even when the
+    /// successor DOES hold p's key: the import that follows writes bytes that
+    /// [`Self::import_signing_key`] has validated derive to p, and p's key is
+    /// the same keypair wherever it is held, so the write is an idempotent
+    /// re-store — or a repair, if a wrong key ever landed under p.
     async fn has_signing_key(&mut self, prefix: &str) -> Result<bool, WriteError> {
         let reply = self
             .ask(DelegateRequest::GetSigningKeyForPrefix {
                 prefix: prefix.to_string(),
             })
             .await?;
-        Ok(matches!(
-            reply,
-            Some(DelegateResponse::SigningKey(ref bytes)) if !bytes.is_empty()
-        ))
+        match reply {
+            Some(DelegateResponse::SigningKey(ref bytes)) => {
+                Ok(signing_key_prefix(bytes).is_some_and(|derived| derived == prefix))
+            }
+            // The delegate reports a missing key as an error, so this is the
+            // legitimate "successor lacks it, import it" answer.
+            Some(DelegateResponse::Error(_)) => Ok(false),
+            // Silence is NOT absence. Answering `false` here would import over
+            // a key we simply failed to read; never-clobber then seals the
+            // wrong key in permanently, and the report still reads `Imported`.
+            None => Err(WriteError::NoAck("GetSigningKeyForPrefix")),
+            // Any other reply kind means the correlation matched something
+            // that was not our answer -- never act on it.
+            Some(_) => Err(WriteError::NoAck("GetSigningKeyForPrefix")),
+        }
     }
 
     /// Store a signing key for `prefix`, awaiting the delegate's ack.
@@ -563,21 +664,6 @@ impl<'a, C: DeltaDelegateChannel, M: MigrationMarkerStore> DeltaSuccessorIo<'a, 
             Some(DelegateResponse::Error(e)) => Err(WriteError::Delegate(e)),
             _ => Err(WriteError::NoAck("StoreSigningKey")),
         }
-    }
-
-    /// The per-site prefix a raw signing key belongs to, derived from its public
-    /// half.
-    ///
-    /// The legacy single slot (`delta:signing_key`) records no prefix, so a raw
-    /// pair copy would land it in the successor's legacy slot where it could
-    /// later sign ANOTHER site's content (the cross-site mis-sign
-    /// `super::delegate::signing_target` exists to prevent). Re-deriving the
-    /// prefix routes it to the correct per-site slot instead. This is precisely
-    /// the kind of app-level knowledge the 0.5.0 writer seam exists to preserve.
-    fn prefix_for_key(key_bytes: &[u8]) -> Option<String> {
-        let arr: [u8; 32] = key_bytes.try_into().ok()?;
-        let sk = ed25519_dalek::SigningKey::from_bytes(&arr);
-        Some(delta_core::pubkey_to_prefix(&sk.verifying_key()))
     }
 }
 
@@ -630,12 +716,32 @@ impl<C: DeltaDelegateChannel, M: MigrationMarkerStore> SuccessorSecretsIo
                 } else {
                     incoming.into_iter().filter(|r| r.is_tombstone()).collect()
                 };
+            // A genuinely empty successor answers `KnownSites([])` -- the
+            // delegate returns an empty vec when the secret is absent, and
+            // `Error` only when stored bytes fail to deserialize. So silence
+            // and errors NEVER legitimately mean "no sites", and must not be
+            // read as an empty base: the merge below feeds `StoreKnownSites`,
+            // which REPLACES the whole list, so one 10s timeout would drop
+            // every site the user created on the successor. Retry instead.
             let current = match self.ask(DelegateRequest::GetKnownSites).await {
                 Ok(Some(DelegateResponse::KnownSites(records))) => records,
-                Ok(_) => Vec::new(),
+                Ok(Some(DelegateResponse::Error(e))) => {
+                    return ItemWrite::retryable(WriteError::Delegate(e))
+                }
+                Ok(_) => return ItemWrite::retryable(WriteError::NoAck("GetKnownSites")),
                 Err(e) => return ItemWrite::retryable(e),
             };
-            let merged = merge_known_sites(&current, &contributions);
+            // Fold in what this run already merged, so a stale read cannot
+            // roll an earlier generation's sites back off the delegate (see
+            // `contributed_sites`). `current` keeps precedence: a genuinely
+            // newer successor record or tombstone still wins.
+            let base = merge_known_sites(&current, &self.contributed_sites);
+            let merged = merge_known_sites(&base, &contributions);
+            // Record BEFORE the store: newer generations were merged first, so
+            // first-wins accumulation preserves newest-wins, and remembering a
+            // contribution whose store then fails only means a later merge
+            // re-asserts it — the write is what a retry re-runs anyway.
+            self.contributed_sites = merge_known_sites(&self.contributed_sites, &contributions);
             if site_sets_match(&merged, &current) {
                 // Every site the predecessor knows is already represented.
                 return ItemWrite::AlreadyAuthoritative;
@@ -661,8 +767,16 @@ impl<C: DeltaDelegateChannel, M: MigrationMarkerStore> SuccessorSecretsIo
         }
 
         // --- the legacy single-slot signing key: re-derive its real prefix ---
+        //
+        // The legacy slot records no prefix, so a raw pair copy would land it
+        // in the successor's legacy slot where it could later sign ANOTHER
+        // site's content (the cross-site mis-sign
+        // `super::delegate::signing_target` exists to prevent). Re-deriving
+        // the prefix routes it to the correct per-site slot instead. This is
+        // precisely the kind of app-level knowledge the 0.5.0 writer seam
+        // exists to preserve.
         if key == SECRET_SIGNING_KEY_LEGACY {
-            let Some(prefix) = Self::prefix_for_key(item.value) else {
+            let Some(prefix) = signing_key_prefix(item.value) else {
                 return ItemWrite::permanent(WriteError::Malformed("signing key"));
             };
             return self.import_signing_key(prefix, item.value.to_vec()).await;
@@ -677,10 +791,37 @@ impl<C: DeltaDelegateChannel, M: MigrationMarkerStore> SuccessorSecretsIo
                 })
                 .await
             {
-                Ok(Some(DelegateResponse::SiteState { state_bytes, .. })) => {
-                    !state_bytes.is_empty()
+                // Only a reply that ECHOES our prefix says anything about our
+                // backup; one for another prefix is a mis-correlated answer to
+                // a concurrent sweep probe. Reading it as "we already have a
+                // backup" silently skipped importing the predecessor's — which,
+                // if the network copy is gone, was the user's only one.
+                Ok(Some(DelegateResponse::SiteState {
+                    prefix: ref echoed,
+                    ref state_bytes,
+                })) if *echoed == prefix => !state_bytes.is_empty(),
+                Ok(Some(DelegateResponse::SiteState { .. })) => {
+                    return ItemWrite::retryable(WriteError::NoAck("GetSiteState"))
                 }
-                Ok(_) => false,
+                // Unlike GetKnownSites, absence here IS reported as an error
+                // ("no backed-up state for site {prefix}"), so THAT error is
+                // the legitimate "successor has no backup" answer and must let
+                // the import proceed. It names its prefix — frozen in the
+                // deployed WASM, pinned to the delegate source by test — so
+                // absence is attributable; any OTHER error is not an answer
+                // about this prefix's backup, and treating it as absence would
+                // let an older predecessor backup replace a fresher successor
+                // one. Silence must not pass either: a timeout is not absence.
+                Ok(Some(DelegateResponse::Error(ref e)))
+                    if correlation::is_no_backup_error_for(e, &prefix) =>
+                {
+                    false
+                }
+                Ok(Some(DelegateResponse::Error(e))) => {
+                    return ItemWrite::retryable(WriteError::Delegate(e))
+                }
+                Ok(None) => return ItemWrite::retryable(WriteError::NoAck("GetSiteState")),
+                Ok(_) => return ItemWrite::retryable(WriteError::NoAck("GetSiteState")),
                 Err(e) => return ItemWrite::retryable(e),
             };
             if existing {
@@ -716,8 +857,14 @@ impl<C: DeltaDelegateChannel, M: MigrationMarkerStore> DeltaSuccessorIo<'_, C, M
         prefix: String,
         key_bytes: Vec<u8>,
     ) -> ItemWrite<WriteError> {
-        if key_bytes.len() != 32 {
-            return ItemWrite::permanent(WriteError::Malformed("signing key"));
+        // The last write gate: a key may only ever be stored under the prefix
+        // it derives (see `signing_key_prefix`). Every current caller supplies
+        // a derived prefix, so this is defence in depth against a future
+        // caller trusting a request-side label again; the verdict is stable
+        // across versions (the keypair IS the site identity), hence permanent.
+        match signing_key_prefix(&key_bytes) {
+            Some(derived) if derived == prefix => {}
+            _ => return ItemWrite::permanent(WriteError::Malformed("signing key")),
         }
         match self.has_signing_key(&prefix).await {
             // Never-clobber: the successor's key for this site stands.
@@ -807,6 +954,303 @@ pub fn delta_delegate_lineage(table: &[([u8; 32], [u8; 32])]) -> Vec<DelegateLin
 }
 
 // ---------------------------------------------------------------------------
+// Reply correlation (the host-testable core of the production transport)
+// ---------------------------------------------------------------------------
+
+/// Correlates delegate replies with in-flight migration round-trips.
+///
+/// Delta's delegate protocol carries NO request id, and adding one would change
+/// the delegate WASM — the exact re-key this migration exists to survive. So a
+/// reply can be matched to a request only by (delegate key, reply shape, and
+/// whatever identity the reply itself carries).
+///
+/// The migration awaits its own round-trips sequentially, so it never has more
+/// than ONE request outstanding and the registry holds at most one slot. That
+/// does NOT make kind-matching sound on its own: the shipped sweep in
+/// `super::delegate` runs CONCURRENTLY from the same trigger and sends the
+/// SAME request kinds to the SAME delegates (`fire_legacy_migration`,
+/// `migrate_per_prefix_signing_key`, `request_site_state_backup`, plus the
+/// stores its response arms issue). Mutual exclusion is not achievable either:
+/// the migration's own replies deliberately FALL THROUGH into those sweep arms
+/// (see `handle_delegate_response`), and the arms respond by sending more
+/// same-kind requests, so sweep traffic during the migration is guaranteed by
+/// design. The registry therefore accepts a reply for the slot only when it is
+/// consistent with the request, and every decision the adapter derives from a
+/// reply that carries no identity of its own is made safe under
+/// mis-correlation at the point of decision (see
+/// [`DeltaSuccessorIo::has_signing_key`] and
+/// [`DeltaPredecessorIo::fetch_secrets`]).
+///
+/// This module is compiled on every target so those rules are testable on the
+/// host; only the browser glue (timers, sends) lives in `wasm_transport`.
+///
+/// [`DeltaSuccessorIo::has_signing_key`]: super::DeltaSuccessorIo
+/// [`DeltaPredecessorIo::fetch_secrets`]: super::DeltaPredecessorIo
+pub mod correlation {
+    use super::{DelegateRequest, DelegateResponse};
+    use freenet_stdlib::prelude::DelegateKey;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::task::{Context, Poll, Waker};
+
+    /// The reply shape a request expects.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub enum ReplyKind {
+        /// `GetPublicKey` → `PublicKey`.
+        PublicKey,
+        /// `GetSigningKey` / `GetSigningKeyForPrefix` → `SigningKey`.
+        SigningKey,
+        /// `GetKnownSites` → `KnownSites`.
+        KnownSites,
+        /// `GetSiteState` → `SiteState`.
+        SiteState,
+        /// `StoreSigningKey` → `KeyStored`.
+        KeyStored,
+        /// `StoreKnownSites` → `SitesStored`.
+        SitesStored,
+        /// `StoreSiteState` → `SiteStateStored`.
+        SiteStateStored,
+    }
+
+    /// What a pending request will accept as its answer.
+    #[derive(Clone, Debug)]
+    pub struct Expectation {
+        kind: ReplyKind,
+        /// The prefix the request named, for requests that name one. Used to
+        /// validate the echo in a `SiteState` reply and the prefix embedded in
+        /// the delegate's site-state absence error. Deliberately NOT used to
+        /// gate `SigningKey` replies: the delegate legitimately answers
+        /// `GetSigningKeyForPrefix { p }` with its LEGACY single-slot key (a
+        /// different site's key) when no per-prefix key is stored, so a
+        /// prefix-mismatched `SigningKey` reply can be a genuine answer. Those
+        /// are validated where the DECISION is made instead.
+        prefix: Option<String>,
+    }
+
+    impl Expectation {
+        /// The expectation `request` establishes, or `None` for a request the
+        /// delegate protocol does not cover.
+        pub fn of_request(request: &DelegateRequest) -> Option<Self> {
+            let kind = match request {
+                DelegateRequest::GetPublicKey => ReplyKind::PublicKey,
+                DelegateRequest::GetSigningKey | DelegateRequest::GetSigningKeyForPrefix { .. } => {
+                    ReplyKind::SigningKey
+                }
+                DelegateRequest::GetKnownSites => ReplyKind::KnownSites,
+                DelegateRequest::GetSiteState { .. } => ReplyKind::SiteState,
+                DelegateRequest::StoreSigningKey { .. } => ReplyKind::KeyStored,
+                DelegateRequest::StoreKnownSites { .. } => ReplyKind::SitesStored,
+                DelegateRequest::StoreSiteState { .. } => ReplyKind::SiteStateStored,
+                _ => return None,
+            };
+            let prefix = match request {
+                DelegateRequest::GetSiteState { prefix }
+                | DelegateRequest::GetSigningKeyForPrefix { prefix } => Some(prefix.clone()),
+                _ => None,
+            };
+            Some(Self { kind, prefix })
+        }
+
+        /// Whether `response` answers this request.
+        ///
+        /// A reply is accepted only when it is CONSISTENT with the request:
+        ///
+        /// * its shape answers the request kind;
+        /// * a `SiteState` reply must echo the requested prefix — one for
+        ///   another prefix is provably an answer to some other (concurrent
+        ///   sweep) request, and rejecting it lets OUR reply, which is still
+        ///   queued behind it, resolve the await instead;
+        /// * an `Error` whose text is one of the current delegate's FROZEN
+        ///   strings (the deployed WASM cannot change without the re-key this
+        ///   migration exists to survive, so the strings are stable; pinned to
+        ///   the delegate source by `error_classification_matches_the_shipped_delegate`)
+        ///   must belong to the awaited kind — and, for the site-state absence
+        ///   error, name the awaited prefix. An error a concurrent sweep probe
+        ///   provoked for a different kind is thereby left to fall through.
+        ///   Unrecognized error text (an older generation's wording) matches
+        ///   any kind, preserving "an error proves execution" for the
+        ///   executability preflight.
+        pub fn matches(&self, response: &DelegateResponse) -> bool {
+            match (self.kind, response) {
+                (kind, DelegateResponse::Error(msg)) => {
+                    error_may_answer(kind, self.prefix.as_deref(), msg)
+                }
+                (ReplyKind::PublicKey, DelegateResponse::PublicKey(_)) => true,
+                (ReplyKind::SigningKey, DelegateResponse::SigningKey(_)) => true,
+                (ReplyKind::KnownSites, DelegateResponse::KnownSites(_)) => true,
+                (ReplyKind::SiteState, DelegateResponse::SiteState { prefix, .. }) => self
+                    .prefix
+                    .as_deref()
+                    .is_none_or(|expected| expected == prefix),
+                (ReplyKind::KeyStored, DelegateResponse::KeyStored) => true,
+                (ReplyKind::SitesStored, DelegateResponse::SitesStored) => true,
+                (ReplyKind::SiteStateStored, DelegateResponse::SiteStateStored) => true,
+                _ => false,
+            }
+        }
+    }
+
+    /// The current delegate's signing-key absence answer (`load_signing_key`).
+    pub const ERR_NO_SIGNING_KEY: &str = "no signing key stored -- store key first";
+    /// The current delegate's corrupt-stored-key answer (`parse_signing_key`).
+    pub const ERR_STORED_KEY_BAD_LEN: &str = "stored key is not 32 bytes";
+    /// The current delegate's `StoreSigningKey` length rejection.
+    pub const ERR_STORE_KEY_BAD_LEN: &str = "signing key must be 32 bytes";
+    /// Prefix of the current delegate's `GetKnownSites` decode failure.
+    pub const ERR_KNOWN_SITES_DECODE_PREFIX: &str = "deserialize known sites: ";
+    /// Prefix of the current delegate's site-state absence answer; the rest of
+    /// the string is the site prefix, which is what makes site-state absence
+    /// ATTRIBUTABLE where signing-key absence is not.
+    pub const ERR_NO_SITE_BACKUP_PREFIX: &str = "no backed-up state for site ";
+
+    /// Whether `msg` is the current delegate's "no backup" answer **about
+    /// `prefix`** — as opposed to about some other site's backup, or an
+    /// unrelated error entirely.
+    pub fn is_no_backup_error_for(msg: &str, prefix: &str) -> bool {
+        msg.strip_prefix(ERR_NO_SITE_BACKUP_PREFIX) == Some(prefix)
+    }
+
+    /// Whether an in-band `Error` with text `msg` can be the answer to an
+    /// outstanding request of `kind` (about `expected_prefix`, where the
+    /// request named one). See [`Expectation::matches`] for the contract.
+    fn error_may_answer(kind: ReplyKind, expected_prefix: Option<&str>, msg: &str) -> bool {
+        if let Some(err_prefix) = msg.strip_prefix(ERR_NO_SITE_BACKUP_PREFIX) {
+            return kind == ReplyKind::SiteState
+                && expected_prefix.is_none_or(|expected| expected == err_prefix);
+        }
+        if msg == ERR_NO_SIGNING_KEY || msg == ERR_STORED_KEY_BAD_LEN {
+            // The signing-key load path answers GetPublicKey, GetSigningKey
+            // and GetSigningKeyForPrefix (and the Sign* requests, which the
+            // migration never awaits).
+            return matches!(kind, ReplyKind::PublicKey | ReplyKind::SigningKey);
+        }
+        if msg == ERR_STORE_KEY_BAD_LEN {
+            return kind == ReplyKind::KeyStored;
+        }
+        if msg.starts_with(ERR_KNOWN_SITES_DECODE_PREFIX) {
+            return kind == ReplyKind::KnownSites;
+        }
+        // Unknown text: an older delegate generation's in-band error. Match
+        // any kind — the pre-narrowing behaviour — so a legacy delegate's
+        // ordinary absence answer is never turned into a 10 s timeout and a
+        // false `Unresponsive` (the freenet/river#204 failure).
+        true
+    }
+
+    /// The resolution state of one awaited reply.
+    #[derive(Default)]
+    pub struct SlotState {
+        reply: Option<DelegateResponse>,
+        timed_out: bool,
+        waker: Option<Waker>,
+    }
+
+    /// A handle to one awaited reply, shared between the registry (which
+    /// resolves it), the timeout (which expires it), and the [`ReplyFuture`]
+    /// (which awaits it).
+    pub type Slot = Rc<RefCell<SlotState>>;
+
+    /// Expire `slot` if it has not been resolved, waking its awaiter so the
+    /// round-trip resolves as `None` (silence) instead of hanging the walk.
+    pub fn mark_timed_out(slot: &Slot) {
+        let mut state = slot.borrow_mut();
+        if state.reply.is_some() {
+            return;
+        }
+        state.timed_out = true;
+        if let Some(waker) = state.waker.take() {
+            waker.wake();
+        }
+    }
+
+    struct Pending {
+        target: Vec<u8>,
+        expectation: Expectation,
+        slot: Slot,
+    }
+
+    /// The pending-reply registry: a request parks a slot, and the response
+    /// handler offers every arriving reply to it.
+    pub struct PendingRegistry {
+        pending: RefCell<Vec<Pending>>,
+    }
+
+    impl PendingRegistry {
+        /// An empty registry.
+        pub const fn new() -> Self {
+            Self {
+                pending: RefCell::new(Vec::new()),
+            }
+        }
+
+        /// Park a slot awaiting the reply to `request` from `target`, or
+        /// `None` for a request outside the delegate protocol (the caller must
+        /// not send it).
+        pub fn register(&self, target: &DelegateKey, request: &DelegateRequest) -> Option<Slot> {
+            let expectation = Expectation::of_request(request)?;
+            let slot: Slot = Rc::new(RefCell::new(SlotState::default()));
+            self.pending.borrow_mut().push(Pending {
+                target: target.bytes().to_vec(),
+                expectation,
+                slot: slot.clone(),
+            });
+            Some(slot)
+        }
+
+        /// Offer a delegate response to any waiting round-trip, oldest waiter
+        /// first. Returns `true` if it was consumed.
+        pub fn offer(&self, responding_key: &DelegateKey, response: &DelegateResponse) -> bool {
+            let mut pending = self.pending.borrow_mut();
+            let Some(index) = pending.iter().position(|p| {
+                p.target == responding_key.bytes() && p.expectation.matches(response)
+            }) else {
+                return false;
+            };
+            let entry = pending.remove(index);
+            let mut slot = entry.slot.borrow_mut();
+            slot.reply = Some(response.clone());
+            if let Some(waker) = slot.waker.take() {
+                waker.wake();
+            }
+            true
+        }
+
+        /// How many awaits are parked. Test observability.
+        pub fn pending_len(&self) -> usize {
+            self.pending.borrow().len()
+        }
+    }
+
+    impl Default for PendingRegistry {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    /// Awaits a slot's resolution: `Some(reply)` or `None` on timeout.
+    pub struct ReplyFuture {
+        /// The slot being awaited.
+        pub slot: Slot,
+    }
+
+    impl core::future::Future for ReplyFuture {
+        type Output = Option<DelegateResponse>;
+
+        fn poll(self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+            let mut state = self.slot.borrow_mut();
+            if let Some(reply) = state.reply.take() {
+                return Poll::Ready(Some(reply));
+            }
+            if state.timed_out {
+                return Poll::Ready(None);
+            }
+            state.waker = Some(cx.waker().clone());
+            Poll::Pending
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Production transport (wasm)
 // ---------------------------------------------------------------------------
 
@@ -815,25 +1259,13 @@ pub fn delta_delegate_lineage(table: &[([u8; 32], [u8; 32])]) -> Vec<DelegateLin
 /// Delta's WebSocket transport is fire-and-forget — `send_to_delegate_key`
 /// pushes a `ClientRequest` and the reply lands later in the global
 /// [`super::delegate::handle_delegate_response`] — while the library's traits
-/// need an awaitable round-trip. This module closes that gap with a
-/// pending-reply registry: a request parks a slot keyed by
-/// `(delegate_key, expected reply kind)`, and the response handler resolves it.
-///
-/// # Correlation is by kind, not by id
-///
-/// Delta's delegate protocol carries NO request id, and adding one would change
-/// the delegate WASM — the exact re-key this migration exists to survive. So
-/// replies are matched on `(delegate_key, reply kind)`, oldest waiter first.
-/// That is sound here because the migration awaits each round-trip
-/// SEQUENTIALLY, so it never has two requests of the same kind outstanding
-/// against the same delegate. It is NOT sound for concurrent callers, which is
-/// why nothing else uses this channel.
+/// need an awaitable round-trip. The gap is closed by the
+/// [`correlation`] registry; this module contributes only the browser glue:
+/// the thread-local registry instance, the send, and the reply timeout.
 #[cfg(target_arch = "wasm32")]
 pub mod wasm_transport {
+    use super::correlation::{self, PendingRegistry, Slot};
     use super::*;
-    use std::cell::RefCell;
-    use std::rc::Rc;
-    use std::task::{Context, Poll, Waker};
 
     /// How long to wait for a reply before treating a predecessor as silent.
     ///
@@ -844,71 +1276,8 @@ pub mod wasm_transport {
     /// user their signing key.
     const REPLY_TIMEOUT_MS: u32 = 10_000;
 
-    /// The reply shape a request expects.
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    enum ReplyKind {
-        PublicKey,
-        SigningKey,
-        KnownSites,
-        SiteState,
-        KeyStored,
-        SitesStored,
-        SiteStateStored,
-    }
-
-    impl ReplyKind {
-        fn of_request(request: &DelegateRequest) -> Option<Self> {
-            Some(match request {
-                DelegateRequest::GetPublicKey => Self::PublicKey,
-                DelegateRequest::GetSigningKey | DelegateRequest::GetSigningKeyForPrefix { .. } => {
-                    Self::SigningKey
-                }
-                DelegateRequest::GetKnownSites => Self::KnownSites,
-                DelegateRequest::GetSiteState { .. } => Self::SiteState,
-                DelegateRequest::StoreSigningKey { .. } => Self::KeyStored,
-                DelegateRequest::StoreKnownSites { .. } => Self::SitesStored,
-                DelegateRequest::StoreSiteState { .. } => Self::SiteStateStored,
-                _ => return None,
-            })
-        }
-
-        /// Whether `response` answers this request.
-        ///
-        /// `Error` answers ANY request: a delegate that replies "no signing key
-        /// stored" has demonstrably executed, which is exactly what the
-        /// executability preflight needs to distinguish from silence.
-        fn matches(self, response: &DelegateResponse) -> bool {
-            match (self, response) {
-                (_, DelegateResponse::Error(_)) => true,
-                (Self::PublicKey, DelegateResponse::PublicKey(_)) => true,
-                (Self::SigningKey, DelegateResponse::SigningKey(_)) => true,
-                (Self::KnownSites, DelegateResponse::KnownSites(_)) => true,
-                (Self::SiteState, DelegateResponse::SiteState { .. }) => true,
-                (Self::KeyStored, DelegateResponse::KeyStored) => true,
-                (Self::SitesStored, DelegateResponse::SitesStored) => true,
-                (Self::SiteStateStored, DelegateResponse::SiteStateStored) => true,
-                _ => false,
-            }
-        }
-    }
-
-    type Slot = Rc<RefCell<SlotState>>;
-
-    #[derive(Default)]
-    struct SlotState {
-        reply: Option<DelegateResponse>,
-        timed_out: bool,
-        waker: Option<Waker>,
-    }
-
-    struct Pending {
-        target: Vec<u8>,
-        kind: ReplyKind,
-        slot: Slot,
-    }
-
     thread_local! {
-        static PENDING: RefCell<Vec<Pending>> = const { RefCell::new(Vec::new()) };
+        static REGISTRY: PendingRegistry = const { PendingRegistry::new() };
     }
 
     /// Offer a delegate response to any waiting migration round-trip.
@@ -918,22 +1287,7 @@ pub mod wasm_transport {
     /// handling, so a reply the migration is awaiting is not also applied to UI
     /// state by the shipped sweep.
     pub fn offer_response(responding_key: &DelegateKey, response: &DelegateResponse) -> bool {
-        PENDING.with(|pending| {
-            let mut pending = pending.borrow_mut();
-            let Some(index) = pending
-                .iter()
-                .position(|p| p.target == responding_key.bytes() && p.kind.matches(response))
-            else {
-                return false;
-            };
-            let entry = pending.remove(index);
-            let mut slot = entry.slot.borrow_mut();
-            slot.reply = Some(response.clone());
-            if let Some(waker) = slot.waker.take() {
-                waker.wake();
-            }
-            true
-        })
+        REGISTRY.with(|registry| registry.offer(responding_key, response))
     }
 
     /// The production [`DeltaDelegateChannel`].
@@ -947,22 +1301,20 @@ pub mod wasm_transport {
             target: &DelegateKey,
             request: DelegateRequest,
         ) -> impl Future<Output = Result<Option<DelegateResponse>, Self::Error>> {
-            let slot: Slot = Rc::new(RefCell::new(SlotState::default()));
-            if let Some(kind) = ReplyKind::of_request(&request) {
-                PENDING.with(|pending| {
-                    pending.borrow_mut().push(Pending {
-                        target: target.bytes().to_vec(),
-                        kind,
-                        slot: slot.clone(),
-                    })
-                });
-                super::super::delegate::send_to_delegate_key_pub(&request, target.clone());
-                arm_timeout(slot.clone());
-            } else {
-                // A request the delegate does not understand is never sent.
-                slot.borrow_mut().timed_out = true;
-            }
-            ReplyFuture { slot }
+            let slot = match REGISTRY.with(|registry| registry.register(target, &request)) {
+                Some(slot) => {
+                    super::super::delegate::send_to_delegate_key_pub(&request, target.clone());
+                    arm_timeout(slot.clone());
+                    slot
+                }
+                None => {
+                    // A request the delegate does not understand is never sent.
+                    let slot: Slot = Slot::default();
+                    correlation::mark_timed_out(&slot);
+                    slot
+                }
+            };
+            async move { Ok(correlation::ReplyFuture { slot }.await) }
         }
     }
 
@@ -971,14 +1323,7 @@ pub mod wasm_transport {
     fn arm_timeout(slot: Slot) {
         use wasm_bindgen::prelude::*;
         let cb = Closure::<dyn Fn()>::new(move || {
-            let mut state = slot.borrow_mut();
-            if state.reply.is_some() {
-                return;
-            }
-            state.timed_out = true;
-            if let Some(waker) = state.waker.take() {
-                waker.wake();
-            }
+            correlation::mark_timed_out(&slot);
         });
         if let Some(window) = web_sys::window() {
             let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
@@ -987,26 +1332,6 @@ pub mod wasm_transport {
             );
         }
         cb.forget();
-    }
-
-    struct ReplyFuture {
-        slot: Slot,
-    }
-
-    impl Future for ReplyFuture {
-        type Output = Result<Option<DelegateResponse>, core::convert::Infallible>;
-
-        fn poll(self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            let mut state = self.slot.borrow_mut();
-            if let Some(reply) = state.reply.take() {
-                return Poll::Ready(Ok(Some(reply)));
-            }
-            if state.timed_out {
-                return Poll::Ready(Ok(None));
-            }
-            state.waker = Some(cx.waker().clone());
-            Poll::Pending
-        }
     }
 
     /// `localStorage`-backed marker store, falling back to page memory.
@@ -1170,6 +1495,479 @@ mod tests {
         assert!(
             delegate_src.contains("delta:site_state:{prefix}"),
             "site-state slot name drifted from the delegate"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // The correlation boundary.
+    //
+    // The migration shares one reply stream, with no request ids, with the
+    // shipped sweep — which sends the SAME request kinds to the SAME delegates
+    // concurrently (and is FED by the migration's own replies falling through
+    // to it, so the concurrency cannot be gated away). These tests drive that
+    // boundary with hostile interleavings: replies that are the right kind
+    // from the right delegate but answer a DIFFERENT request. The dangerous
+    // property under test is that no such reply can cause a wrong write or a
+    // false already-have-it skip.
+    // -----------------------------------------------------------------------
+
+    use super::super::delegate_migration_differential as diff;
+    use super::correlation;
+
+    /// Wraps the differential [`diff::FakeNode`], substituting a forged reply
+    /// for requests the interceptor claims — the host-side stand-in for a
+    /// mis-correlated reply picked out of the shared reply stream.
+    struct HostileChannel<'a, F>
+    where
+        F: Fn(&DelegateKey, &DelegateRequest) -> Option<DelegateResponse>,
+    {
+        inner: &'a diff::FakeNode,
+        intercept: F,
+    }
+
+    impl<F> DeltaDelegateChannel for HostileChannel<'_, F>
+    where
+        F: Fn(&DelegateKey, &DelegateRequest) -> Option<DelegateResponse>,
+    {
+        type Error = core::convert::Infallible;
+
+        async fn request(
+            &self,
+            target: &DelegateKey,
+            request: DelegateRequest,
+        ) -> Result<Option<DelegateResponse>, Self::Error> {
+            if let Some(forged) = (self.intercept)(target, &request) {
+                return Ok(Some(forged));
+            }
+            self.inner.request(target, request).await
+        }
+    }
+
+    // --- registry: which replies may resolve an await at all ---
+
+    /// The error classifier narrows `Error` matching by recognizing the
+    /// CURRENT delegate's error strings. That is sound only because the
+    /// deployed delegate WASM cannot change without the re-key this migration
+    /// exists to survive — so pin every classified string to the delegate
+    /// source, exactly as `delegate_migration_is_ui_side_only` pins the slot
+    /// names. If this fails, the classifier and the delegate have drifted and
+    /// the narrowing is misclassifying real answers.
+    #[test]
+    fn error_classification_matches_the_shipped_delegate() {
+        let delegate_src = include_str!("../../../delegates/site-delegate/src/lib.rs");
+        for (needle, what) in [
+            (
+                format!("\"{}\"", correlation::ERR_NO_SIGNING_KEY),
+                "signing-key absence",
+            ),
+            (
+                format!("\"{}\"", correlation::ERR_STORED_KEY_BAD_LEN),
+                "corrupt stored key",
+            ),
+            (
+                format!("\"{}\"", correlation::ERR_STORE_KEY_BAD_LEN),
+                "store-key length rejection",
+            ),
+            (
+                format!("\"{}{{e}}\"", correlation::ERR_KNOWN_SITES_DECODE_PREFIX),
+                "known-sites decode failure",
+            ),
+            (
+                format!("\"{}{{prefix}}\"", correlation::ERR_NO_SITE_BACKUP_PREFIX),
+                "site-state absence",
+            ),
+        ] {
+            assert!(
+                delegate_src.contains(&needle),
+                "{what} error string drifted from the delegate: {needle} not found"
+            );
+        }
+    }
+
+    /// Defect 4: `Error` used to match ANY pending kind, so an error provoked
+    /// by a concurrent sweep probe (post-re-key, the current delegate answers
+    /// "no signing key stored" to every per-prefix probe — these are COMMON,
+    /// not rare) could resolve the migration's await for a totally different
+    /// kind, e.g. its known-sites read.
+    #[test]
+    fn a_signing_key_error_does_not_resolve_a_known_sites_await() {
+        let registry = correlation::PendingRegistry::new();
+        let target = diff::delegate_key([0x11; 32]);
+        let slot = registry
+            .register(&target, &DelegateRequest::GetKnownSites)
+            .expect("GetKnownSites is a protocol request");
+
+        let sweep_error =
+            DelegateResponse::Error("no signing key stored -- store key first".into());
+        assert!(
+            !registry.offer(&target, &sweep_error),
+            "a signing-key absence error must not resolve a KnownSites await"
+        );
+        assert_eq!(registry.pending_len(), 1, "the await must still be parked");
+
+        // The genuine reply, arriving later, still resolves it.
+        let genuine = DelegateResponse::KnownSites(Vec::new());
+        assert!(registry.offer(&target, &genuine));
+        let got = diff::block_on(correlation::ReplyFuture { slot });
+        assert!(matches!(got, Some(DelegateResponse::KnownSites(_))));
+    }
+
+    /// Defect 2, transport half: a `SiteState` reply echoes its prefix, so a
+    /// reply for another site's backup is detectably not ours and must fall
+    /// through to the sweep (which is its real addressee) instead of resolving
+    /// our await.
+    #[test]
+    fn a_site_state_reply_for_the_wrong_prefix_is_rejected() {
+        let registry = correlation::PendingRegistry::new();
+        let target = diff::delegate_key([0x22; 32]);
+        let p1 = diff::prefix_of_seed(1);
+        let p2 = diff::prefix_of_seed(2);
+        let slot = registry
+            .register(
+                &target,
+                &DelegateRequest::GetSiteState { prefix: p1.clone() },
+            )
+            .expect("GetSiteState is a protocol request");
+
+        let other_sites_backup = DelegateResponse::SiteState {
+            prefix: p2,
+            state_bytes: vec![1, 2, 3],
+        };
+        assert!(
+            !registry.offer(&target, &other_sites_backup),
+            "a SiteState reply for another prefix must not resolve this await"
+        );
+        assert_eq!(registry.pending_len(), 1);
+
+        let ours = DelegateResponse::SiteState {
+            prefix: p1,
+            state_bytes: vec![9],
+        };
+        assert!(registry.offer(&target, &ours));
+        assert!(diff::block_on(correlation::ReplyFuture { slot }).is_some());
+    }
+
+    /// The delegate's site-state absence error carries the prefix in its text
+    /// ("no backed-up state for site {prefix}", frozen in the deployed WASM),
+    /// so absence is attributable: an absence error about ANOTHER prefix must
+    /// not stand in for an answer about ours.
+    #[test]
+    fn a_site_state_absence_error_is_scoped_to_its_prefix() {
+        let registry = correlation::PendingRegistry::new();
+        let target = diff::delegate_key([0x33; 32]);
+        let p1 = diff::prefix_of_seed(1);
+        let p2 = diff::prefix_of_seed(2);
+        let slot = registry
+            .register(
+                &target,
+                &DelegateRequest::GetSiteState { prefix: p1.clone() },
+            )
+            .expect("GetSiteState is a protocol request");
+
+        let other = DelegateResponse::Error(format!("no backed-up state for site {p2}"));
+        assert!(
+            !registry.offer(&target, &other),
+            "an absence error about another prefix must not resolve this await"
+        );
+
+        let ours = DelegateResponse::Error(format!("no backed-up state for site {p1}"));
+        assert!(
+            registry.offer(&target, &ours),
+            "the absence error about OUR prefix is the genuine answer"
+        );
+        assert!(matches!(
+            diff::block_on(correlation::ReplyFuture { slot }),
+            Some(DelegateResponse::Error(_))
+        ));
+    }
+
+    /// Compat pin: an error string this module does not recognize (an older
+    /// delegate generation's wording) must still match any kind — otherwise a
+    /// legacy delegate's ordinary absence answer becomes a 10 s timeout and a
+    /// false `Unresponsive`, the freenet/river#204 failure.
+    #[test]
+    fn an_unrecognized_error_string_still_resolves_a_probe() {
+        let registry = correlation::PendingRegistry::new();
+        let target = diff::delegate_key([0x44; 32]);
+        let slot = registry
+            .register(&target, &DelegateRequest::GetPublicKey)
+            .expect("GetPublicKey is a protocol request");
+        let vintage = DelegateResponse::Error("no key".into());
+        assert!(
+            registry.offer(&target, &vintage),
+            "an unknown error string must conservatively answer any await"
+        );
+        assert!(diff::block_on(correlation::ReplyFuture { slot }).is_some());
+    }
+
+    /// Compat pin: the current delegate's signing-key absence error must keep
+    /// answering a signing-key await — it is the ordinary "not stored" answer
+    /// `has_signing_key` depends on. Narrowing `Error` matching must never
+    /// narrow this away.
+    #[test]
+    fn the_signing_key_absence_error_still_answers_a_signing_key_await() {
+        let registry = correlation::PendingRegistry::new();
+        let target = diff::delegate_key([0x55; 32]);
+        let slot = registry
+            .register(
+                &target,
+                &DelegateRequest::GetSigningKeyForPrefix {
+                    prefix: diff::prefix_of_seed(1),
+                },
+            )
+            .expect("GetSigningKeyForPrefix is a protocol request");
+        let absence = DelegateResponse::Error("no signing key stored -- store key first".into());
+        assert!(registry.offer(&target, &absence));
+        assert!(diff::block_on(correlation::ReplyFuture { slot }).is_some());
+    }
+
+    /// A reply from a different delegate never resolves an await, whatever its
+    /// kind. (Held by the shipped code too; pinned now that it is host-testable.)
+    #[test]
+    fn a_reply_from_a_different_delegate_is_never_consumed() {
+        let registry = correlation::PendingRegistry::new();
+        let awaited = diff::delegate_key([0x66; 32]);
+        let other = diff::delegate_key([0x77; 32]);
+        let _slot = registry
+            .register(&awaited, &DelegateRequest::GetKnownSites)
+            .expect("GetKnownSites is a protocol request");
+        assert!(!registry.offer(&other, &DelegateResponse::KnownSites(Vec::new())));
+        assert_eq!(registry.pending_len(), 1);
+    }
+
+    // --- adapter: decisions must be safe under mis-correlation ---
+
+    /// Defect 3, the successor half — the data-loss headline. While the
+    /// migration imports p1's key, its "does the successor already hold p1's
+    /// key?" probe is answered by a reply carrying ANOTHER site's key (a
+    /// concurrent sweep probe's reply; `SigningKey` carries no prefix, so the
+    /// registry cannot tell). Treating that as "already have it" reports
+    /// `AlreadyAuthoritative` while p1's key is never imported — silent,
+    /// permanent key loss once a durable Done marker seals it.
+    #[test]
+    fn a_mis_correlated_signing_key_reply_cannot_fake_already_authoritative() {
+        let p1 = diff::prefix_of_seed(1);
+        let mut predecessor = diff::DelegateFixture::modern();
+        predecessor.known_sites = vec![diff::site(&p1, "Mine")];
+        predecessor
+            .per_prefix_keys
+            .insert(p1.clone(), diff::signing_key_seed(1));
+        let fixture = diff::Fixture {
+            predecessors: vec![predecessor],
+            successor: diff::DelegateFixture::modern(),
+        };
+        let node = diff::FakeNode::new(&fixture);
+
+        let successor_bytes = diff::successor_key_bytes();
+        let p1_for_intercept = p1.clone();
+        let channel = HostileChannel {
+            inner: &node,
+            intercept: move |target: &DelegateKey, request: &DelegateRequest| match request {
+                DelegateRequest::GetSigningKeyForPrefix { prefix }
+                    if target.bytes() == successor_bytes.as_slice()
+                        && *prefix == p1_for_intercept =>
+                {
+                    // p2's key, as a sweep probe for p2 would elicit.
+                    Some(DelegateResponse::SigningKey(
+                        diff::signing_key_seed(2).to_vec(),
+                    ))
+                }
+                _ => None,
+            },
+        };
+
+        let mut markers = diff::MemoryMarkers::default();
+        let report = diff::block_on(run_delegate_migration(
+            &channel,
+            &mut markers,
+            diff::delegate_key(diff::successor_key_bytes()),
+            &fixture.lineage(),
+            Vec::new(),
+        ));
+
+        let landed = node.successor_state();
+        assert_eq!(
+            landed.per_prefix_keys.get(&p1),
+            Some(&diff::signing_key_seed(1)),
+            "p1's key must be imported: another site's key satisfying the \
+             has-key probe is a mis-correlation, not evidence the successor \
+             holds p1's key"
+        );
+        assert!(
+            report.is_complete(),
+            "the import went through, so the report should be clean"
+        );
+    }
+
+    /// Defect 3, the predecessor half. The reply to the migration's per-prefix
+    /// probe of p1 carries a DIFFERENT site's key. This is not only the
+    /// concurrent case: the real delegate's `load_signing_key` FALLS BACK to
+    /// the legacy single slot, so `GetSigningKeyForPrefix { p1 }` legitimately
+    /// returns another site's key even sequentially. Attributing those bytes
+    /// to p1 writes the wrong key under `delta:signing_key:p1`, sealed in by
+    /// never-clobber — the site becomes permanently unusable while the report
+    /// reads `Imported`.
+    #[test]
+    fn a_fallback_signing_key_reply_is_never_written_under_the_probed_prefix() {
+        let p1 = diff::prefix_of_seed(1);
+        let q = diff::prefix_of_seed(9);
+        let mut predecessor = diff::DelegateFixture::modern();
+        // p1 is listed but its per-prefix key is stored nowhere; the legacy
+        // single slot holds site q's key, which the fallback serves.
+        predecessor.known_sites = vec![diff::site(&p1, "Keyless")];
+        predecessor.legacy_key = Some(diff::signing_key_seed(9));
+        let fixture = diff::Fixture {
+            predecessors: vec![predecessor],
+            successor: diff::DelegateFixture::modern(),
+        };
+        let node = diff::FakeNode::new(&fixture);
+
+        let mut markers = diff::MemoryMarkers::default();
+        let _report = diff::block_on(run_delegate_migration(
+            &node,
+            &mut markers,
+            diff::delegate_key(diff::successor_key_bytes()),
+            &fixture.lineage(),
+            Vec::new(),
+        ));
+
+        let landed = node.successor_state();
+        assert_ne!(
+            landed.per_prefix_keys.get(&p1),
+            Some(&diff::signing_key_seed(9)),
+            "q's key must never be written under p1's slot — that is the \
+             permanent wrong-key corruption"
+        );
+        assert_eq!(
+            landed.per_prefix_keys.get(&q),
+            Some(&diff::signing_key_seed(9)),
+            "the recovered key must land under the prefix it actually derives"
+        );
+    }
+
+    /// Defect 1's residual (the lead analysis called `GetKnownSites`
+    /// cross-matching harmless; this is the one case it is not): the
+    /// read-merge-write's READ can be satisfied by a mis-correlated reply
+    /// snapshotted BEFORE the migration's own previous merge was stored. The
+    /// merge then rebuilds from the stale base and the follow-up
+    /// `StoreKnownSites` — a whole-list REPLACE — rolls the earlier
+    /// generation's contribution back off the delegate.
+    ///
+    /// The second write here is an OLDER generation's tombstone contribution
+    /// (the only known-sites content the generation gate accepts from older
+    /// generations), landing after the newest generation's site was merged; a
+    /// stale-empty base for it must not unwind that site.
+    #[test]
+    fn a_stale_known_sites_read_cannot_roll_back_an_earlier_generations_merge() {
+        let a = diff::prefix_of_seed(1);
+        let gone = diff::prefix_of_seed(3);
+        let mut older = diff::DelegateFixture::modern();
+        older.known_sites = vec![delta_core::KnownSiteRecord::tombstone(&gone)];
+        let mut newer = diff::DelegateFixture::modern();
+        newer.known_sites = vec![diff::site(&a, "On the newer delegate")];
+        let fixture = diff::Fixture {
+            predecessors: vec![older, newer],
+            successor: diff::DelegateFixture::modern(),
+        };
+        let node = diff::FakeNode::new(&fixture);
+
+        // EVERY read of the successor's list is answered stale-empty — the
+        // worst case for a mis-correlated snapshot.
+        let successor_bytes = diff::successor_key_bytes();
+        let channel = HostileChannel {
+            inner: &node,
+            intercept: move |target: &DelegateKey, request: &DelegateRequest| match request {
+                DelegateRequest::GetKnownSites if target.bytes() == successor_bytes.as_slice() => {
+                    Some(DelegateResponse::KnownSites(Vec::new()))
+                }
+                _ => None,
+            },
+        };
+
+        let mut markers = diff::MemoryMarkers::default();
+        let _report = diff::block_on(run_delegate_migration(
+            &channel,
+            &mut markers,
+            diff::delegate_key(diff::successor_key_bytes()),
+            &fixture.lineage(),
+            Vec::new(),
+        ));
+
+        let landed = node.successor_state();
+        let live: Vec<&str> = landed
+            .known_sites
+            .iter()
+            .filter(|r| !r.is_tombstone())
+            .map(|r| r.prefix.as_str())
+            .collect();
+        assert!(
+            live.contains(&a.as_str()),
+            "the newest generation's site must survive the older generation's \
+             tombstone merge even when that merge's read base is stale; got {live:?}"
+        );
+        assert!(
+            landed
+                .known_sites
+                .iter()
+                .any(|r| r.is_tombstone() && r.prefix == gone),
+            "and the older generation's tombstone must still be carried forward"
+        );
+    }
+
+    /// Defect 2, the adapter half. The successor-side "do we already hold a
+    /// backup for p1?" probe is answered by a NON-EMPTY `SiteState` reply for
+    /// p2. Reading it as "yes" skips importing p1's backup with a clean
+    /// report — if the network copy is gone, that backup was the user's only
+    /// copy. The reply must instead be rejected as not-our-answer, leaving the
+    /// item retryable (report NOT complete), never silently skipped.
+    #[test]
+    fn a_wrong_prefix_site_state_reply_does_not_pass_the_exists_check() {
+        let p1 = diff::prefix_of_seed(1);
+        let p2 = diff::prefix_of_seed(2);
+        let mut predecessor = diff::DelegateFixture::modern();
+        predecessor.known_sites = vec![diff::site(&p1, "Backed up")];
+        predecessor.site_states.insert(p1.clone(), vec![0xAB; 16]);
+        let fixture = diff::Fixture {
+            predecessors: vec![predecessor],
+            successor: diff::DelegateFixture::modern(),
+        };
+        let node = diff::FakeNode::new(&fixture);
+
+        let successor_bytes = diff::successor_key_bytes();
+        let p1_for_intercept = p1.clone();
+        let channel = HostileChannel {
+            inner: &node,
+            intercept: move |target: &DelegateKey, request: &DelegateRequest| match request {
+                DelegateRequest::GetSiteState { prefix }
+                    if target.bytes() == successor_bytes.as_slice()
+                        && *prefix == p1_for_intercept =>
+                {
+                    Some(DelegateResponse::SiteState {
+                        prefix: p2.clone(),
+                        state_bytes: vec![0xCD; 8],
+                    })
+                }
+                _ => None,
+            },
+        };
+
+        let mut markers = diff::MemoryMarkers::default();
+        let report = diff::block_on(run_delegate_migration(
+            &channel,
+            &mut markers,
+            diff::delegate_key(diff::successor_key_bytes()),
+            &fixture.lineage(),
+            Vec::new(),
+        ));
+
+        assert!(
+            !report.is_complete(),
+            "a mis-correlated exists-check answer must leave the backup item \
+             retryable, never silently skipped with a clean report"
+        );
+        assert!(
+            node.successor_state().site_states.is_empty(),
+            "and nothing may be written from an unverified answer"
         );
     }
 }
