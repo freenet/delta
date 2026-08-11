@@ -1790,7 +1790,8 @@ mod tests {
         // Control: the gate must not over-block — the same bytes under the
         // prefix they DO derive import normally.
         let own = diff::prefix_of_seed(2);
-        let result = diff::block_on(io.import_signing_key(own.clone(), diff::signing_key_seed(2).to_vec()));
+        let result =
+            diff::block_on(io.import_signing_key(own.clone(), diff::signing_key_seed(2).to_vec()));
         assert!(matches!(result, ItemWrite::Written), "got {result:?}");
         assert_eq!(
             node.successor_state().per_prefix_keys.get(&own),
@@ -1917,6 +1918,16 @@ mod tests {
     /// legacy-fallback reply to the probed prefix. So the first thing this
     /// migration must not do is faithfully copy that corruption forward, where
     /// never-clobber would then refuse to correct it forever.
+    ///
+    /// Mutation evidence, and the reason this test is worth keeping alongside
+    /// the unit one: TWO independent layers stop this, and each covers for the
+    /// other, so no single mutation trips this test. Breaking the enumeration
+    /// re-homing alone routes the pair to `import_signing_key`, where the
+    /// last-write gate refuses it; deleting the gate alone leaves the
+    /// re-homing to place the key correctly. Only removing BOTH lands q's key
+    /// under p1, and then this test fails. It therefore pins the *property*
+    /// rather than either mechanism — which is exactly what should survive a
+    /// future refactor that legitimately replaces one of the two layers.
     #[test]
     fn a_mis_slotted_predecessor_key_is_not_copied_forward() {
         let p1 = diff::prefix_of_seed(1);
