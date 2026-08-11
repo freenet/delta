@@ -70,12 +70,19 @@ fn generate_build_info() {
         now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
     );
 
+    // Check the exit status, not just that the process spawned. Building from
+    // a source tarball WITH git installed spawns fine, exits non-zero, and
+    // writes nothing to stdout — so without this, `GIT_COMMIT` is `""` rather
+    // than `"unknown"`, and an empty commit in the footer reads as a bug in the
+    // fingerprint rather than as "not built from a repo".
     let git_hash = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
         .ok()
+        .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=GIT_COMMIT={git_hash}");
 }
@@ -115,8 +122,9 @@ fn emit_git_ref_rerun_paths() {
 /// Returning `None` (and so emitting no directive) is deliberate for the
 /// no-git case, e.g. building from a source tarball. Emitting a path that does
 /// not exist is precisely the bug this replaces, and it degrades to the
-/// pre-existing cosmetic issue: `GIT_COMMIT` is already `"unknown"` when git is
-/// unavailable, so there is nothing for a stale fingerprint to misreport.
+/// pre-existing cosmetic issue: `GIT_COMMIT` is already `"unknown"` whenever git
+/// cannot resolve HEAD — whether the binary is absent or it runs outside a
+/// repository — so there is nothing for a stale fingerprint to misreport.
 fn git_ref_path(spec: &str) -> Option<String> {
     let output = std::process::Command::new("git")
         .args(["rev-parse", "--git-path", spec])
