@@ -39,9 +39,33 @@ EOF
 
 echo ""
 echo "Added $VERSION to $TOML"
+
+# Stage the file we just wrote, rather than telling the human to remember it.
+# An entry that is recorded but never committed is indistinguishable from one
+# that was never recorded: the published bundle's migration table lacks the
+# outgoing delegate, and every returning user loses access to their signing
+# keys and site list. Staging does not guarantee a commit, but it puts the
+# change in `git status`'s staged section instead of leaving it to be lost in a
+# `git checkout .` or an abandoned working tree.
+#
+# Deliberately non-fatal: the entry is already written at this point, so a
+# staging failure (not a git repo, index lock, …) must not abort the script and
+# leave the caller thinking nothing was recorded.
+if git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+    if git -C "$REPO_ROOT" add "$TOML"; then
+        echo "Staged $TOML (staged, NOT committed)."
+    else
+        echo "WARNING: could not stage $TOML — stage and commit it by hand." >&2
+    fi
+else
+    echo "Not a git repository; skipping staging of $TOML." >&2
+fi
+
 echo ""
 echo "Next steps:"
 echo "  1. ./scripts/sync-wasm.sh       # rebuild and copy new WASMs"
 echo "  2. cargo check -p delta-ui      # verify build with new migration entry"
-echo "  3. git add legacy_delegates.toml ui/public/contracts/"
-echo "  4. git commit"
+echo "  3. git add ui/public/contracts/ && git commit"
+echo ""
+echo "The migration entry is worthless until it is COMMITTED and published:"
+echo "an unrecorded predecessor means returning users cannot reach their data."
