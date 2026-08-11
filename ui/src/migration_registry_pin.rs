@@ -164,9 +164,17 @@ fn every_toml_the_build_script_reads_is_declared_to_cargo() {
         let needle = format!("cargo:rerun-if-changed=../{name}");
         // Require the directive in an actual println!, so a build script that
         // merely mentions the path in a comment does not satisfy the pin.
+        //
+        // This must anchor at the START of the trimmed line. `contains`
+        // was satisfied by the single input the clause above exists to
+        // reject -- a commented-out directive holds both `println!` and the
+        // needle, so the pin stayed green while the directive was dead, and
+        // the resulting staleness only surfaced later, from an unrelated
+        // commit. A guard defeated by its own stated counter-example is the
+        // shape this whole PR is about.
         let declared = BUILD_RS
             .lines()
-            .any(|l| l.contains("println!") && l.contains(&needle));
+            .any(|l| l.trim_start().starts_with("println!") && l.contains(&needle));
         assert!(
             declared,
             "ui/build.rs reads {name} but never prints \
