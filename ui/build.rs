@@ -61,8 +61,7 @@ fn generate_build_info() {
     // the published webapp contains recent fixes. See AGENTS.md
     // "Publishing" and the April 2026 incident in delta/#9 follow-up.
     println!("cargo:rerun-if-changed=build.rs");
-    println!("cargo:rerun-if-changed=../.git/HEAD");
-    println!("cargo:rerun-if-changed=../.git/index");
+    emit_git_ref_rerun_paths();
     println!("cargo:rerun-if-env-changed=FORCE_REBUILD_TIMESTAMP");
 
     let now = Utc::now();
@@ -71,14 +70,78 @@ fn generate_build_info() {
         now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
     );
 
+    // Check the exit status, not just that the process spawned. Building from
+    // a source tarball WITH git installed spawns fine, exits non-zero, and
+    // writes nothing to stdout — so without this, `GIT_COMMIT` is `""` rather
+    // than `"unknown"`, and an empty commit in the footer reads as a bug in the
+    // fingerprint rather than as "not built from a repo".
     let git_hash = std::process::Command::new("git")
         .args(["rev-parse", "--short", "HEAD"])
         .output()
         .ok()
+        .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "unknown".to_string());
     println!("cargo:rustc-env=GIT_COMMIT={git_hash}");
+}
+
+/// Emit `rerun-if-changed` for the two git files that decide `GIT_COMMIT`:
+/// `HEAD` (which commit / branch) and `index` (staging, which moves on commit).
+///
+/// These were hardcoded as `../.git/HEAD` and `../.git/index`, which is only
+/// correct in a normal checkout. **In a git worktree `.git` is a FILE** holding
+/// `gitdir: /path/to/repo/.git/worktrees/<name>`, so those paths do not resolve
+/// at all — and Cargo treats an unresolvable `rerun-if-changed` target as
+/// permanently dirty. The build script therefore re-ran on every single build
+/// in a worktree, and cached as designed only in the main checkout.
+///
+/// That asymmetry is worth more attention than the wasted CPU, because it made
+/// a data-loss bug invisible from the standard vantage point. The repo's own
+/// convention is to work in worktrees, where the script never caches and the
+/// generated migration tables are always fresh. The one place caching was live
+/// is the main checkout, which is exactly where `cargo make publish-delta`
+/// runs. A missing `rerun-if-changed` on `legacy_delegates.toml` (fixed in the
+/// PR below this one) could therefore ship a stale migration table to users
+/// while being impossible to reproduce for anyone following the convention.
+///
+/// `git rev-parse --git-path` resolves correctly in both layouts: it returns
+/// `../.git/HEAD` in a normal checkout and the absolute per-worktree path
+/// inside `.git/worktrees/<name>/` otherwise.
+fn emit_git_ref_rerun_paths() {
+    for spec in ["HEAD", "index"] {
+        if let Some(path) = git_ref_path(spec) {
+            println!("cargo:rerun-if-changed={path}");
+        }
+    }
+}
+
+/// Resolve a git metadata file, or `None` if it cannot be resolved.
+///
+/// Returning `None` (and so emitting no directive) is deliberate for the
+/// no-git case, e.g. building from a source tarball. Emitting a path that does
+/// not exist is precisely the bug this replaces, and it degrades to the
+/// pre-existing cosmetic issue: `GIT_COMMIT` is already `"unknown"` whenever git
+/// cannot resolve HEAD — whether the binary is absent or it runs outside a
+/// repository — so there is nothing for a stale fingerprint to misreport.
+fn git_ref_path(spec: &str) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--git-path", spec])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = String::from_utf8(output.stdout).ok()?.trim().to_string();
+    // The existence check is the actual guard. `--git-path` is documented to
+    // return a path whether or not the file is present, so a repo state
+    // without one of these (e.g. no index yet) would otherwise re-introduce
+    // the always-dirty behaviour this function exists to remove.
+    if path.is_empty() || !Path::new(&path).exists() {
+        return None;
+    }
+    Some(path)
 }
 
 fn generate_legacy_delegates() {
