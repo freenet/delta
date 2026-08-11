@@ -28,7 +28,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 GATE="$SCRIPT_DIR/../check-migration.sh"
 REPO="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-command -v b3sum >/dev/null 2>&1 || { echo "SKIP: b3sum not installed" >&2; exit 1; }
+# Exits 1, so call it what it is. A missing b3sum means the gate cannot hash a
+# WASM and so cannot answer the question, which must block a publish rather
+# than be reported as a skipped nicety.
+command -v b3sum >/dev/null 2>&1 || { echo "FAIL: b3sum not installed — the gate cannot run" >&2; exit 1; }
 
 PASS=0
 FAIL=0
@@ -93,6 +96,19 @@ assert "preflight depends on test-migration-gate (this file)" $?
 grep -q 'dependencies = .*"preflight"' <<< "$(makefile_task publish-delta)"
 assert "publish-delta depends on preflight" $?
 
+# Depending on the gate is not the same as being stopped by it. cargo-make's
+# `ignore_errors`/`force` make a task's non-zero exit non-fatal, so either one
+# on any task in this chain would let a REFUSING gate be walked straight past
+# while every other assertion here stayed green.
+chain_honours_failure=0
+for t in check-migration test-migration-gate preflight publish-delta; do
+    if grep -qE '^(ignore_errors|force) *= *true' <<< "$(makefile_task "$t")"; then
+        echo "  [$t] sets ignore_errors/force, so a failing gate would not stop it" >&2
+        chain_honours_failure=1
+    fi
+done
+assert "no task in the publish chain ignores a failing dependency" $chain_honours_failure
+
 ci="$REPO/.github/workflows/ci.yml"
 grep -q 'run: \./scripts/check-migration\.sh' "$ci"
 assert "CI runs the gate" $?
@@ -102,6 +118,19 @@ assert "CI checks out full history (shallow would disarm the gate)" $?
 
 grep -q 'run: \./scripts/tests/check-migration-test\.sh' "$ci"
 assert "CI runs this test file" $?
+
+# The gate must decide whether to run from HOW it was loaded, never from the
+# environment. `CHECK_MIGRATION_LIB_ONLY` once gated `main` directly, so an
+# exported copy of this internal test hook made the gate a silent no-op on the
+# real publish path (cargo-make passes the environment through untouched):
+# `CHECK_MIGRATION_LIB_ONLY=1 cargo make publish-delta` exited 0 having checked
+# nothing. Executing must refuse; sourcing must still yield the functions.
+CHECK_MIGRATION_LIB_ONLY=1 bash "$GATE" >/dev/null 2>&1
+[ $? -ne 0 ]
+assert "executing the gate with CHECK_MIGRATION_LIB_ONLY set refuses" $?
+
+bash -c "CHECK_MIGRATION_LIB_ONLY=1 source '$GATE' && [ \"\$(type -t require_generations_recorded)\" = function ]" >/dev/null 2>&1
+assert "sourcing the gate still defines its functions without running checks" $?
 
 # ------------------------------------------------------------ END-TO-END ----
 # Run the REAL script, via main(), against a synthetic repo. build-wasm.sh is

@@ -21,11 +21,17 @@ set -euo pipefail
 # Exit 0 = safe to publish, exit 1 = a migration entry is missing (or the
 # committed WASM is stale, or history is too shallow to tell).
 #
-# Testing: `CHECK_MIGRATION_LIB_ONLY=1 source scripts/check-migration.sh`
-# defines the functions without running the checks, and
-# CHECK_MIGRATION_REPO_ROOT overrides the repo under inspection. Both exist so
-# scripts/tests/check-migration-test.sh can exercise the gate against synthetic
-# git repositories without a cargo build. Run that test after touching this file.
+# Testing: `source scripts/check-migration.sh` defines the functions without
+# running the checks (sourcing is detected via BASH_SOURCE, see the bottom of
+# this file), and CHECK_MIGRATION_REPO_ROOT overrides the repo under
+# inspection. Both exist so scripts/tests/check-migration-test.sh can exercise
+# the gate against synthetic git repositories without a cargo build. Run that
+# test after touching this file.
+#
+# `CHECK_MIGRATION_LIB_ONLY=1` is accepted when sourcing, for compatibility with
+# existing callers, but is now REFUSED when the script is executed directly --
+# as an environment variable it could otherwise disarm the gate on the real
+# publish path.
 
 REPO_ROOT="${CHECK_MIGRATION_REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}"
 
@@ -279,6 +285,21 @@ main() {
     echo "Safe to publish."
 }
 
-if [ -z "${CHECK_MIGRATION_LIB_ONLY:-}" ]; then
+# Whether to run the checks is decided by HOW this file was loaded, never by
+# the environment. `CHECK_MIGRATION_LIB_ONLY` used to gate this directly, which
+# meant an exported copy of an internal test hook silently disarmed the gate on
+# the real publish path: cargo-make passes the environment straight through, so
+# `CHECK_MIGRATION_LIB_ONLY=1 cargo make publish-delta` exited 0 having checked
+# nothing and published anyway. That is the same "guard that cannot fail" shape
+# this script exists to remove, so the test hook must not be able to reach it.
+#
+# `BASH_SOURCE[0]` differs from `$0` exactly when the file was sourced, which is
+# the real question and is not settable from outside.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    if [ -n "${CHECK_MIGRATION_LIB_ONLY:-}" ]; then
+        die "CHECK_MIGRATION_LIB_ONLY is set while running the gate directly. \
+It suppresses every check, so honouring it here would publish unverified. \
+Unset it, or 'source' this script instead if you only want its functions."
+    fi
     main "$@"
 fi

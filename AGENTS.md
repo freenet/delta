@@ -334,10 +334,21 @@ committed.
 ## Publishing
 
 ```bash
-# Full build + publish
+# Full build + publish. This is the supported route: it runs the migration
+# gate via `preflight` and aborts before anything is built or uploaded if a
+# predecessor hash is missing.
 cargo make publish-delta
+```
 
-# Or manual steps:
+**Do not assemble a publish by hand without running the gate first.** An
+earlier version of this section listed the raw `dx build` / tar / sign /
+`fdev publish` steps with no mention of `check-migration.sh`, which
+documented a route that skips the only thing standing between a WASM change
+and every returning user losing their sites. If you genuinely need the
+individual steps, run the gate as step one and stop if it refuses:
+
+```bash
+./scripts/check-migration.sh   # MUST print "Safe to publish" — exit 1 means stop
 cd ui && npm run build:css && dx build --release
 # Copy CSS, tar, sign, fdev publish (see Makefile.toml)
 ```
