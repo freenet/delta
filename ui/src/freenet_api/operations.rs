@@ -469,11 +469,29 @@ fn handle_site_state(key: ContractKey, state_bytes: &[u8]) -> bool {
     }
 
     // If this is the currently selected site, re-select to pick up
-    // pending page from hash route and update title
+    // pending page from hash route and update title.
+    //
+    // NOT while the user is editing. `state::select_site` sets `EDITING` to
+    // false and moves `CURRENT_PAGE` to the site's first page, so a network
+    // state change arriving mid-edit closes the editor and discards the
+    // unsaved draft — the same lost work as freenet/delta#62, reached by a
+    // different route, and reachable in the same window (the load-time sweep
+    // merges backed-up state, which counts as `changed`). The pending
+    // hash-route page and the refreshed document title are worth less than
+    // the user's typing, and both are picked up the next time they navigate.
+    //
+    // The check sits INSIDE the spawned task on purpose: `EDITING` must be
+    // read when the task runs, not when it is scheduled.
     if state::CURRENT_SITE.read().as_deref() == Some(&prefix) {
         #[cfg(target_arch = "wasm32")]
         {
             wasm_bindgen_futures::spawn_local(async move {
+                if *state::EDITING.read() {
+                    log(&format!(
+                        "Delta: skipping re-select of {prefix} — user is editing"
+                    ));
+                    return;
+                }
                 state::select_site(&prefix);
             });
         }
@@ -1500,6 +1518,38 @@ fn log(msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pin: the post-state-change re-select must stay gated on the user not
+    /// editing (freenet/delta#62).
+    ///
+    /// This is a SOURCE SCRAPE, not a behavioural test, and deliberately so:
+    /// the call site is inside a `cfg(target_arch = "wasm32")` block, so no
+    /// host test can execute it, and a host test that pretended to would be
+    /// testing a copy of the code rather than the code. What it pins is that
+    /// the guard exists at all — without it, `state::select_site` clears
+    /// `EDITING` and jumps `CURRENT_PAGE` to the site's first page, closing
+    /// the editor mid-edit and discarding the unsaved draft.
+    ///
+    /// The scrape anchors on the first occurrence of each marker, which is
+    /// the real call site (this test is further down the same file). Delete
+    /// the guard and the region between the markers no longer mentions
+    /// `EDITING`, so this fails rather than matching its own source.
+    #[test]
+    fn the_post_state_change_reselect_is_gated_on_not_editing() {
+        let src = include_str!("operations.rs");
+        let start = src
+            .find("// If this is the currently selected site")
+            .expect("re-select call site not found — did the comment move?");
+        let tail = &src[start..];
+        let end = tail
+            .find("state::select_site(&prefix)")
+            .expect("select_site call not found after the marker");
+        assert!(
+            tail[..end].contains("state::EDITING"),
+            "the re-select after a network state change must be skipped while \
+             the user is editing, or it closes the editor and drops the draft (#62)"
+        );
+    }
 
     fn hex32(s: &str) -> [u8; 32] {
         let bytes: Vec<u8> = (0..s.len())
