@@ -71,11 +71,20 @@ script = "./scripts/check-migration.sh"
 description = "Prove the migration gate still refuses an unrecorded predecessor"
 script = "./scripts/tests/check-migration-test.sh"
 
+[tasks.test-bundle-gate]
+description = "Prove the webapp bundle gate still refuses a bloated bundle"
+script = "./scripts/tests/check-webapp-bundle-test.sh"
+
 [tasks.preflight]
 description = "Run all checks before publishing"
 # test-migration-gate runs BEFORE check-migration: a gate that has lost its
 # ability to refuse would otherwise report "Safe to publish" and be believed.
-dependencies = ["test-migration-gate", "check-migration"]
+# test-bundle-gate is here for the same reason, but note the asymmetry: only the
+# gate's TEST belongs in preflight. The bundle gate itself CANNOT go here --
+# preflight runs as a dependency of publish-delta, so the archive does not exist
+# yet and a gate placed here would inspect a stale or absent one and pass, which
+# is precisely the delta#46 shape. It lives inside bundle-webapp, after the tar.
+dependencies = ["test-migration-gate", "test-bundle-gate", "check-migration"]
 script = '''
 #!/bin/bash
 set -euo pipefail
@@ -93,20 +102,65 @@ cargo test 2>&1 || { echo "FAILED: Tests must pass before publish"; exit 1; }
 echo "All pre-publish checks passed."
 '''
 
-[tasks.publish-delta]
-description = "Build, sign, and publish Delta to Freenet"
+[tasks.bundle-webapp]
+description = "Build the release UI and pack it into target/webapp/webapp.tar.xz (no publish)"
+# Depends on preflight, not just build-tailwind. This task produces a
+# ready-to-sign archive, and before it existed the ONLY route to one was through
+# publish-delta, which meant check-migration and cargo test had necessarily run
+# first. Splitting the build out for testability must not quietly open a second
+# route to a signable artifact that skips both. The cost is nil on the publish
+# path, where cargo-make runs preflight once for both tasks.
 dependencies = ["build-tailwind", "preflight"]
 script = '''
 #!/bin/bash
+set -euo pipefail
+ROOT="${CARGO_MAKE_WORKING_DIRECTORY:-$PWD}"
+[ -f "$ROOT/Makefile.toml" ] || { echo "bundle-webapp must run from the repo root (got: $ROOT)"; exit 1; }
+DX_PUBLIC="$ROOT/target/dx/delta-ui/release/web/public"
+
+# dx writes CONTENT-HASHED filenames into public/assets/, so a changed build
+# lands beside its predecessor instead of overwriting it, and nothing prunes the
+# old one. The tar below packs the whole directory, so without this the bundle
+# accumulated a full ~2MB wasm + js pair on every publish, indefinitely (#70).
+#
+# The whole output directory goes, not just assets/. dx also STAGES the
+# unhashed wasm-bindgen output at public/wasm/ before moving it into assets/, so
+# an interrupted build leaves a full-size public/wasm/delta-ui_bg.wasm that an
+# assets-only clean would leave behind and ship. Everything under here is dx
+# output: index.html is regenerated, contracts/*.wasm are re-copied from
+# ui/public/contracts/ every build, and styles.css/main.css are copied in below
+# after the build. Nothing here is a source of truth.
+rm -rf "$DX_PUBLIC"
+
+# Two lines, not `cd ... && dx build`: with `&&`, a failing cd makes the whole
+# list return non-zero without `set -e` treating it as a fatal command, so
+# execution would fall through to the cp/tar below and fail later, naming the
+# wrong thing.
+cd "$ROOT/ui"
+dx build --release
+cd "$ROOT"
+cp ui/assets/styles.css "$DX_PUBLIC/"
+cp ui/assets/main.css "$DX_PUBLIC/"
+mkdir -p "$ROOT/target/webapp"
+cd "$DX_PUBLIC"
+tar -cJf "$ROOT/target/webapp/webapp.tar.xz" *
+cd "$ROOT"
+# The publish gate, kept to a one-line delegation so there is exactly one
+# implementation. It is called HERE, inline after the tar, rather than as a
+# cargo-make dependency of publish-delta: a dependency could be reordered ahead
+# of the tar and would then approve a stale archive from an earlier build, which
+# is the delta#46 shape. Being in the same script as the tar, under `set -e`,
+# makes "the archive the gate approved" and "the archive fdev publishes" the
+# same bytes by construction. Do not move this into preflight.
+./scripts/check-webapp-bundle.sh target/webapp/webapp.tar.xz
+'''
+
+[tasks.publish-delta]
+description = "Build, sign, and publish Delta to Freenet"
+dependencies = ["build-tailwind", "preflight", "bundle-webapp"]
+script = '''
+#!/bin/bash
 set -e
-cd ui && dx build --release
-cd ..
-cp ui/assets/styles.css target/dx/delta-ui/release/web/public/
-cp ui/assets/main.css target/dx/delta-ui/release/web/public/
-mkdir -p target/webapp
-cd target/dx/delta-ui/release/web/public
-tar -cJf ../../../../../../target/webapp/webapp.tar.xz *
-cd ../../../../../..
 WCT=$(which web-container-tool 2>/dev/null || echo "/home/ian/code/freenet/river/main/target/native/x86_64-unknown-linux-gnu/release/web-container-tool")
 VERSION=$(($(date +%s) / 60))
 $WCT sign \
