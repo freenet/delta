@@ -71,11 +71,20 @@ script = "./scripts/check-migration.sh"
 description = "Prove the migration gate still refuses an unrecorded predecessor"
 script = "./scripts/tests/check-migration-test.sh"
 
+[tasks.test-bundle-gate]
+description = "Prove the webapp bundle gate still refuses a bloated bundle"
+script = "./scripts/tests/check-webapp-bundle-test.sh"
+
 [tasks.preflight]
 description = "Run all checks before publishing"
 # test-migration-gate runs BEFORE check-migration: a gate that has lost its
 # ability to refuse would otherwise report "Safe to publish" and be believed.
-dependencies = ["test-migration-gate", "check-migration"]
+# test-bundle-gate is here for the same reason, but note the asymmetry: only the
+# gate's TEST belongs in preflight. The bundle gate itself CANNOT go here --
+# preflight runs as a dependency of publish-delta, so the archive does not exist
+# yet and a gate placed here would inspect a stale or absent one and pass, which
+# is precisely the delta#46 shape. It lives inside bundle-webapp, after the tar.
+dependencies = ["test-migration-gate", "test-bundle-gate", "check-migration"]
 script = '''
 #!/bin/bash
 set -euo pipefail
@@ -119,6 +128,13 @@ mkdir -p "$ROOT/target/webapp"
 cd "$DX_PUBLIC"
 tar -cJf "$ROOT/target/webapp/webapp.tar.xz" *
 cd "$ROOT"
+# The publish gate, kept to a one-line delegation so there is exactly one
+# implementation. It is called HERE, inline after the tar, rather than as a
+# cargo-make dependency of publish-delta: a dependency could be reordered ahead
+# of the tar and would then approve a stale archive from an earlier build, which
+# is the delta#46 shape. Being in the same script as the tar, under `set -e`,
+# makes "the archive the gate approved" and "the archive fdev publishes" the
+# same bytes by construction. Do not move this into preflight.
 ./scripts/check-webapp-bundle.sh target/webapp/webapp.tar.xz
 '''
 

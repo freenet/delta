@@ -43,6 +43,13 @@ jobs:
       - name: Run tests
         run: cargo test
 
+      - name: Prove the webapp bundle gate can still refuse
+        # The gate itself runs on the publish path (inside `bundle-webapp`,
+        # after the tar), where CI cannot reach it without a full dx build and a
+        # publish. This proves the gate can REFUSE a bloated bundle and that it
+        # is still wired into that path, which is the half that rots silently.
+        run: ./scripts/tests/check-webapp-bundle-test.sh
+
       - name: Check contract builds (WASM)
         run: ./scripts/build-wasm.sh -p site-contract -p site-delegate
 

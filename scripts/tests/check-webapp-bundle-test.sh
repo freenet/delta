@@ -1,0 +1,242 @@
+#!/bin/bash
+# Tests for the bundle gate (scripts/check-webapp-bundle.sh).
+#
+# Same shape and same reasoning as check-migration-test.sh: prove the gate can
+# REFUSE, and prove it is WIRED IN. A gate that runs on the publish path but
+# returns 0 for every input is worse than no gate, because the docs cite it as
+# protection.
+#
+#   WIRING   (source scrapes) - the gate runs inside publish-delta, AFTER the
+#            tar that produces the archive and BEFORE sign/publish, under a
+#            shell that aborts on its non-zero exit. delta#46 was a wiring bug,
+#            not a logic bug: the gate existed and was correct, but ran beside
+#            the publish path instead of on it. The specific trap here is that
+#            preflight runs as a DEPENDENCY of publish-delta, i.e. before the
+#            tar exists, so a bundle gate placed there would inspect a stale or
+#            absent archive and pass -- exactly delta#46 again.
+#
+#   END-TO-END - run the REAL script against synthetic archives. These exercise
+#            the whole script, so deleting a check from it fails here.
+#
+# No cargo build, no dx build: about a second, so it gates every PR.
+
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+GATE="$SCRIPT_DIR/../check-webapp-bundle.sh"
+REPO="$(cd "$SCRIPT_DIR/../.." && pwd)"
+
+PASS=0
+FAIL=0
+
+check() { # $1 description, $2 expected exit, $3 actual exit
+    if [ "$2" = "$3" ]; then
+        echo "ok   - $1 (exit $3)"
+        PASS=$((PASS + 1))
+    else
+        echo "FAIL - $1: expected exit $2, got $3"
+        FAIL=$((FAIL + 1))
+    fi
+}
+
+assert() { check "$1" 0 "$2"; }
+
+# ---------------------------------------------------------------- WIRING ----
+
+makefile_task() { # $1 task name -> that task's block
+    # Ends the block on a TOML section header specifically, not on any line
+    # starting with "[". bundle-webapp's own repo-root guard begins with
+    # `[ -f "$ROOT/Makefile.toml" ]`, and a looser match truncates the body
+    # there -- silently hiding every line after it, including the tar and the
+    # gate call this file exists to check.
+    awk -v t="[tasks.$1]" '$0==t{f=1;next} /^\[[A-Za-z][A-Za-z0-9._-]*\]$/{f=0} f' "$REPO/Makefile.toml"
+}
+
+echo "--- wiring ---"
+
+bundle_body=$(makefile_task bundle-webapp)
+
+grep -q './scripts/check-webapp-bundle.sh' <<< "$bundle_body"
+assert "bundle-webapp delegates to the gate script" $?
+
+# One implementation. Any reachability logic in the Makefile means a second copy
+# is back, which is how delta#46 started. Comments are stripped first: this is
+# an assertion about code, and the task's comments legitimately discuss
+# index.html and the asset names while implementing none of it.
+! grep -vE '^\s*#' <<< "$bundle_body" | grep -qE 'delta-ui_bg|index\.html|unreachable'
+assert "bundle-webapp contains no inline reimplementation of the gate" $?
+
+# THE delta#46 GUARD: the gate inspects the archive, so it must come after the
+# tar that writes it. Compare line numbers within the task body.
+tar_line=$(grep -n 'tar -cJf' <<< "$bundle_body" | head -1 | cut -d: -f1)
+gate_line=$(grep -n './scripts/check-webapp-bundle.sh' <<< "$bundle_body" | head -1 | cut -d: -f1)
+[ -n "$tar_line" ] && [ -n "$gate_line" ] && [ "$gate_line" -gt "$tar_line" ]
+assert "the gate runs AFTER the tar step, not before it" $?
+
+# A gate whose non-zero exit is not fatal is decoration. Without `set -e` the
+# script would carry on and cargo-make would see a zero exit from the task.
+grep -qE '^set -e|^set -euo pipefail' <<< "$bundle_body"
+assert "bundle-webapp aborts on a failing command (set -e)" $?
+
+# The gate must not be in preflight: preflight is a DEPENDENCY of publish-delta
+# and so runs before the archive exists. This is the trap that produced delta#46
+# in the migration gate, and it is available here too.
+! grep -q 'check-webapp-bundle' <<< "$(makefile_task preflight)"
+assert "the bundle gate is NOT in preflight (it would inspect a stale archive)" $?
+
+publish_body=$(makefile_task publish-delta)
+
+grep -q 'dependencies = .*"bundle-webapp"' <<< "$publish_body"
+assert "publish-delta depends on bundle-webapp" $?
+
+# Bundling lives in exactly one task. A second tar in publish-delta would
+# rebuild the archive after the gate had already approved a different one.
+! grep -q 'tar -cJf' <<< "$publish_body"
+assert "publish-delta does not re-tar after the gate has run" $?
+
+grep -q 'fdev publish' <<< "$publish_body"
+assert "publish-delta is still the task that publishes" $?
+
+# Depending on the gate is not the same as being stopped by it. cargo-make's
+# `ignore_errors`/`force` make a task's non-zero exit non-fatal, so either one
+# on any task in this chain would let a REFUSING gate be walked straight past
+# while every other assertion here stayed green.
+chain_honours_failure=0
+for t in bundle-webapp test-bundle-gate preflight publish-delta; do
+    if grep -qE '^(ignore_errors|force) *= *true' <<< "$(makefile_task "$t")"; then
+        echo "  [$t] sets ignore_errors/force, so a failing gate would not stop it" >&2
+        chain_honours_failure=1
+    fi
+done
+assert "no task in the publish chain ignores a failing dependency" $chain_honours_failure
+
+grep -q 'dependencies = .*"test-bundle-gate"' <<< "$(makefile_task preflight)"
+assert "preflight depends on test-bundle-gate (this file)" $?
+
+grep -q 'script = "\./scripts/tests/check-webapp-bundle-test\.sh"' <<< "$(makefile_task test-bundle-gate)"
+assert "test-bundle-gate delegates to this file" $?
+
+ci="$REPO/.github/workflows/ci.yml"
+grep -q 'run: \./scripts/tests/check-webapp-bundle-test\.sh' "$ci"
+assert "CI runs this test file" $?
+
+# ------------------------------------------------------------ END-TO-END ----
+# Build synthetic archives and run the REAL gate against them. Names mirror
+# dx's real output shape; the gate does not depend on the naming.
+
+JS_NAME="delta-ui-dxhaaaaaaaaaaaaaaaa.js"
+WASM_NAME="delta-ui_bg-dxhbbbbbbbbbbbbbbbb.wasm"
+FAVICON_NAME="favicon-dxhcccccccccccccccc.svg"
+
+make_bundle() { # echoes an archive path for a well-formed bundle
+    local dir archive
+    dir=$(mktemp -d)
+    mkdir -p "$dir/src/assets" "$dir/src/contracts"
+    # index.html -> js -> wasm -> favicon, the real reference shape: the
+    # favicon's hashed name is embedded in the wasm, not in the html.
+    printf '<html><script type="module" src="/assets/%s"></script></html>\n' "$JS_NAME" \
+        > "$dir/src/index.html"
+    printf 'export default function init(){ return fetch("/assets/%s"); }\n' "$WASM_NAME" \
+        > "$dir/src/assets/$JS_NAME"
+    printf '\0asm\1\0\0\0 some wasm bytes referencing /assets/%s\n' "$FAVICON_NAME" \
+        > "$dir/src/assets/$WASM_NAME"
+    printf '<svg/>\n' > "$dir/src/assets/$FAVICON_NAME"
+    printf 'contract\n' > "$dir/src/contracts/site_contract.wasm"
+    printf 'delegate\n' > "$dir/src/contracts/site_delegate.wasm"
+    printf 'body{}\n' > "$dir/src/styles.css"
+    printf 'body{}\n' > "$dir/src/main.css"
+    archive="$dir/webapp.tar.xz"
+    tar -cJf "$archive" -C "$dir/src" .
+    echo "$archive"
+}
+
+# Rebuild the archive after a fixture has mutated the extracted tree.
+retar() { # $1 archive
+    local dir="$(dirname "$1")"
+    rm -f "$1"
+    tar -cJf "$1" -C "$dir/src" .
+}
+
+run_gate() { bash "$GATE" "$1" >/dev/null 2>&1; echo $?; }
+
+echo "--- end-to-end (runs the real gate) ---"
+
+a=$(make_bundle)
+check "well-formed bundle: proceed" 0 "$(run_gate "$a")"
+rm -rf "$(dirname "$a")"
+
+# THE BUG. A second build's wasm + loader left behind by the missing clean.
+a=$(make_bundle)
+d="$(dirname "$a")/src"
+cp "$d/assets/$WASM_NAME" "$d/assets/delta-ui_bg-dxhstale00000000.wasm"
+cp "$d/assets/$JS_NAME"   "$d/assets/delta-ui-dxhstale00000000.js"
+retar "$a"
+check "orphaned wasm + loader from an earlier build: REFUSE" 1 "$(run_gate "$a")"
+rm -rf "$(dirname "$a")"
+
+# A lone orphan, which a "the chain resolves" check alone would miss.
+a=$(make_bundle)
+d="$(dirname "$a")/src"
+cp "$d/assets/$WASM_NAME" "$d/assets/delta-ui_bg-dxhstale00000000.wasm"
+retar "$a"
+check "single orphaned wasm: REFUSE" 1 "$(run_gate "$a")"
+rm -rf "$(dirname "$a")"
+
+# Generality: not a delta-ui file at all. A name-scoped check would miss this.
+a=$(make_bundle)
+d="$(dirname "$a")/src"
+cp "$d/assets/$FAVICON_NAME" "$d/assets/favicon-dxhstale00000000.svg"
+retar "$a"
+check "orphaned favicon (not a delta-ui name): REFUSE" 1 "$(run_gate "$a")"
+rm -rf "$(dirname "$a")"
+
+# Stale index.html pointing at an old loader while the fresh pair is orphaned.
+a=$(make_bundle)
+d="$(dirname "$a")/src"
+cp "$d/assets/$JS_NAME" "$d/assets/delta-ui-dxhfresh00000000.js"
+cp "$d/assets/$WASM_NAME" "$d/assets/delta-ui_bg-dxhfresh00000000.wasm"
+retar "$a"
+check "fresh pair present but index.html still points at the old one: REFUSE" 1 "$(run_gate "$a")"
+rm -rf "$(dirname "$a")"
+
+# Dangling references: the chain must resolve INSIDE the archive.
+a=$(make_bundle)
+d="$(dirname "$a")/src"
+rm "$d/assets/$JS_NAME"
+retar "$a"
+check "index.html references a loader that is not in the bundle: REFUSE" 1 "$(run_gate "$a")"
+rm -rf "$(dirname "$a")"
+
+a=$(make_bundle)
+d="$(dirname "$a")/src"
+rm "$d/assets/$WASM_NAME" "$d/assets/$FAVICON_NAME"
+retar "$a"
+check "loader references a wasm that is not in the bundle: REFUSE" 1 "$(run_gate "$a")"
+rm -rf "$(dirname "$a")"
+
+# VACUITY GUARD. "No unreachable assets" is trivially true of an empty
+# assets/ directory, so an app-less bundle must be refused on its own account.
+a=$(make_bundle)
+d="$(dirname "$a")/src"
+rm -f "$d"/assets/*
+retar "$a"
+check "empty assets/ (build produced no app): REFUSE" 1 "$(run_gate "$a")"
+rm -rf "$(dirname "$a")"
+
+a=$(make_bundle)
+d="$(dirname "$a")/src"
+rm "$d/index.html"
+retar "$a"
+check "no index.html: REFUSE" 1 "$(run_gate "$a")"
+rm -rf "$(dirname "$a")"
+
+# Fail closed: no archive at all is a refusal, never a skip.
+check "archive does not exist: REFUSE" 1 "$(run_gate "/nonexistent/webapp.tar.xz")"
+
+missing=$(mktemp -d)
+check "no archive argument: REFUSE" 1 "$(bash "$GATE" >/dev/null 2>&1; echo $?)"
+rm -rf "$missing"
+
+echo ""
+echo "$PASS passed, $FAIL failed"
+[ "$FAIL" -eq 0 ]
