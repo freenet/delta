@@ -159,6 +159,30 @@ retar() { # $1 archive
 
 run_gate() { bash "$GATE" "$1" >/dev/null 2>&1; echo $?; }
 
+# Assert the REASON, not just the exit code. Several refusals are reachable by
+# more than one route -- an empty assets/ trips both the empty-directory check
+# and, further down, "index.html references no js" -- so a test that only reads
+# the exit code cannot tell which check fired, and stays green when one of them
+# is deleted. Mutation testing found exactly that: removing the empty-assets
+# refusal left every exit-code assertion here passing. Pinning the message means
+# each case pins one specific check.
+check_refusal() { # $1 description, $2 archive, $3 expected message fragment
+    local out code
+    out=$(bash "$GATE" "$2" 2>&1); code=$?
+    if [ "$code" -ne 1 ]; then
+        echo "FAIL - $1: expected exit 1, got $code"
+        FAIL=$((FAIL + 1))
+    elif ! grep -qF -- "$3" <<< "$out"; then
+        echo "FAIL - $1: refused, but not for the expected reason"
+        echo "         wanted message containing: $3"
+        echo "         got: $(head -1 <<< "$out")"
+        FAIL=$((FAIL + 1))
+    else
+        echo "ok   - $1 (exit 1, correct reason)"
+        PASS=$((PASS + 1))
+    fi
+}
+
 echo "--- end-to-end (runs the real gate) ---"
 
 a=$(make_bundle)
@@ -171,7 +195,7 @@ d="$(dirname "$a")/src"
 cp "$d/assets/$WASM_NAME" "$d/assets/delta-ui_bg-dxhstale00000000.wasm"
 cp "$d/assets/$JS_NAME"   "$d/assets/delta-ui-dxhstale00000000.js"
 retar "$a"
-check "orphaned wasm + loader from an earlier build: REFUSE" 1 "$(run_gate "$a")"
+check_refusal "orphaned wasm + loader from an earlier build: REFUSE" "$a" "unreachable from index.html"
 rm -rf "$(dirname "$a")"
 
 # A lone orphan, which a "the chain resolves" check alone would miss.
@@ -179,7 +203,7 @@ a=$(make_bundle)
 d="$(dirname "$a")/src"
 cp "$d/assets/$WASM_NAME" "$d/assets/delta-ui_bg-dxhstale00000000.wasm"
 retar "$a"
-check "single orphaned wasm: REFUSE" 1 "$(run_gate "$a")"
+check_refusal "single orphaned wasm: REFUSE" "$a" "unreachable from index.html"
 rm -rf "$(dirname "$a")"
 
 # Generality: not a delta-ui file at all. A name-scoped check would miss this.
@@ -187,7 +211,7 @@ a=$(make_bundle)
 d="$(dirname "$a")/src"
 cp "$d/assets/$FAVICON_NAME" "$d/assets/favicon-dxhstale00000000.svg"
 retar "$a"
-check "orphaned favicon (not a delta-ui name): REFUSE" 1 "$(run_gate "$a")"
+check_refusal "orphaned favicon (not a delta-ui name): REFUSE" "$a" "unreachable from index.html"
 rm -rf "$(dirname "$a")"
 
 # Stale index.html pointing at an old loader while the fresh pair is orphaned.
@@ -196,22 +220,29 @@ d="$(dirname "$a")/src"
 cp "$d/assets/$JS_NAME" "$d/assets/delta-ui-dxhfresh00000000.js"
 cp "$d/assets/$WASM_NAME" "$d/assets/delta-ui_bg-dxhfresh00000000.wasm"
 retar "$a"
-check "fresh pair present but index.html still points at the old one: REFUSE" 1 "$(run_gate "$a")"
+check_refusal "fresh pair present but index.html still points at the old one: REFUSE" "$a" "unreachable from index.html"
 rm -rf "$(dirname "$a")"
 
 # Dangling references: the chain must resolve INSIDE the archive.
+#
+# This fixture isolates the entry-point check deliberately. Simply deleting the
+# loader would leave the wasm and favicon orphaned, so the UNREACHABLE check
+# fires first and this case would pin nothing new. Here every asset present is
+# reachable, and the only thing wrong is that none of them is an entry point.
 a=$(make_bundle)
 d="$(dirname "$a")/src"
-rm "$d/assets/$JS_NAME"
+rm -f "$d"/assets/*
+printf '<svg/>\n' > "$d/assets/$FAVICON_NAME"
+printf '<html><link rel="icon" href="/assets/%s"></html>\n' "$FAVICON_NAME" > "$d/index.html"
 retar "$a"
-check "index.html references a loader that is not in the bundle: REFUSE" 1 "$(run_gate "$a")"
+check_refusal "assets present and reachable but no js entry point: REFUSE" "$a" "references no js in assets/"
 rm -rf "$(dirname "$a")"
 
 a=$(make_bundle)
 d="$(dirname "$a")/src"
 rm "$d/assets/$WASM_NAME" "$d/assets/$FAVICON_NAME"
 retar "$a"
-check "loader references a wasm that is not in the bundle: REFUSE" 1 "$(run_gate "$a")"
+check_refusal "loader references a wasm that is not in the bundle: REFUSE" "$a" "references no wasm in assets/"
 rm -rf "$(dirname "$a")"
 
 # VACUITY GUARD. "No unreachable assets" is trivially true of an empty
@@ -220,18 +251,18 @@ a=$(make_bundle)
 d="$(dirname "$a")/src"
 rm -f "$d"/assets/*
 retar "$a"
-check "empty assets/ (build produced no app): REFUSE" 1 "$(run_gate "$a")"
+check_refusal "empty assets/ (build produced no app): REFUSE" "$a" "empty assets/ directory"
 rm -rf "$(dirname "$a")"
 
 a=$(make_bundle)
 d="$(dirname "$a")/src"
 rm "$d/index.html"
 retar "$a"
-check "no index.html: REFUSE" 1 "$(run_gate "$a")"
+check_refusal "no index.html: REFUSE" "$a" "no index.html"
 rm -rf "$(dirname "$a")"
 
 # Fail closed: no archive at all is a refusal, never a skip.
-check "archive does not exist: REFUSE" 1 "$(run_gate "/nonexistent/webapp.tar.xz")"
+check_refusal "archive does not exist: REFUSE" "/nonexistent/webapp.tar.xz" "no such archive"
 
 missing=$(mktemp -d)
 check "no archive argument: REFUSE" 1 "$(bash "$GATE" >/dev/null 2>&1; echo $?)"
