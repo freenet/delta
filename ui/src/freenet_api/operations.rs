@@ -1534,6 +1534,14 @@ mod tests {
     /// the real call site (this test is further down the same file). Delete
     /// the guard and the region between the markers no longer mentions
     /// `EDITING`, so this fails rather than matching its own source.
+    ///
+    /// It requires a `return;` between the `EDITING` read and the
+    /// `select_site` call, not merely that both appear. Checking only for the
+    /// presence of `EDITING` would be satisfied by a guard that observes the
+    /// flag and then falls through —
+    /// `if *state::EDITING.read() { log(..); }` with no `return` — which
+    /// leaves the bug fully live while the pin stays green. Both shapes were
+    /// mutation-checked.
     #[test]
     fn the_post_state_change_reselect_is_gated_on_not_editing() {
         let src = include_str!("operations.rs");
@@ -1544,10 +1552,18 @@ mod tests {
         let end = tail
             .find("state::select_site(&prefix)")
             .expect("select_site call not found after the marker");
+        let guard = &tail[..end];
+
+        let editing_at = guard.find("state::EDITING").unwrap_or_else(|| {
+            panic!(
+                "the re-select after a network state change must be skipped while \
+                 the user is editing, or it closes the editor and drops the draft (#62)"
+            )
+        });
         assert!(
-            tail[..end].contains("state::EDITING"),
-            "the re-select after a network state change must be skipped while \
-             the user is editing, or it closes the editor and drops the draft (#62)"
+            guard[editing_at..].contains("return;"),
+            "the EDITING check must RETURN before reaching select_site — a guard \
+             that observes the flag and falls through leaves the bug live (#62)"
         );
     }
 
