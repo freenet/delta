@@ -29,6 +29,11 @@ REPO="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PASS=0
 FAIL=0
 
+# Fixtures are built under one scratch root so a mid-suite failure cannot leak
+# temp trees.
+SCRATCH="$(mktemp -d)"
+trap 'rm -rf "$SCRATCH"' EXIT
+
 check() { # $1 description, $2 expected exit, $3 actual exit
     if [ "$2" = "$3" ]; then
         echo "ok   - $1 (exit $3)"
@@ -55,28 +60,38 @@ makefile_task() { # $1 task name -> that task's block
 echo "--- wiring ---"
 
 bundle_body=$(makefile_task bundle-webapp)
+# EVERY assertion about what the task DOES must read the comment-stripped body.
+# A commented-out gate call is the single most likely way this gets disabled --
+# someone silencing it "just for one publish" -- and it left all 23 assertions
+# green until this was fixed.
+bundle_code=$(grep -vE '^\s*#' <<< "$bundle_body")
 
-grep -q './scripts/check-webapp-bundle.sh' <<< "$bundle_body"
+grep -q './scripts/check-webapp-bundle.sh' <<< "$bundle_code"
 assert "bundle-webapp delegates to the gate script" $?
 
 # One implementation. Any reachability logic in the Makefile means a second copy
-# is back, which is how delta#46 started. Comments are stripped first: this is
-# an assertion about code, and the task's comments legitimately discuss
-# index.html and the asset names while implementing none of it.
-! grep -vE '^\s*#' <<< "$bundle_body" | grep -qE 'delta-ui_bg|index\.html|unreachable'
+# is back, which is how delta#46 started. The task's comments legitimately
+# discuss index.html and the asset names while implementing none of it.
+! grep -qE 'delta-ui_bg|index\.html|unreachable' <<< "$bundle_code"
 assert "bundle-webapp contains no inline reimplementation of the gate" $?
 
 # THE delta#46 GUARD: the gate inspects the archive, so it must come after the
 # tar that writes it. Compare line numbers within the task body.
-tar_line=$(grep -n 'tar -cJf' <<< "$bundle_body" | head -1 | cut -d: -f1)
-gate_line=$(grep -n './scripts/check-webapp-bundle.sh' <<< "$bundle_body" | head -1 | cut -d: -f1)
+tar_line=$(grep -n 'tar -cJf' <<< "$bundle_code" | head -1 | cut -d: -f1)
+gate_line=$(grep -n './scripts/check-webapp-bundle.sh' <<< "$bundle_code" | head -1 | cut -d: -f1)
 [ -n "$tar_line" ] && [ -n "$gate_line" ] && [ "$gate_line" -gt "$tar_line" ]
 assert "the gate runs AFTER the tar step, not before it" $?
 
-# A gate whose non-zero exit is not fatal is decoration. Without `set -e` the
-# script would carry on and cargo-make would see a zero exit from the task.
-grep -qE '^set -e|^set -euo pipefail' <<< "$bundle_body"
+# A gate whose non-zero exit is not fatal is decoration. `set -e` is necessary
+# but NOT sufficient: `|| true` on the call defeats it while leaving `set -e`
+# present, and is exactly what someone reaches for to silence a gate. Both
+# halves are checked.
+grep -qE '^set -e|^set -euo pipefail' <<< "$bundle_code"
 assert "bundle-webapp aborts on a failing command (set -e)" $?
+
+! grep -E './scripts/check-webapp-bundle.sh' <<< "$bundle_code" \
+    | grep -qE '\|\|\s*(true|:|exit 0)|;\s*true\s*$'
+assert "the gate call is not suffixed with || true / || : / || exit 0" $?
 
 # The gate must not be in preflight: preflight is a DEPENDENCY of publish-delta
 # and so runs before the archive exists. This is the trap that produced delta#46
@@ -89,6 +104,13 @@ publish_body=$(makefile_task publish-delta)
 grep -q 'dependencies = .*"bundle-webapp"' <<< "$publish_body"
 assert "publish-delta depends on bundle-webapp" $?
 
+# bundle-webapp produces a ready-to-SIGN archive. Before it was split out, the
+# only route to one was through publish-delta, so check-migration and the test
+# suite had necessarily run first. Extracting it for testability must not open a
+# gate-free second route to a signable artifact.
+grep -q 'dependencies = .*"preflight"' <<< "$bundle_body"
+assert "bundle-webapp depends on preflight (no gate-free route to a signable archive)" $?
+
 # Bundling lives in exactly one task. A second tar in publish-delta would
 # rebuild the archive after the gate had already approved a different one.
 ! grep -q 'tar -cJf' <<< "$publish_body"
@@ -98,17 +120,21 @@ grep -q 'fdev publish' <<< "$publish_body"
 assert "publish-delta is still the task that publishes" $?
 
 # Depending on the gate is not the same as being stopped by it. cargo-make's
-# `ignore_errors`/`force` make a task's non-zero exit non-fatal, so either one
-# on any task in this chain would let a REFUSING gate be walked straight past
-# while every other assertion here stayed green.
+# `ignore_errors`/`force` make a task's non-zero exit non-fatal, and `disabled`
+# is worse still: it drops the task from the execution plan entirely, so
+# `disabled = true` on bundle-webapp leaves publish-delta signing and publishing
+# whatever stale webapp.tar.xz happens to be on disk. That was verified against
+# a planted 3-copy archive: cargo make exited 0 and both sign and publish ran.
+# Any of the three on any task in this chain would let a REFUSING gate be walked
+# straight past while every other assertion here stayed green.
 chain_honours_failure=0
 for t in bundle-webapp test-bundle-gate preflight publish-delta; do
-    if grep -qE '^(ignore_errors|force) *= *true' <<< "$(makefile_task "$t")"; then
-        echo "  [$t] sets ignore_errors/force, so a failing gate would not stop it" >&2
+    if grep -qE '^(ignore_errors|force|disabled) *= *true' <<< "$(makefile_task "$t")"; then
+        echo "  [$t] sets ignore_errors/force/disabled, so a failing gate would not stop it" >&2
         chain_honours_failure=1
     fi
 done
-assert "no task in the publish chain ignores a failing dependency" $chain_honours_failure
+assert "no task in the publish chain is disabled or ignores a failing dependency" $chain_honours_failure
 
 grep -q 'dependencies = .*"test-bundle-gate"' <<< "$(makefile_task preflight)"
 assert "preflight depends on test-bundle-gate (this file)" $?
@@ -130,7 +156,7 @@ FAVICON_NAME="favicon-dxhcccccccccccccccc.svg"
 
 make_bundle() { # echoes an archive path for a well-formed bundle
     local dir archive
-    dir=$(mktemp -d)
+    dir=$(mktemp -d -p "$SCRATCH")
     mkdir -p "$dir/src/assets" "$dir/src/contracts"
     # index.html -> js -> wasm -> favicon, the real reference shape: the
     # favicon's hashed name is embedded in the wasm, not in the html.
@@ -206,6 +232,46 @@ retar "$a"
 check_refusal "single orphaned wasm: REFUSE" "$a" "unreachable from index.html"
 rm -rf "$(dirname "$a")"
 
+# Outside assets/. An assets-only scan returned "Bundle OK" for all three of
+# these. The staged-wasm case is the one that actually happens: dx writes the
+# unhashed wasm-bindgen output to public/wasm/ before moving it into assets/, so
+# an interrupted build leaves a full-size copy there.
+a=$(make_bundle)
+d="$(dirname "$a")/src"
+mkdir -p "$d/wasm"
+cp "$d/assets/$WASM_NAME" "$d/wasm/delta-ui_bg.wasm"
+retar "$a"
+check_refusal "stale staged copy at wasm/delta-ui_bg.wasm: REFUSE" "$a" "unreachable from index.html"
+rm -rf "$(dirname "$a")"
+
+a=$(make_bundle)
+d="$(dirname "$a")/src"
+printf 'orphan\n' > "$d/orphan.js"
+retar "$a"
+check_refusal "orphan at the archive root: REFUSE" "$a" "unreachable from index.html"
+rm -rf "$(dirname "$a")"
+
+a=$(make_bundle)
+d="$(dirname "$a")/src"
+mkdir -p "$d/assets/snippets"
+printf 'stale\n' > "$d/assets/snippets/stale.js"
+retar "$a"
+check_refusal "orphan nested in assets/snippets/: REFUSE" "$a" "unreachable from index.html"
+rm -rf "$(dirname "$a")"
+
+# The destructive clean before the build makes a missing runtime file a real
+# possibility, and contracts/*.wasm cannot be covered by reachability: their
+# names appear nowhere in the bundle, because the app builds the path at run
+# time. Checked by presence instead.
+for required in contracts/site_contract.wasm contracts/site_delegate.wasm styles.css main.css; do
+    a=$(make_bundle)
+    d="$(dirname "$a")/src"
+    rm "$d/$required"
+    retar "$a"
+    check_refusal "required file $required missing: REFUSE" "$a" "missing 1 file(s) the app needs"
+    rm -rf "$(dirname "$a")"
+done
+
 # Generality: not a delta-ui file at all. A name-scoped check would miss this.
 a=$(make_bundle)
 d="$(dirname "$a")/src"
@@ -235,14 +301,14 @@ rm -f "$d"/assets/*
 printf '<svg/>\n' > "$d/assets/$FAVICON_NAME"
 printf '<html><link rel="icon" href="/assets/%s"></html>\n' "$FAVICON_NAME" > "$d/index.html"
 retar "$a"
-check_refusal "assets present and reachable but no js entry point: REFUSE" "$a" "references no js in assets/"
+check_refusal "assets present and reachable but no js entry point: REFUSE" "$a" "references no js in the bundle"
 rm -rf "$(dirname "$a")"
 
 a=$(make_bundle)
 d="$(dirname "$a")/src"
 rm "$d/assets/$WASM_NAME" "$d/assets/$FAVICON_NAME"
 retar "$a"
-check_refusal "loader references a wasm that is not in the bundle: REFUSE" "$a" "references no wasm in assets/"
+check_refusal "loader references a wasm that is not in the bundle: REFUSE" "$a" "references no wasm in the bundle"
 rm -rf "$(dirname "$a")"
 
 # VACUITY GUARD. "No unreachable assets" is trivially true of an empty
@@ -251,22 +317,20 @@ a=$(make_bundle)
 d="$(dirname "$a")/src"
 rm -f "$d"/assets/*
 retar "$a"
-check_refusal "empty assets/ (build produced no app): REFUSE" "$a" "empty assets/ directory"
+check_refusal "no app assets at all (build produced nothing): REFUSE" "$a" "contains no app assets"
 rm -rf "$(dirname "$a")"
 
 a=$(make_bundle)
 d="$(dirname "$a")/src"
 rm "$d/index.html"
 retar "$a"
-check_refusal "no index.html: REFUSE" "$a" "no index.html"
+check_refusal "no index.html: REFUSE" "$a" "missing 1 file(s) the app needs"
 rm -rf "$(dirname "$a")"
 
 # Fail closed: no archive at all is a refusal, never a skip.
 check_refusal "archive does not exist: REFUSE" "/nonexistent/webapp.tar.xz" "no such archive"
 
-missing=$(mktemp -d)
 check "no archive argument: REFUSE" 1 "$(bash "$GATE" >/dev/null 2>&1; echo $?)"
-rm -rf "$missing"
 
 echo ""
 echo "$PASS passed, $FAIL failed"

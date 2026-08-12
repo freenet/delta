@@ -353,22 +353,32 @@ committed.
 ```bash
 # Full build + publish. This is the supported route: it runs the migration
 # gate via `preflight` and aborts before anything is built or uploaded if a
-# predecessor hash is missing.
+# predecessor hash is missing, and it refuses to publish a bundle that is not
+# self-consistent.
 cargo make publish-delta
 ```
 
-**Do not assemble a publish by hand without running the gate first.** An
-earlier version of this section listed the raw `dx build` / tar / sign /
-`fdev publish` steps with no mention of `check-migration.sh`, which
-documented a route that skips the only thing standing between a WASM change
-and every returning user losing their sites. If you genuinely need the
-individual steps, run the gate as step one and stop if it refuses:
+**Do not assemble a publish by hand.** There are now TWO gates on this path,
+and a hand-assembled publish skips both:
+
+- `scripts/check-migration.sh` (via `preflight`) — the only thing standing
+  between a WASM change and every returning user losing their sites.
+- `scripts/check-webapp-bundle.sh` (inside `bundle-webapp`, after the tar) —
+  refuses an archive carrying stale copies from earlier builds. `dx` writes
+  content-hashed filenames, so without the clean-and-check the bundle grew a
+  full ~2MB wasm on every publish and shipped several builds of the app at
+  once (delta#70).
+
+An earlier version of this section listed raw `dx build` / tar / sign /
+`fdev publish` steps, which documented exactly that gate-free route. If you
+need the archive without publishing, build it with the task — it runs both
+gates and stops at the tar:
 
 ```bash
-./scripts/check-migration.sh   # MUST print "Safe to publish" — exit 1 means stop
-cd ui && npm run build:css && dx build --release
-# Copy CSS, tar, sign, fdev publish (see Makefile.toml)
+cargo make bundle-webapp     # -> target/webapp/webapp.tar.xz, gated, no publish
 ```
+
+Do not sign or publish an archive produced any other way.
 
 Contract ID: `EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr`
 
