@@ -158,13 +158,23 @@ make_bundle() { # echoes an archive path for a well-formed bundle
     local dir archive
     dir=$(mktemp -d -p "$SCRATCH")
     mkdir -p "$dir/src/assets" "$dir/src/contracts"
-    # index.html -> js -> wasm -> favicon, the real reference shape: the
-    # favicon's hashed name is embedded in the wasm, not in the html.
-    printf '<html><script type="module" src="/assets/%s"></script></html>\n' "$JS_NAME" \
+    # index.html -> js -> wasm -> favicon, matching the REAL reference shapes,
+    # which were read off an actual bundle. Getting these wrong is not a
+    # cosmetic issue: an earlier version of this fixture omitted the loader's
+    # unhashed "delta-ui_bg.wasm" literal, and the staged-wasm case below then
+    # passed here while the real gate let a 2MB orphan through. The fixture has
+    # to be able to produce the fault, or the case that pins it is theatre.
+    #
+    #   index.html -> loader   by FULL PATH   ("/./assets/<js>")
+    #   loader     -> wasm     by FULL PATH   ("/./assets/<wasm>")
+    #                          AND carries wasm-bindgen's own unhashed
+    #                          "delta-ui_bg.wasm" literal
+    #   wasm       -> favicon  by BARE BASENAME, no path at all
+    printf '<html><script type="module" src="/./assets/%s"></script></html>\n' "$JS_NAME" \
         > "$dir/src/index.html"
-    printf 'export default function init(){ return fetch("/assets/%s"); }\n' "$WASM_NAME" \
-        > "$dir/src/assets/$JS_NAME"
-    printf '\0asm\1\0\0\0 some wasm bytes referencing /assets/%s\n' "$FAVICON_NAME" \
+    printf 'let w="delta-ui_bg.wasm";export default function init(){return fetch("/./assets/%s");}\n' \
+        "$WASM_NAME" > "$dir/src/assets/$JS_NAME"
+    printf '\0asm\1\0\0\0 some wasm bytes referencing %s\n' "$FAVICON_NAME" \
         > "$dir/src/assets/$WASM_NAME"
     printf '<svg/>\n' > "$dir/src/assets/$FAVICON_NAME"
     printf 'contract\n' > "$dir/src/contracts/site_contract.wasm"
@@ -218,8 +228,8 @@ rm -rf "$(dirname "$a")"
 # THE BUG. A second build's wasm + loader left behind by the missing clean.
 a=$(make_bundle)
 d="$(dirname "$a")/src"
-cp "$d/assets/$WASM_NAME" "$d/assets/delta-ui_bg-dxhstale00000000.wasm"
-cp "$d/assets/$JS_NAME"   "$d/assets/delta-ui-dxhstale00000000.js"
+cp "$d/assets/$WASM_NAME" "$d/assets/delta-ui_bg-dxh5741e00000000.wasm"
+cp "$d/assets/$JS_NAME"   "$d/assets/delta-ui-dxh5741e00000000.js"
 retar "$a"
 check_refusal "orphaned wasm + loader from an earlier build: REFUSE" "$a" "unreachable from index.html"
 rm -rf "$(dirname "$a")"
@@ -227,7 +237,7 @@ rm -rf "$(dirname "$a")"
 # A lone orphan, which a "the chain resolves" check alone would miss.
 a=$(make_bundle)
 d="$(dirname "$a")/src"
-cp "$d/assets/$WASM_NAME" "$d/assets/delta-ui_bg-dxhstale00000000.wasm"
+cp "$d/assets/$WASM_NAME" "$d/assets/delta-ui_bg-dxh5741e00000000.wasm"
 retar "$a"
 check_refusal "single orphaned wasm: REFUSE" "$a" "unreachable from index.html"
 rm -rf "$(dirname "$a")"
@@ -236,19 +246,49 @@ rm -rf "$(dirname "$a")"
 # these. The staged-wasm case is the one that actually happens: dx writes the
 # unhashed wasm-bindgen output to public/wasm/ before moving it into assets/, so
 # an interrupted build leaves a full-size copy there.
+# THE MOTIVATING CASE, and the one that regressed once already. dx stages the
+# UNHASHED wasm-bindgen output at wasm/delta-ui_bg.wasm, and the loader contains
+# the literal "delta-ui_bg.wasm" (wasm-bindgen's own default name), so a
+# basename-anywhere matcher laundered this 2MB orphan into "reachable" and the
+# gate printed Bundle OK. Caught by hash-shape, which cannot be argued out of a
+# refusal by what some other file happens to contain.
 a=$(make_bundle)
 d="$(dirname "$a")/src"
 mkdir -p "$d/wasm"
 cp "$d/assets/$WASM_NAME" "$d/wasm/delta-ui_bg.wasm"
 retar "$a"
-check_refusal "stale staged copy at wasm/delta-ui_bg.wasm: REFUSE" "$a" "unreachable from index.html"
+check_refusal "stale staged copy at wasm/delta-ui_bg.wasm: REFUSE" "$a" "carry no dx content hash"
+rm -rf "$(dirname "$a")"
+
+# The same laundering, in the SAME directory as the reference. Same-directory
+# basename matching is deliberately still allowed (the wasm names the favicon
+# with no path), so reachability alone would pass this. Only hash-shape refuses.
+a=$(make_bundle)
+d="$(dirname "$a")/src"
+cp "$d/assets/$WASM_NAME" "$d/assets/delta-ui_bg.wasm"
+retar "$a"
+check_refusal "unhashed stray beside the loader that names it: REFUSE" "$a" "carry no dx content hash"
+rm -rf "$(dirname "$a")"
+
+# The converse: a HASHED copy in another directory, which hash-shape passes.
+# This is what pins the path-resolution rule specifically -- its basename is
+# identical to the genuinely-reachable wasm, so a basename-anywhere matcher
+# marks it reached, and only resolving the reference relative to the referrer's
+# directory (assets/, not wasm/) refuses it.
+a=$(make_bundle)
+d="$(dirname "$a")/src"
+mkdir -p "$d/wasm"
+cp "$d/assets/$WASM_NAME" "$d/wasm/$WASM_NAME"
+retar "$a"
+check_refusal "hashed copy in another directory sharing the loader's target basename: REFUSE" \
+    "$a" "unreachable from index.html"
 rm -rf "$(dirname "$a")"
 
 a=$(make_bundle)
 d="$(dirname "$a")/src"
 printf 'orphan\n' > "$d/orphan.js"
 retar "$a"
-check_refusal "orphan at the archive root: REFUSE" "$a" "unreachable from index.html"
+check_refusal "unhashed orphan at the archive root: REFUSE" "$a" "carry no dx content hash"
 rm -rf "$(dirname "$a")"
 
 a=$(make_bundle)
@@ -256,7 +296,7 @@ d="$(dirname "$a")/src"
 mkdir -p "$d/assets/snippets"
 printf 'stale\n' > "$d/assets/snippets/stale.js"
 retar "$a"
-check_refusal "orphan nested in assets/snippets/: REFUSE" "$a" "unreachable from index.html"
+check_refusal "unhashed orphan nested in assets/snippets/: REFUSE" "$a" "carry no dx content hash"
 rm -rf "$(dirname "$a")"
 
 # The destructive clean before the build makes a missing runtime file a real
@@ -275,7 +315,7 @@ done
 # Generality: not a delta-ui file at all. A name-scoped check would miss this.
 a=$(make_bundle)
 d="$(dirname "$a")/src"
-cp "$d/assets/$FAVICON_NAME" "$d/assets/favicon-dxhstale00000000.svg"
+cp "$d/assets/$FAVICON_NAME" "$d/assets/favicon-dxh5741e00000000.svg"
 retar "$a"
 check_refusal "orphaned favicon (not a delta-ui name): REFUSE" "$a" "unreachable from index.html"
 rm -rf "$(dirname "$a")"
@@ -283,8 +323,8 @@ rm -rf "$(dirname "$a")"
 # Stale index.html pointing at an old loader while the fresh pair is orphaned.
 a=$(make_bundle)
 d="$(dirname "$a")/src"
-cp "$d/assets/$JS_NAME" "$d/assets/delta-ui-dxhfresh00000000.js"
-cp "$d/assets/$WASM_NAME" "$d/assets/delta-ui_bg-dxhfresh00000000.wasm"
+cp "$d/assets/$JS_NAME" "$d/assets/delta-ui-dxhf6e5b00000000.js"
+cp "$d/assets/$WASM_NAME" "$d/assets/delta-ui_bg-dxhf6e5b00000000.wasm"
 retar "$a"
 check_refusal "fresh pair present but index.html still points at the old one: REFUSE" "$a" "unreachable from index.html"
 rm -rf "$(dirname "$a")"

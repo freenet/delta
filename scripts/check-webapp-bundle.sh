@@ -25,10 +25,16 @@
 #               because the publish task now wipes the whole build directory
 #               before building.
 #
-#   REACHABLE - referenced, transitively, from index.html. The real graph is
-#               index.html -> js -> wasm -> favicon (the favicon's hashed name
-#               is embedded in the wasm, not the html), so every file is scanned
-#               as text and no naming scheme is hardcoded.
+#   ACCOUNTED - carries a dx content hash in its name (check 0) AND is
+#               referenced, transitively, from index.html (check 1). The real
+#               graph is index.html -> js -> wasm -> favicon; the favicon's
+#               hashed name is embedded in the wasm, not the html, so every file
+#               is scanned as text.
+#
+# Both are needed and neither is redundant: hash-shape catches an unhashed stray
+# whatever any file happens to contain, and reachability catches a HASHED orphan
+# from an earlier build, which is the original delta#70 bug and which hash-shape
+# cannot distinguish from the live one.
 #
 # Reachability is the general property, deliberately not a count: it subsumes
 # "exactly one of each", and also catches an orphaned favicon, a stale
@@ -80,6 +86,8 @@ fi
 # Every file in the archive, relative to its root.
 mapfile -t ALL < <(find . -type f -printf '%P\n' | sort)
 
+dir_of() { case "$1" in */*) printf '%s' "${1%/*}" ;; *) printf '' ;; esac; }
+
 # Candidates for the reachability scan: everything that is not a REQUIRED
 # fixed-name file.
 CANDIDATES=()
@@ -90,18 +98,56 @@ for f in "${ALL[@]}"; do
 done
 [ "${#CANDIDATES[@]}" -gt 0 ] || fail "archive contains no app assets -- the build produced nothing"
 
-# Transitive reachability from index.html. Files are scanned as text (grep -a)
-# because the loader names its wasm and the wasm embeds the hashed favicon name.
-# A candidate counts as referenced if either its full path or its basename
-# appears in a file already reached.
+# CHECK 0: every non-required file must carry a dx content hash in its name.
+#
+# This is the PRIMARY check because it involves no parsing at all, so nothing a
+# file happens to contain can talk it out of a refusal. It exists because the
+# reachability scan below was fooled exactly once, by exactly this shape: dx
+# stages the UNHASHED wasm-bindgen output at wasm/delta-ui_bg.wasm, and the
+# loader legitimately contains the literal string "delta-ui_bg.wasm" (it is
+# wasm-bindgen's own default name). A 2MB orphan was therefore laundered into
+# "reachable" by a substring coincidence with a file that really was reachable.
+#
+# Hash-shape catches that by construction, and keeps catching it whatever the
+# matcher below is later changed to: the staged copy is precisely the file whose
+# name is NOT hashed. If dx ever changes its hash format this check starts
+# refusing everything, which is loud rather than silent -- the correct direction
+# for a publish gate to fail.
+UNHASHED=()
+for f in "${CANDIDATES[@]}"; do
+    [[ "${f##*/}" =~ -dxh[0-9a-f]+\.[A-Za-z0-9]+$ ]] || UNHASHED+=("$f")
+done
+if [ "${#UNHASHED[@]}" -gt 0 ]; then
+    echo "FAILED: ${#UNHASHED[@]} file(s) carry no dx content hash and are not required files:"
+    for f in "${UNHASHED[@]}"; do
+        echo "          $f ($(stat -c%s "$f") bytes)"
+    done
+    echo "        dx names every bundled asset <name>-dxh<hash>.<ext>. An unhashed"
+    echo "        file here is a stray -- most likely dx's staged wasm/delta-ui_bg.wasm"
+    echo "        left by an interrupted build. See delta#70."
+    exit 1
+fi
+
+# CHECK 1: transitive reachability from index.html, for orphans that DO carry a
+# hash (a previous build's asset, which check 0 cannot distinguish).
+#
+# Files are scanned as text (grep -a) because the loader names its wasm and the
+# wasm embeds the hashed favicon name. References resolve RELATIVE TO THE
+# REFERRER: a candidate is reached if the referrer contains its full archive
+# path, or if the referrer contains its bare basename AND the two live in the
+# same directory. Bare-basename matching cannot be dropped -- the wasm names the
+# favicon with no path at all -- but restricting it to same-directory means a
+# reference living in assets/ can no longer reach a file in wasm/.
 declare -A REACHED=()
 FRONTIER=("index.html")
 while [ "${#FRONTIER[@]}" -gt 0 ]; do
     current="${FRONTIER[0]}"
     FRONTIER=("${FRONTIER[@]:1}")
+    current_dir="$(dir_of "$current")"
     for f in "${CANDIDATES[@]}"; do
         [ -n "${REACHED[$f]:-}" ] && continue
-        if grep -aqF -- "$f" "$current" || grep -aqF -- "${f##*/}" "$current"; then
+        if grep -aqF -- "$f" "$current" \
+           || { [ "$(dir_of "$f")" = "$current_dir" ] && grep -aqF -- "${f##*/}" "$current"; }; then
             REACHED[$f]=1
             FRONTIER+=("$f")
         fi
