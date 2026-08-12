@@ -3,8 +3,125 @@ use dioxus::prelude::*;
 
 use crate::state;
 
+/// What the edit buffers were last seeded with: which page, and the exact
+/// text written into them.
+///
+/// The values matter as much as the identity. Comparing the live buffers
+/// against them is how the effect tells "the user has typed" from "the
+/// buffers are still exactly what we put there", which is what lets it keep
+/// following the persisted page until the moment the user actually edits.
+#[derive(PartialEq)]
+struct SeededFrom {
+    identity: (String, PageId),
+    title: String,
+    content: String,
+}
+
 #[component]
 pub fn Editor() -> Element {
+    // What the edit buffers were last seeded with. `None` until the first
+    // seeding run.
+    //
+    // Declared before the "no page selected" early return purely so the
+    // seeding effect keeps running when there is briefly no current page
+    // (e.g. the page was deleted out from under an open editor) — with the
+    // return first, the effect would not exist on those renders. This is NOT
+    // a hook-ordering fix: seven `use_signal` calls still sit below that
+    // return, so the component genuinely calls a different number of hooks
+    // depending on `current_page()`. That is safe here because dioxus 0.7.4
+    // indexes hooks per render and resets the index each pass, so an early
+    // return simply truncates the list to a prefix and the indices realign
+    // next render. Do not read this comment as a licence to assume hook
+    // order is unconditional in this component — it is not.
+    let mut seeded = use_signal(|| None::<SeededFrom>);
+
+    // Seed the edit buffers from the persisted page — but never over text the
+    // user has typed.
+    //
+    // This effect reads CURRENT_SITE, CURRENT_PAGE and SITES (the last via
+    // `state::current_page`), which subscribes it to all three. Dioxus's
+    // `Signal::write()` drop guard calls `update_subscribers()`
+    // unconditionally — it never compares the old value against the new — so
+    // ANY write to SITES re-runs this effect, including a write that changes
+    // nothing at all. Several handlers take the SITES write guard before
+    // checking whether they have anything to change (`freenet_api::delegate`,
+    // `freenet_api::operations`), and after load the legacy delegate sweep
+    // and the freenet-migrate walk land a multi-second trickle of them.
+    //
+    // Seeding on every run therefore overwrote whatever the user had typed
+    // with the persisted page text a few seconds into an edit. There is no
+    // draft buffer, so the typing was simply gone: freenet/delta#62, reported
+    // by Ivvor on 2026-08-12 ("the page would be reset to the current
+    // contract state version, overwriting all my edits").
+    //
+    // Guarding on `!EDITING` instead would be both wrong and useless:
+    // `Editor` is only rendered while `EDITING` is true (see
+    // `components::App`), so the guard would be false on every single run and
+    // the buffers would never be seeded at all.
+    //
+    // Keying only on the page IDENTITY is not enough either, and gets the
+    // same class of bug back with a different victim. If the editor opened on
+    // the delegate's backed-up (older) text and the network GET landed a
+    // moment later, an identity-only guard would leave the buffers on the
+    // stale text. The user then types one character and saves — and
+    // `state::save_current_page` routes through `next_page_updated_at`
+    // (`state.rs`), which reads the CURRENT `updated_at` out of SITES and
+    // returns `max(now, existing + 1)`. The save therefore strictly dominates
+    // the newer generation that had already arrived and silently reverts it,
+    // with no conflict UI. Same thing long-lived when another device's edit
+    // arrives via `handle_site_delta`.
+    //
+    // So the rule is: re-seed when the page identity is stale, OR when the
+    // buffers still hold exactly what was last seeded into them — the latter
+    // meaning the user has not typed, so following the persisted text is both
+    // safe and necessary to keep the save base current. Once they type, the
+    // buffers stop matching and nothing overwrites them until they save or
+    // cancel.
+    //
+    // `seeded` is component-local, so closing the editor and reopening it
+    // re-seeds from the persisted text; a cancelled draft does not resurrect.
+    use_effect(move || {
+        let Some(prefix) = (*state::CURRENT_SITE.read()).clone() else {
+            return;
+        };
+        let Some((page_id, page)) = state::current_page() else {
+            return;
+        };
+        let identity = (prefix, page_id);
+
+        // `peek` throughout, deliberately. A normal read would subscribe this
+        // effect to signals it also writes: `seeded` would re-run it every
+        // time it seeds, and the editor buffers would re-run it on every
+        // keystroke.
+        let reseed = match &*seeded.peek() {
+            None => true,
+            Some(prev) => {
+                prev.identity != identity
+                    || (*state::EDITOR_TITLE.peek() == prev.title
+                        && *state::EDITOR_CONTENT.peek() == prev.content)
+            }
+        };
+        if !reseed {
+            return;
+        }
+
+        // Write only on a real difference. Nothing downstream depends on the
+        // notification, and skipping the no-op write avoids re-rendering the
+        // editor (and re-running the markdown preview pipeline) on every one
+        // of the no-op SITES writes that caused this bug.
+        if *state::EDITOR_TITLE.peek() != page.title {
+            *state::EDITOR_TITLE.write() = page.title.clone();
+        }
+        if *state::EDITOR_CONTENT.peek() != page.content {
+            *state::EDITOR_CONTENT.write() = page.content.clone();
+        }
+        seeded.set(Some(SeededFrom {
+            identity,
+            title: page.title.clone(),
+            content: page.content.clone(),
+        }));
+    });
+
     let Some((_page_id, _page)) = state::current_page() else {
         return rsx! {
             div { class: "flex items-center justify-center h-full text-text-muted-light",
@@ -12,13 +129,6 @@ pub fn Editor() -> Element {
             }
         };
     };
-
-    use_effect(move || {
-        if let Some((_, page)) = state::current_page() {
-            *state::EDITOR_TITLE.write() = page.title.clone();
-            *state::EDITOR_CONTENT.write() = page.content.clone();
-        }
-    });
 
     let title = state::EDITOR_TITLE.read().clone();
     let content = state::EDITOR_CONTENT.read().clone();
@@ -386,6 +496,329 @@ fn update_autocomplete(
     }
     ac_visible.set(false);
     ac_query.set(None);
+}
+
+/// Behavioural coverage for the edit-buffer seeding effect (freenet/delta#62).
+///
+/// These mount the REAL `Editor` component in a headless `VirtualDom`, which
+/// works on the native target: `dioxus`'s core is platform-independent, and
+/// the only two browser-dependent helpers `Editor` reaches
+/// (`page_view::behind_gateway` / `own_contract_id`) already have
+/// `cfg(not(target_arch = "wasm32"))` fallbacks. So the reseed behaviour does
+/// NOT need a browser to test, and these are not source-scrape pins — they
+/// drive the effect and assert on the buffer contents.
+///
+/// Effect-flush semantics, verified empirically before these were written:
+/// `rebuild_in_place()` alone does NOT run effects; they are flushed by the
+/// following `render_immediate_to_vec()`. A write that changes nothing still
+/// schedules a re-run, which is the bug's trigger and is what
+/// `a_background_no_op_sites_write_does_not_clobber_an_in_progress_edit`
+/// exercises.
+#[cfg(test)]
+mod reseed_tests {
+    use super::*;
+    use crate::state;
+    use delta_core::{Page, SiteConfig, SiteState};
+    use ed25519_dalek::SigningKey;
+
+    const PREFIX: &str = "AmcVD92D3U";
+
+    fn owner_key() -> SigningKey {
+        SigningKey::from_bytes(&[7u8; 32])
+    }
+
+    fn site(pages: &[(PageId, &str, &str)]) -> state::KnownSite {
+        let owner = owner_key();
+        let mut site_state = SiteState::new(SiteConfig::default(), &owner);
+        for (id, title, content) in pages {
+            let page = Page::new(*id, title.to_string(), content.to_string(), 100, &owner);
+            site_state
+                .upsert_page(*id, page, &owner.verifying_key())
+                .unwrap();
+        }
+        state::KnownSite {
+            name: "Test site".to_string(),
+            prefix: PREFIX.to_string(),
+            role: state::SiteRole::Owner,
+            state: site_state,
+            owner_pubkey: owner.verifying_key().to_bytes(),
+            contract_key: None,
+        }
+    }
+
+    /// Mirrors the branch in `components::App` that decides whether the
+    /// editor exists at all. Rendering `Editor` through it (rather than as
+    /// the root) is what makes `EDITING` mount and unmount the component, so
+    /// the "reopening re-seeds" test is not silently testing a fresh runtime.
+    #[component]
+    fn Harness() -> Element {
+        if *state::EDITING.read() {
+            rsx! { Editor {} }
+        } else {
+            rsx! { div { "viewing" } }
+        }
+    }
+
+    /// Run pending work until it stops producing more.
+    ///
+    /// `rebuild_in_place()` does not itself run effects, and an effect queued
+    /// while a render is in flight (e.g. the mount effect of a component that
+    /// appeared during that render) only runs on the NEXT pass — so a single
+    /// pass is not enough to reach a settled state. Iterating is also what
+    /// keeps these tests honest in the failing direction: the bug shows up as
+    /// an EXTRA seeding run, and extra passes can only make that more likely
+    /// to be observed, never less.
+    fn flush(dom: &mut VirtualDom) {
+        for _ in 0..4 {
+            let _ = dom.render_immediate_to_vec();
+        }
+    }
+
+    /// Mount the harness with `page_id` of `site` selected and open the
+    /// editor, mirroring `state::start_editing` / `state::create_page` (both
+    /// of which set `EDITING = true`, which is what renders `Editor`).
+    fn open_editor_on(site: state::KnownSite, page_id: PageId) -> VirtualDom {
+        let mut dom = VirtualDom::new(Harness);
+        dom.rebuild_in_place();
+        dom.in_runtime(|| {
+            state::SITES.write().insert(PREFIX.to_string(), site);
+            *state::CURRENT_SITE.write() = Some(PREFIX.to_string());
+            *state::CURRENT_PAGE.write() = Some(page_id);
+            *state::EDITING.write() = true;
+        });
+        flush(&mut dom);
+        dom
+    }
+
+    #[test]
+    fn a_background_no_op_sites_write_does_not_clobber_an_in_progress_edit() {
+        let mut dom = open_editor_on(
+            site(&[(1, "Home", "persisted text"), (2, "Second", "second text")]),
+            1,
+        );
+
+        // Opening the editor seeds the buffers from the persisted page.
+        dom.in_runtime(|| {
+            assert_eq!(state::EDITOR_CONTENT.cloned(), "persisted text");
+            assert_eq!(state::EDITOR_TITLE.cloned(), "Home");
+        });
+
+        // The user types. Nothing is saved yet, so this text lives ONLY in
+        // the editor buffers — never in SITES.
+        dom.in_runtime(|| {
+            *state::EDITOR_CONTENT.write() = "the user's unsaved draft".to_string();
+            *state::EDITOR_TITLE.write() = "Home, retitled".to_string();
+        });
+
+        // A background handler takes the SITES write guard and changes
+        // nothing. Several do exactly this (the legacy delegate sweep, the
+        // freenet-migrate walk, the state-response handlers), and Dioxus
+        // notifies subscribers on drop of the guard regardless, so the
+        // seeding effect is re-run.
+        dom.in_runtime(|| {
+            let _guard = state::SITES.write();
+        });
+        flush(&mut dom);
+
+        dom.in_runtime(|| {
+            assert_eq!(
+                state::EDITOR_CONTENT.cloned(),
+                "the user's unsaved draft",
+                "a no-op SITES write must not overwrite the edit buffer (#62)"
+            );
+            assert_eq!(state::EDITOR_TITLE.cloned(), "Home, retitled");
+        });
+
+        // Positive control, same DOM. The assertions above are all "this did
+        // NOT change", which would also hold if the effect had simply stopped
+        // running — and `flush`'s pass count is a constant, so a change in
+        // dioxus's scheduling could silently make that true. Moving to
+        // another page must still re-seed, so a dead effect fails here
+        // instead of passing everything.
+        dom.in_runtime(|| *state::CURRENT_PAGE.write() = Some(2));
+        flush(&mut dom);
+        dom.in_runtime(|| {
+            assert_eq!(
+                state::EDITOR_CONTENT.cloned(),
+                "second text",
+                "positive control: the seeding effect must still be live"
+            );
+        });
+    }
+
+    #[test]
+    fn a_remote_update_to_the_page_being_edited_does_not_clobber_the_draft() {
+        let mut dom = open_editor_on(
+            site(&[(1, "Home", "persisted text"), (2, "Second", "second text")]),
+            1,
+        );
+
+        dom.in_runtime(|| {
+            *state::EDITOR_CONTENT.write() = "the user's unsaved draft".to_string();
+        });
+
+        // A network UPDATE for the very page being edited lands and rewrites
+        // SITES. The persisted page legitimately changes; the user's unsaved
+        // buffer must still not be replaced under them.
+        dom.in_runtime(|| {
+            let mut sites = state::SITES.write();
+            let known = sites.get_mut(PREFIX).expect("site present");
+            known.state.pages.get_mut(&1).expect("page present").content =
+                "text that arrived from the network".to_string();
+        });
+        flush(&mut dom);
+
+        dom.in_runtime(|| {
+            assert_eq!(
+                state::EDITOR_CONTENT.cloned(),
+                "the user's unsaved draft",
+                "an incoming UPDATE must not overwrite the edit buffer (#62)"
+            );
+        });
+
+        // Positive control (see the sibling test): prove the effect is still
+        // live, so "did not change" cannot pass by the effect being dead.
+        dom.in_runtime(|| *state::CURRENT_PAGE.write() = Some(2));
+        flush(&mut dom);
+        dom.in_runtime(|| {
+            assert_eq!(
+                state::EDITOR_CONTENT.cloned(),
+                "second text",
+                "positive control: the seeding effect must still be live"
+            );
+        });
+    }
+
+    #[test]
+    fn a_remote_update_reaches_the_buffers_when_the_user_has_not_typed() {
+        // The other half of the rule, and a regression guard on the first
+        // version of this fix, which keyed only on page identity.
+        //
+        // The realistic sequence: the editor opens on the delegate's backed-up
+        // (older) text, and the network GET lands a moment later. An
+        // identity-only guard leaves the buffers on the stale text. The user
+        // then types one character and saves, and `save_current_page` ->
+        // `next_page_updated_at` returns `max(now, existing + 1)` against the
+        // NEWER `updated_at` now in SITES — so the save strictly dominates and
+        // silently reverts the update that had already arrived. That is the
+        // same lost-update bug as #62 with a different victim, so the buffers
+        // must keep following the persisted page until the user actually types.
+        let mut dom = open_editor_on(site(&[(1, "Home", "older backed-up text")]), 1);
+
+        dom.in_runtime(|| {
+            assert_eq!(state::EDITOR_CONTENT.cloned(), "older backed-up text");
+        });
+
+        // The network GET lands. The user has NOT typed.
+        dom.in_runtime(|| {
+            let mut sites = state::SITES.write();
+            let known = sites.get_mut(PREFIX).expect("site present");
+            known.state.pages.get_mut(&1).expect("page present").content =
+                "newer text from the network".to_string();
+        });
+        flush(&mut dom);
+
+        dom.in_runtime(|| {
+            assert_eq!(
+                state::EDITOR_CONTENT.cloned(),
+                "newer text from the network",
+                "with nothing typed, the buffer must track the persisted page \
+                 so the save base does not go stale"
+            );
+        });
+    }
+
+    #[test]
+    fn tracking_stops_at_the_first_keystroke_and_does_not_resume() {
+        // The boundary between the two rules above. Once the user types, no
+        // later update may move the buffer — not even the one that arrives
+        // after several more no-op writes.
+        let mut dom = open_editor_on(site(&[(1, "Home", "v1"), (2, "Second", "second text")]), 1);
+
+        dom.in_runtime(|| *state::EDITOR_CONTENT.write() = "v1 plus the user's edit".to_string());
+
+        for text in ["v2", "v3"] {
+            dom.in_runtime(|| {
+                let mut sites = state::SITES.write();
+                sites
+                    .get_mut(PREFIX)
+                    .expect("site present")
+                    .state
+                    .pages
+                    .get_mut(&1)
+                    .expect("page present")
+                    .content = text.to_string();
+            });
+            flush(&mut dom);
+        }
+
+        dom.in_runtime(|| {
+            assert_eq!(state::EDITOR_CONTENT.cloned(), "v1 plus the user's edit");
+        });
+
+        // Positive control (see the sibling tests).
+        dom.in_runtime(|| *state::CURRENT_PAGE.write() = Some(2));
+        flush(&mut dom);
+        dom.in_runtime(|| {
+            assert_eq!(
+                state::EDITOR_CONTENT.cloned(),
+                "second text",
+                "positive control: the seeding effect must still be live"
+            );
+        });
+    }
+
+    #[test]
+    fn switching_to_a_different_page_reseeds_the_buffers() {
+        // Pins the identity branch, so "fix it by seeding only once at mount"
+        // does not pass: `state::create_page` moves CURRENT_PAGE while
+        // EDITING stays true, and the buffers must then follow the new page.
+        let mut dom = open_editor_on(
+            site(&[(1, "Home", "home text"), (2, "Second", "second text")]),
+            1,
+        );
+
+        dom.in_runtime(|| {
+            *state::EDITOR_CONTENT.write() = "draft on page 1".to_string();
+            *state::CURRENT_PAGE.write() = Some(2);
+        });
+        flush(&mut dom);
+
+        dom.in_runtime(|| {
+            assert_eq!(state::EDITOR_CONTENT.cloned(), "second text");
+            assert_eq!(state::EDITOR_TITLE.cloned(), "Second");
+        });
+    }
+
+    #[test]
+    fn reopening_the_editor_on_the_same_page_seeds_from_the_persisted_text() {
+        // The buffers are only left alone WITHIN one edit session. Closing
+        // the editor unmounts the component and drops `seeded_from` with it,
+        // so a later edit of the same page starts from what is actually
+        // stored — otherwise a cancelled edit would silently resurrect
+        // itself the next time the user pressed Edit.
+        let mut dom = open_editor_on(site(&[(1, "Home", "persisted text")]), 1);
+
+        // Type, then Cancel (`EDITING = false`, exactly what the Cancel
+        // button does) — the draft is deliberately discarded.
+        dom.in_runtime(|| {
+            *state::EDITOR_CONTENT.write() = "abandoned draft".to_string();
+            *state::EDITING.write() = false;
+        });
+        flush(&mut dom);
+
+        // Press Edit again on the same page.
+        dom.in_runtime(|| *state::EDITING.write() = true);
+        flush(&mut dom);
+
+        dom.in_runtime(|| {
+            assert_eq!(
+                state::EDITOR_CONTENT.cloned(),
+                "persisted text",
+                "reopening the editor must re-seed from the stored page"
+            );
+        });
+    }
 }
 
 #[cfg(test)]
