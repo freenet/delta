@@ -93,20 +93,41 @@ cargo test 2>&1 || { echo "FAILED: Tests must pass before publish"; exit 1; }
 echo "All pre-publish checks passed."
 '''
 
+[tasks.bundle-webapp]
+description = "Build the release UI and pack it into target/webapp/webapp.tar.xz (no publish)"
+dependencies = ["build-tailwind"]
+script = '''
+#!/bin/bash
+set -euo pipefail
+ROOT="${CARGO_MAKE_WORKING_DIRECTORY:-$PWD}"
+[ -f "$ROOT/Makefile.toml" ] || { echo "bundle-webapp must run from the repo root (got: $ROOT)"; exit 1; }
+DX_PUBLIC="$ROOT/target/dx/delta-ui/release/web/public"
+
+# dx writes CONTENT-HASHED filenames into public/assets/, so a changed build
+# lands beside its predecessor instead of overwriting it, and nothing prunes the
+# old one. The tar below packs the whole directory, so without this the bundle
+# accumulated a full ~2MB wasm + js pair on every publish, indefinitely (#70).
+# Only assets/ needs clearing: every other output here (index.html, main.css,
+# styles.css, contracts/*.wasm) has a fixed name and is overwritten each build.
+rm -rf "$DX_PUBLIC/assets"
+
+cd "$ROOT/ui" && dx build --release
+cd "$ROOT"
+cp ui/assets/styles.css "$DX_PUBLIC/"
+cp ui/assets/main.css "$DX_PUBLIC/"
+mkdir -p "$ROOT/target/webapp"
+cd "$DX_PUBLIC"
+tar -cJf "$ROOT/target/webapp/webapp.tar.xz" *
+cd "$ROOT"
+./scripts/check-webapp-bundle.sh target/webapp/webapp.tar.xz
+'''
+
 [tasks.publish-delta]
 description = "Build, sign, and publish Delta to Freenet"
-dependencies = ["build-tailwind", "preflight"]
+dependencies = ["build-tailwind", "preflight", "bundle-webapp"]
 script = '''
 #!/bin/bash
 set -e
-cd ui && dx build --release
-cd ..
-cp ui/assets/styles.css target/dx/delta-ui/release/web/public/
-cp ui/assets/main.css target/dx/delta-ui/release/web/public/
-mkdir -p target/webapp
-cd target/dx/delta-ui/release/web/public
-tar -cJf ../../../../../../target/webapp/webapp.tar.xz *
-cd ../../../../../..
 WCT=$(which web-container-tool 2>/dev/null || echo "/home/ian/code/freenet/river/main/target/native/x86_64-unknown-linux-gnu/release/web-container-tool")
 VERSION=$(($(date +%s) / 60))
 $WCT sign \
