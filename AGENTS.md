@@ -190,15 +190,35 @@ The new contract validates all signatures and accepts the state.
 4. GET state from old key, PUT to new key with the new contract container
 5. Update the stored key in the delegate
 
-This happens automatically - no user action needed.
+This happens automatically - no user action needed. That is the
+single-hop case; the fallback below covers the rest, and both are
+folded into one decision by the driver described under it.
 
 **Multi-hop migration fallback:** when a restored `KnownSiteRecord`
 has no `contract_key_b58` (legacy delegates from before b82d3bc) or
 when the stored key itself refers to a hash no longer on the network,
 the UI additionally probes every previous contract WASM hash recorded
-in `legacy_contracts.toml`. The first GET that returns non-empty
-state wins, and concurrent probes for the same prefix are cancelled
-so a slower response from an older hash can't overwrite fresh state.
+in `legacy_contracts.toml`. Every candidate generation is reconciled
+into local state by the tombstone-aware `reconcile_into` merge, which
+keeps the newest data and preserves deletions regardless of arrival
+order. There is no "first response wins" and no drop-late-arrival
+behaviour, and legacy sibling probes are deliberately left running
+(`ui/src/freenet_api/operations.rs:49-53`, `:213-215`, `:263-267`):
+a slower generation may still be the newest one, which is also the
+self-heal path for a user whose current key holds stale state from an
+earlier broken migration.
+
+**The contract sweep runs on `freenet-migrate`'s decision driver**
+(adopted in delta#36). `ProbeDriver` with `SelectionPolicy::FoldAll`
+(`operations.rs:928-933`) bounds the sweep into ONE decision and one
+forward PUT once every candidate has resolved
+(`finalize_migration_sweep`), replacing the earlier re-PUT on every
+legacy response that changed local state. The driver validates and
+pins the fold while `reconcile_into` keeps ownership of the production
+data decisions, so no second merge implementation exists that could
+drift from the one the tests pin. The driver header at
+`operations.rs:778-800` records two honest bounds on that soundness,
+both pre-existing rather than introduced by the adoption.
 
 **Recording contract WASM hashes is part of the release process.**
 Any commit that changes `site_contract.wasm` — including an incidental
@@ -222,6 +242,41 @@ Migration entries in `legacy_delegates.toml` allow the UI to read from old deleg
 3. Once the current delegate's KnownSites response arrives (see the ordering invariant under "Known-Sites Tombstone Convention"), the UI sends GetPublicKey, GetKnownSites, GetSigningKey to each legacy delegate. **The send order is load-bearing, not cosmetic:** with an empty current delegate the first non-empty legacy reply latches `CURRENT_SITES_LOADED` and calls `save_known_sites()`, after which `skip_older_legacy` discards every remaining generation bar the newest — so send order decides whose view is persisted. Reordering the sweep is a change to stored data and needs its own tests.
 4. When legacy KnownSites arrives, GetSiteState is also requested for each prefix from that legacy delegate
 5. If an old delegate responds, signing keys, known sites, and site state backups are migrated to the current delegate
+
+**Two mechanisms run side by side, and steps 3-5 describe only the
+first.** Since delta#61 Delta runs both:
+
+- The **hand-rolled sweep**, `fire_legacy_migration()`
+  (`ui/src/freenet_api/delegate.rs:1388-1453`), is what steps 3-5
+  above describe. It owns the UI-state restoration the library does
+  not migrate: site list reconciliation, contract GETs and hash-route
+  replay. Its send order is load-bearing, as step 3 explains.
+- The **crate walk**, `start_delegate_secret_migration()`
+  (`delegate.rs:1163`), calls `freenet_migrate::migrate_delegate_secrets`
+  through `run_delegate_migration` (`delegate_migration.rs:922`). It
+  owns walk order, durable per-predecessor marker bookkeeping,
+  never-clobber writes and per-predecessor classification.
+
+Both are armed from the same match arm and nowhere else
+(`delegate.rs:873-874`), so both inherit the ordering invariant under
+"Known-Sites Tombstone Convention": the current delegate has already
+answered, so a predecessor's reply can no longer be applied ahead of
+it and resurrect a site the user removed. Neither is behind a feature
+flag.
+
+Running both is deliberate staging rather than an oversight. Both
+paths are idempotent and never-clobber, so running both is safe;
+retiring the hand-rolled secret probing is a follow-up once the walk
+is field-validated. The rationale is on the doc comment for
+`start_delegate_secret_migration` (`delegate.rs:1150-1162`), and the
+`freenet-migrate-adoption` skill covers the call-site swap, the
+dual-running period and the parity test.
+
+`ui/src/freenet_api/delegate_migration_differential.rs` is a
+**test-only** harness, declared behind `#[cfg(test)]` at
+`ui/src/freenet_api.rs:8-9`. It compares a transcribed model of the
+shipped sweep against the library-driven walk under `cargo test`. It
+is not a runtime check, so do not read it as a third mechanism.
 
 **`legacy_delegates.toml` is baked into the UI at build time** by
 `ui/build.rs`, which declares `cargo:rerun-if-changed` on it. That
