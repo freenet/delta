@@ -62,7 +62,7 @@ freenet-stdlib = { workspace = true, features = ["net"] }
 # tombstone-preservation guarantees live in one reviewed, property-tested place
 # rather than being re-derived in each app. Pins freenet-stdlib ^0.8.2, which
 # unifies with our 0.8.3 so ContractInstanceId/Parameters are the same types.
-freenet-migrate = "0.5.0"
+freenet-migrate = "0.6"
 
 # Internal
 delta-core.workspace = true

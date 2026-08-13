@@ -919,6 +919,18 @@ fn cbor_site_params(prefix: &str) -> Vec<u8> {
 /// the merge is what makes that safe. A candidate with no map entry is treated
 /// as a miss (the finalize caller only runs this once every fired candidate has
 /// resolved, so that path is defensive).
+///
+/// `responses` cannot currently distinguish a real `NotFound` from a candidate
+/// that never resolved: both collapse to `None` well upstream of this
+/// function, in `record_sweep_resolution`'s shared `Option<Vec<u8>>` signature
+/// and the `MigrationSweep.responses` map it feeds (see the real-`NotFound`
+/// handler and `record_sweep_timeout` in this file, which both call
+/// `record_sweep_resolution(prefix, key_b58, None, false)` with no
+/// distinguishing signal). So every `None` here is answered with
+/// [`ProbeDriver::on_unknown`], never [`ProbeDriver::on_absent`] — the safe
+/// reading per the freenet-migrate 0.6.0 upgrade notes. Telling the two apart
+/// would need `responses` (and everything that feeds it) widened to a
+/// three-way signal; that is out of scope here.
 fn drive_fold_probe(
     candidates: NewestFirst,
     responses: &HashMap<ContractInstanceId, Option<Vec<u8>>>,
@@ -935,8 +947,9 @@ fn drive_fold_probe(
     while let Step::Get(id) = driver.next_action() {
         match responses.get(&id) {
             Some(Some(bytes)) => driver.on_response(id, bytes),
-            // NotFound, or a candidate that never resolved: a miss.
-            Some(None) | None => driver.on_timeout(id),
+            // NotFound, or a candidate that never resolved: not distinguishable
+            // here (see doc comment above), so always the safe reading.
+            Some(None) | None => driver.on_unknown(id),
         }
     }
     driver
@@ -2292,10 +2305,16 @@ mod tests {
     }
 
     #[test]
-    fn driver_all_miss_seeds_local_snapshot() {
-        // Local-only data must survive a sweep where every candidate is a miss
-        // (NotFound / undecodable) — the no-silent-data-loss guarantee, now via
-        // the driver. `SeedLocal` carries the local snapshot forward unchanged.
+    fn driver_all_miss_yields_indeterminate_and_preserves_local_snapshot() {
+        // Local-only data must survive a sweep where no candidate's state was
+        // established — the no-silent-data-loss guarantee, now via the driver.
+        // `responses` cannot currently express a real NotFound (see
+        // `drive_fold_probe`'s doc comment), so a `None` entry is always
+        // answered with `on_unknown`, never `on_absent`. That means this sweep
+        // is never a clean `SeedLocal` ("every candidate positively answered
+        // absent") — it is `Indeterminate` (cid(2) never resolved at all), which
+        // still carries the local snapshot forward unchanged but does NOT claim
+        // it is safe to seal the migration as finished.
         let owner = key(8);
         let local = signed_state(&owner, &[(1, "local-only", 700)]);
         let responses: HashMap<ContractInstanceId, Option<Vec<u8>>> =
@@ -2307,12 +2326,22 @@ mod tests {
             local.clone(),
             DEFAULT_MAX_PROBE_HOPS,
         );
-        let Outcome::SeedLocal { local: seeded } = outcome else {
-            panic!("all-miss sweep must seed the local snapshot");
+        let Outcome::Indeterminate {
+            local: seeded,
+            unresolved,
+        } = outcome
+        else {
+            panic!("a sweep with an unresolved candidate must be Indeterminate, got {outcome:?}");
         };
         assert_eq!(
             seeded, local,
-            "local-only data must survive an all-miss sweep"
+            "local-only data must survive a sweep with an unresolved candidate"
+        );
+        assert_eq!(
+            unresolved,
+            vec![cid(2)],
+            "only the never-resolved candidate is unresolved; the undecodable \
+             candidate answered, it just decoded to nothing"
         );
     }
 
