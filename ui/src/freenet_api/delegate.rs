@@ -680,11 +680,20 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                             prefixes.push(prefix.clone());
                         }
                     });
-                    // Mark the site as owner if it exists already
+                    // Mark the site as owner if it exists already. Guard
+                    // against no-op writes: Dioxus notifies subscribers on
+                    // every `write()` drop, even when nothing changed, so
+                    // taking the guard unconditionally during the post-load
+                    // sweep churns every subscriber and re-seeds the editor
+                    // textarea value (#69).
                     let mut sites = state::SITES.write();
                     if let Some(site) = sites.get_mut(&prefix) {
-                        site.role = state::SiteRole::Owner;
-                        site.owner_pubkey = vk.to_bytes();
+                        let needs_update = site.role != state::SiteRole::Owner
+                            || site.owner_pubkey != vk.to_bytes();
+                        if needs_update {
+                            site.role = state::SiteRole::Owner;
+                            site.owner_pubkey = vk.to_bytes();
+                        }
                     }
                 }
                 DelegateResponse::SignedPage { page_id, page } => {
@@ -937,9 +946,12 @@ fn handle_signed_page(page_id: PageId, page: delta_core::Page) {
     {
         let mut sites = state::SITES.write();
         if let Some(site) = sites.get_mut(&prefix) {
-            site.state.pages.insert(page_id, page.clone());
-            if page_id >= site.state.next_page_id {
-                site.state.next_page_id = page_id + 1;
+            let page_changed = site.state.pages.get(&page_id) != Some(&page);
+            if page_changed {
+                site.state.pages.insert(page_id, page.clone());
+                if page_id >= site.state.next_page_id {
+                    site.state.next_page_id = page_id + 1;
+                }
             }
         }
     }
@@ -970,8 +982,10 @@ fn handle_signed_config(signed_config: delta_core::SignedConfig) {
     {
         let mut sites = state::SITES.write();
         if let Some(site) = sites.get_mut(&prefix) {
-            site.state.config = signed_config.clone();
-            site.name = signed_config.config.name.clone();
+            if site.state.config != signed_config {
+                site.state.config = signed_config.clone();
+                site.name = signed_config.config.name.clone();
+            }
         }
     }
 
@@ -1019,7 +1033,12 @@ fn handle_signed_deletion(deletion: delta_core::SignedPageDeletion) {
     {
         let mut sites = state::SITES.write();
         if let Some(site) = sites.get_mut(&prefix) {
-            site.state.pages.remove(&page_id);
+            let removed = site.state.pages.remove(&page_id);
+            if removed.is_none() {
+                log(&format!(
+                    "Delta: page {page_id} not in local state for {prefix} — nothing to remove"
+                ));
+            }
         }
     }
 

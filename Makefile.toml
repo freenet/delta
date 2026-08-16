@@ -155,24 +155,79 @@ cd "$ROOT"
 ./scripts/check-webapp-bundle.sh target/webapp/webapp.tar.xz
 '''
 
-[tasks.publish-delta]
-description = "Build, sign, and publish Delta to Freenet"
-dependencies = ["build-tailwind", "preflight", "bundle-webapp"]
+[tasks.sign-webapp]
+description = "Sign the webapp using a monotonic counter file"
 script = '''
-#!/bin/bash
-set -e
+# Bump the version counter committed at published-contract/contract-version.txt
+# and use that as the metadata version. The previous `seconds/60` timestamp
+# scheme was fragile — if any past publish ever ran with a clock skewed
+# ahead (or someone hand-bumped to a future round number), the on-network
+# version is stuck ahead and the timestamp-derived value can't catch up
+# without manual intervention. The counter file makes the version a strict
+# monotonic local invariant; gaps are fine (the contract enforces
+# monotonicity, not contiguity).
+#
+# Counter lifecycle:
+# 1. `sign-webapp` here writes a `.prev-version` snapshot BEFORE bumping
+#    the counter file, so a downstream `publish-delta` failure can roll
+#    back atomically.
+# 2. The counter file is bumped to `current+1` and the new metadata is
+#    signed with that value.
+# 3. After a successful `fdev publish`, the caller commits the bumped
+#    counter file (the snapshot is left for the publish task to clean
+#    up). A failed publish rolls the counter back from the snapshot.
+#
+# Locking: this script is NOT safe under two parallel `publish-delta`
+# runs on the same workstation — they would race the read-modify-write.
+# Wrap in `flock` if you need that:
+#     flock published-contract/contract-version.txt cargo make publish-delta
+version_file="published-contract/contract-version.txt"
+prev_snapshot="$version_file.prev"
+if [ ! -f "$version_file" ]; then
+    echo "ERROR: $version_file missing. Seed it with the current on-network version."
+    exit 1
+fi
+current=$(cat "$version_file" | tr -d '[:space:]')
+version=$((current + 1))
+cp "$version_file" "$prev_snapshot"
+echo "$version" > "$version_file"
+echo "Web-container version: $current -> $version (commit $version_file after a successful publish)"
 WCT=$(which web-container-tool 2>/dev/null || echo "/home/ian/code/freenet/river/main/target/native/x86_64-unknown-linux-gnu/release/web-container-tool")
-VERSION=$(($(date +%s) / 60))
 $WCT sign \
     --input target/webapp/webapp.tar.xz \
     --output target/webapp/webapp.metadata \
     --parameters target/webapp/webapp.parameters \
     --key-file ~/.config/delta/web-container-keys.toml \
-    --version $VERSION
-fdev publish \
+    --version $version
+'''
+
+[tasks.publish-delta]
+description = "Build, sign, and publish Delta to Freenet"
+dependencies = ["build-tailwind", "preflight", "bundle-webapp", "sign-webapp"]
+script = '''
+#!/bin/bash
+set -e
+version_file="published-contract/contract-version.txt"
+prev_snapshot="$version_file.prev"
+if fdev publish \
     --code published-contract/web_container_contract.wasm \
     --parameters published-contract/webapp.parameters \
     contract \
     --webapp-archive target/webapp/webapp.tar.xz \
-    --webapp-metadata target/webapp/webapp.metadata
+    --webapp-metadata target/webapp/webapp.metadata; then
+    # Publish succeeded — the bumped counter file is the new truth.
+    # Discard the snapshot. Caller must commit $version_file.
+    rm -f "$prev_snapshot"
+    echo "Publish OK. Remember to commit $version_file."
+else
+    rc=$?
+    # Publish failed — roll the counter back so subsequent retries
+    # don't accumulate a drift. The on-network version is unchanged,
+    # and our local counter is now matched to it again.
+    if [ -f "$prev_snapshot" ]; then
+        mv "$prev_snapshot" "$version_file"
+        echo "Publish failed (exit $rc); rolled $version_file back to its pre-publish value." >&2
+    fi
+    exit $rc
+fi
 '''

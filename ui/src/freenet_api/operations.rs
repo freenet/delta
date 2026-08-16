@@ -564,11 +564,22 @@ fn handle_site_delta(key: ContractKey, delta_bytes: &[u8]) {
         log(&format!("Delta: delta for unknown contract key {key}"));
         return;
     };
+    // Snapshot the state before applying the delta so we can avoid a no-op
+    // write guard. Dioxus notifies subscribers on every `write()` drop even
+    // when nothing changes, so taking the guard unconditionally during the
+    // post-load sweep churns every subscriber and re-seeds the editor
+    // textarea value (#69).
     let mut sites = state::SITES.write();
 
     if let Some(site) = sites.get_mut(&prefix) {
+        let before = site.state.clone();
         match apply_delta_to_site_state(&mut site.state, &delta) {
-            Ok(name) => site.name = name,
+            Ok(name) => {
+                if site.state != before {
+                    site.name = name;
+                    super::delegate::backup_site_state(&prefix, &site.state);
+                }
+            }
             Err(e) => {
                 log(&format!(
                     "Delta: rejected delta for {prefix} (failed verification): {e}"
@@ -576,11 +587,6 @@ fn handle_site_delta(key: ContractKey, delta_bytes: &[u8]) {
                 return;
             }
         }
-    }
-
-    // Back up updated state to delegate
-    if let Some(site) = sites.get(&prefix) {
-        super::delegate::backup_site_state(&prefix, &site.state);
     }
 }
 

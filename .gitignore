@@ -1,2 +1,10 @@
 target/
 node_modules/
+AGENTS.md
+.commandcode/
+
+# Web-container version-counter rollback snapshot. Created by
+# `cargo make sign-webapp` BEFORE bumping the counter; removed on
+# successful publish, or moved back over the counter on failure.
+# Should never appear in commits.
+/published-contract/contract-version.txt.prev
