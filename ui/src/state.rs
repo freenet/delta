@@ -45,6 +45,22 @@ pub static EDITOR_CONTENT: GlobalSignal<String> = GlobalSignal::new(String::new)
 /// Prevents network responses from re-adding them.
 pub static REMOVED_PREFIXES: GlobalSignal<Vec<String>> = GlobalSignal::new(Vec::new);
 
+/// Debounce interval for rapid page reorders. Coalescing rapid clicks into
+/// a single network UPDATE prevents held-arrow-key drift from pushing
+/// `updated_at` far into the future (freenet/delta#14).
+const REORDER_DEBOUNCE_MS: u32 = 500;
+
+/// Pending page IDs that need signing after a debounced reorder settles.
+/// Populated on every `swap_page_order` call; drained when the debounce
+/// timer fires.
+#[cfg(target_arch = "wasm32")]
+static REORDER_PENDING: GlobalSignal<Vec<PageId>> = GlobalSignal::new(Vec::new);
+
+/// Active debounce timer ID, if any. Cleared on each subsequent call so only
+/// the last click in a burst arms the sign requests.
+#[cfg(target_arch = "wasm32")]
+static REORDER_TIMER: GlobalSignal<Option<i32>> = GlobalSignal::new(|| None);
+
 /// How far the startup search for the user's sites has got.
 ///
 /// Delta re-keys its delegate on essentially every release, so a returning
@@ -782,21 +798,147 @@ pub fn swap_page_order(page_a: PageId, page_b: PageId) {
     // Order is part of the v2 signature, so re-sign every page whose
     // order changed. In the migration case that's all pages; in the
     // steady state it's just the two pages being swapped.
-    let sites = SITES.read();
-    let Some(site) = sites.get(&prefix) else {
-        return;
-    };
-    for &pid in &plan.pages_to_sign {
-        if let (Some(page), Some(&ts)) = (site.state.pages.get(&pid), new_timestamps.get(&pid)) {
-            crate::freenet_api::delegate::request_sign_page(
-                &prefix,
-                contract_key,
-                pid,
-                page.title.clone(),
-                page.content.clone(),
-                ts,
-                page.order,
-            );
+    //
+    // Debounce: a held arrow key at ~30 Hz would otherwise fire a
+    // sign request per click, each bumping `updated_at` by 1 second and
+    // pushing the page's timestamp minutes into the future. We coalesce
+    // rapid clicks by deferring the sign requests behind a timer; only
+    // the last click in a burst arms them (freenet/delta#14). The local
+    // state update above is immediate for visual feedback.
+    queue_reorder_signs(&prefix, contract_key, &plan.pages_to_sign, &new_timestamps);
+}
+
+/// Stage reorder sign requests behind a debounce timer. Each call cancels
+/// any pending timer and arms a fresh one, so only the final click in a
+/// burst actually fires `request_sign_page`. The pending pages accumulate
+/// in `REORDER_PENDING` so a single debounced flush covers the full
+/// migration set (all pages) as well as the steady-state two-page swap.
+fn queue_reorder_signs(
+    prefix: &str,
+    contract_key: ContractKey,
+    pages_to_sign: &[PageId],
+    new_timestamps: &BTreeMap<PageId, u64>,
+) {
+    #[cfg(target_arch = "wasm32")]
+    {
+        use wasm_bindgen::JsCast;
+
+        // Cancel any in-flight timer.
+        if let Some(id) = REORDER_TIMER.write().take() {
+            if let Some(window) = web_sys::window() {
+                let _ = window.clear_timeout_with_handle(id);
+            }
+        }
+
+        // Accumulate pages for this debounced flush. We need to snapshot
+        // the data we'll need when the timer fires, since the SITES state
+        // may change between now and then (though in practice the user is
+        // still clicking reorder, which only mutates order/timestamps).
+        let prefix_owned = prefix.to_string();
+        let pages_owned: Vec<PageId> = pages_to_sign.to_vec();
+        let timestamps_owned: BTreeMap<PageId, u64> = new_timestamps.clone();
+
+        // Queue the pages for the final flush. If this is a repeat click,
+        // the pages will already be in the vec — dedupe by retaining only
+        // unique entries (the last click's page set is the authoritative one).
+        *REORDER_PENDING.write() = pages_owned;
+
+        let callback = {
+            let cb = Closure::<dyn Fn()>::new(move || {
+                // Drain pending pages under the read guard, snapshot all
+                // needed data, then drop the guard before signing (signing
+                // sends async requests that don't need the SITES lock).
+                let pages_to_process = REORDER_PENDING.write().clone();
+                REORDER_PENDING.write().clear();
+
+                if pages_to_process.is_empty() {
+                    log(&format!(
+                        "Delta: reorder debounce fired with no pending pages for {prefix_owned}"
+                    ));
+                    return;
+                }
+
+                let (titles, contents, orders, timestamps) = {
+                    let sites = SITES.read();
+                    if let Some(site) = sites.get(&prefix_owned) {
+                        let mut titles: Vec<(PageId, String)> = Vec::new();
+                        let mut contents: Vec<(PageId, String)> = Vec::new();
+                        let mut orders: Vec<(PageId, u32)> = Vec::new();
+                        let mut ts_vec: Vec<(PageId, u64)> = Vec::new();
+                        for &pid in &pages_to_process {
+                            if let Some(page) = site.state.pages.get(&pid) {
+                                titles.push((pid, page.title.clone()));
+                                contents.push((pid, page.content.clone()));
+                                orders.push((pid, page.order));
+                                let ts = timestamps_owned
+                                    .get(&pid)
+                                    .copied()
+                                    .unwrap_or_else(|| now_secs());
+                                ts_vec.push((pid, ts));
+                            }
+                        }
+                        (titles, contents, orders, ts_vec)
+                    } else {
+                        log(&format!(
+                            "Delta: site {prefix_owned} vanished before reorder flush"
+                        ));
+                        return;
+                    }
+                };
+
+                for (pid, ts) in &ts_vec {
+                    if let (Some(title), Some(content), Some(&order)) = (
+                        titles.iter().find(|(id, _)| id == pid).map(|(_, t)| t),
+                        contents.iter().find(|(id, _)| id == pid).map(|(_, c)| c),
+                        orders.iter().find(|(id, _)| id == pid).map(|(_, o)| *o),
+                    ) {
+                        crate::freenet_api::delegate::request_sign_page(
+                            &prefix_owned,
+                            contract_key,
+                            *pid,
+                            title.clone(),
+                            content.clone(),
+                            *ts,
+                            order,
+                        );
+                    }
+                }
+            });
+            cb.as_ref().unchecked_ref()
+        };
+
+        if let Some(window) = web_sys::window() {
+            let id = window
+                .set_timeout_with_callback_and_timeout_and_arguments_0(
+                    callback,
+                    REORDER_DEBOUNCE_MS,
+                )
+                .expect("timeout callback should be allowed");
+            *REORDER_TIMER.write() = Some(id);
+        }
+        callback.forget();
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        // Native build: no debounce needed, sign immediately.
+        let sites = SITES.read();
+        if let Some(site) = sites.get(prefix) {
+            for &pid in pages_to_sign {
+                if let (Some(page), Some(&ts)) =
+                    (site.state.pages.get(&pid), new_timestamps.get(&pid))
+                {
+                    crate::freenet_api::delegate::request_sign_page(
+                        prefix,
+                        contract_key,
+                        pid,
+                        page.title.clone(),
+                        page.content.clone(),
+                        ts,
+                        page.order,
+                    );
+                }
+            }
         }
     }
 }
@@ -874,6 +1016,17 @@ fn slugify(title: &str) -> String {
 
 fn now_secs() -> u64 {
     chrono::Utc::now().timestamp() as u64
+}
+
+/// Log a message to the browser console (wasm) or stderr (native).
+#[cfg(target_arch = "wasm32")]
+fn log(msg: &str) {
+    web_sys::console::log_1(&msg.into());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn log(msg: &str) {
+    eprintln!("{msg}");
 }
 
 /// Compute a `updated_at` value for a page-update that is **strictly
@@ -1062,12 +1215,14 @@ fn update_document_title(site_name: Option<&str>, page_title: Option<&str>) {
 fn update_hash(hash: &str) {
     #[cfg(target_arch = "wasm32")]
     {
-        // Use history.replaceState to update the hash without triggering
-        // navigation — set_hash causes "Unsafe attempt to load URL" errors
-        // inside the gateway's sandboxed iframe.
+        // Use history.pushState to update the address bar and create a
+        // new history entry (so back/forward works for page navigation)
+        // without triggering a full navigation. `set_hash` causes "Unsafe
+        // attempt to load URL" errors inside the gateway's sandboxed iframe;
+        // `pushState` avoids that while keeping the IRI in sync (freenet/delta#29).
         if let Some(window) = web_sys::window() {
             let _ = window.history().ok().and_then(|h| {
-                h.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(hash))
+                h.push_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(hash))
                     .ok()
             });
         }
