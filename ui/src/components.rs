@@ -267,7 +267,9 @@ fn setup_hash_listener() {
         use wasm_bindgen::prelude::*;
         use wasm_bindgen::JsCast;
 
-        // Handle internal hashchange events
+        // Handle internal hashchange events. These fire when the URL hash
+        // changes — both from browser back/forward navigation and from
+        // `history.pushState` calls with hash-only URLs.
         let hashchange = Closure::<dyn Fn()>::new(|| {
             handle_hash_navigation();
         });
@@ -276,6 +278,16 @@ fn setup_hash_listener() {
                 "hashchange",
                 hashchange.as_ref().unchecked_ref(),
             );
+            // Also listen for popstate so back/forward works with pushState
+            // (popstate fires on back/forward but not on pushState calls).
+            let popstate = Closure::<dyn Fn()>::new(|| {
+                handle_hash_navigation();
+            });
+            let _ = window.add_event_listener_with_callback(
+                "popstate",
+                popstate.as_ref().unchecked_ref(),
+            );
+            popstate.forget();
         }
         hashchange.forget();
 
