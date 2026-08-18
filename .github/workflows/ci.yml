@@ -116,18 +116,17 @@ jobs:
           # Full history: the gate compares against the PR's base commit to
           # confirm the version moved and that no record vanished.
           fetch-depth: 0
+
       - run: command -v b3sum || cargo install b3sum --locked
 
-      # Pinned by revision AND --locked. This tool decides what a record's bytes
-      # ARE; a gate whose oracle can change under it is not a gate, and without
-      # --locked cargo re-resolves so the installed binary is not the tested one.
+      # Pinned by revision AND --locked. This tool decides what a record's
+      # bytes ARE; a gate whose oracle can change under it is not a gate, and
+      # without --locked cargo re-resolves so the installed binary is not the
+      # one that was tested.
       - name: Install pointer-record
         run: |
           REV="$(grep -m1 '^POINTER_TOOL_REV=' scripts/check-pointer-freshness.sh \
                  | sed 's/.*:-\([0-9a-f]*\)}.*/\1/')"
-          # Validate the SHAPE, not just non-emptiness: if the line stops
-          # matching, sed passes it through unchanged, which is non-empty and
-          # would sail past a bare `test -n` into a garbage rev.
           case "$REV" in
             [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
             *) echo "POINTER_TOOL_REV is not a hex SHA: '$REV'"; exit 1 ;;
@@ -136,7 +135,7 @@ jobs:
             --rev "$REV" --features publish --locked freenet-pointer-contract
 
       # This workflow runs on pushes to main as well as PRs, and on a push
-      # `github.event.pull_request.*` is EMPTY — passing those through would
+      # `github.event.pull_request.*` is EMPTY -- passing those through would
       # invoke `--ci "" ""` every time. Two modes, so both events are checked.
       - name: Verify every pointer record (PR)
         if: github.event_name == 'pull_request'
@@ -145,51 +144,6 @@ jobs:
             "${{ github.event.pull_request.base.sha }}" \
             "${{ github.event.pull_request.head.sha }}"
 
-      - name: Verify every pointer record (push to main)
+      - name: Verify every pointer record (push)
         if: github.event_name != 'pull_request'
         run: ./scripts/check-pointer-freshness.sh
-
-    name: Check, lint, and test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust
-        # No `with: toolchain:` — `dtolnay/rust-toolchain` honours the
-        # rust-toolchain.toml file at the repo root. Pinning lives in
-        # one place; CI and local devs run the same rustc, which is
-        # what makes the migration-safety check in the next job
-        # actually able to compare hashes.
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
-
-      - name: Check formatting
-        run: cargo fmt --check
-
-      - name: Run clippy
-        run: cargo clippy --all-targets -- -D warnings
-
-      - name: Run tests
-        run: cargo test
-
-      - name: Prove the webapp bundle gate can still refuse
-        # The gate itself runs on the publish path (inside `bundle-webapp`,
-        # after the tar), where CI cannot reach it without a full dx build and a
-        # publish. This proves the gate can REFUSE a bloated bundle and that it
-        # is still wired into that path, which is the half that rots silently.
-        run: ./scripts/tests/check-webapp-bundle-test.sh
-
-      - name: Check contract builds (WASM)
-        run: ./scripts/build-wasm.sh -p site-contract -p site-delegate
-
-      - name: Check UI builds (WASM)
-        run: cargo check -p delta-ui --target wasm32-unknown-unknown
