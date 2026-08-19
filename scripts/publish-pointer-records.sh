@@ -75,9 +75,29 @@ echo "=============================================================="
 # ---------------------------------------------------------------- PROVENANCE
 echo ""
 echo "[provenance] clean tree, on main, at origin/main, CI green"
-if [ -n "$(git status --porcelain)" ]; then
-    git status --short | sed 's/^/    /'
-    die "working tree is not clean. Publish only from a clean checkout of main."
+# TRACKED modifications only. An untracked file cannot change what is
+# published: every path this script reads (pointer-records.toml, the wasm) is
+# tracked, and the records are separately checked against the committed blob
+# and the artifact live on the network. Refusing on untracked files blocked
+# every publish in the Atlas port (freenet/atlas#47), whose checkout normally
+# carries build artifacts.
+#
+# They are still PRINTED rather than ignored silently — if one of them is a
+# surprise, the operator should see it before writing to the network.
+#
+# A modified TRACKED file is still a hard refusal, and deliberately so: it means
+# this checkout differs from the commit whose CI was verified above, which is
+# exactly the provenance claim being made. Note `ui/assets/styles.css` is a
+# GENERATED Tailwind output that is nevertheless committed, so it goes dirty on
+# any local CSS build — expect to commit or restore it before publishing.
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+    git status --short --untracked-files=no | sed 's/^/    /'
+    die "tracked files are modified. Publish only from a clean checkout of main."
+fi
+UNTRACKED="$(git status --porcelain | grep '^??' || true)"
+if [ -n "$UNTRACKED" ]; then
+    say "note: untracked files present (they cannot affect what is published):"
+    printf '%s\n' "$UNTRACKED" | sed 's/^/      /'
 fi
 BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 [ "$BRANCH" = "main" ] || die "on branch '$BRANCH'. Publish only from main (see ~/.claude/rules/publish-from-main.md)."
