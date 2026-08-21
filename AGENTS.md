@@ -336,15 +336,27 @@ misses a prefix, the NotFound fallback catches it.
 # 3. Rebuild WASMs
 ./scripts/sync-wasm.sh
 
+# 3b. Re-sign the pointer records against the WASMs you just built. Step 1
+#     carries OUR users forward; this carries THIRD PARTIES forward — see
+#     "Stable identity" below. CI's pointer-freshness job fails the PR if you
+#     skip it.
+./scripts/sign-pointer-records.sh
+
 # 4. Build and publish. `publish-delta` depends on `preflight`, which runs
 #    scripts/check-migration.sh and aborts the whole chain — before anything
 #    is signed or published — if either WASM's predecessor hash is missing.
 cargo make publish-delta
 
 # 5. Commit everything
-git add legacy_delegates.toml legacy_contracts.toml ui/public/contracts/ common/ contracts/
+git add legacy_delegates.toml legacy_contracts.toml pointer-records.toml \
+    ui/public/contracts/ common/ contracts/
 git commit -m "fix: description with delegate migration"
 git push
+
+# 6. AFTER the PR merges, from main: publish the re-signed pointer records.
+#    Signing is offline and belongs in the PR; the network write does not.
+./scripts/publish-pointer-records.sh --node-port <your node, NOT 7509> \
+    --pointer-wasm <path to the COMMITTED pointer-v1.wasm>
 ```
 
 Steps 4 and 5 may also be done in the other order (commit and merge first,
@@ -402,6 +414,29 @@ the build assertion in `ui/build.rs`; that the sweep reaches the data at all
 is only ever proven by the browser check (step 9 of the rustc-bump
 procedure). It also cannot see a state that was published but never
 committed.
+
+## Stable identity: pointer records
+
+The `legacy_*.toml` registries above carry **our own users'** data across a
+re-key. They do nothing for a **third party** integrating with Delta, whose
+reference to our contract or delegate key is a build-time constant that goes
+stale silently — every read comes back looking like "this user has nothing
+stored", which at the protocol level is indistinguishable from the truth.
+
+`pointer-records.toml` is that other half: a record at a FIXED address naming
+each artifact's current code hash, signed by Delta's author key, which
+integrators resolve instead of pinning. Same trigger as a migration entry,
+different beneficiary — and the pointer failure is the quieter of the two,
+because a stale pointer answers confidently with a dead key rather than
+erroring.
+
+CI's `pointer-freshness` job fails the PR if a pointed-at WASM changed and no
+new record was signed. So in practice: whenever you run `add-migration.sh`, you
+also need `sign-pointer-records.sh`.
+
+See `FREENET.md` for the integrator-facing side, including the scope boundary —
+**a pointer solves addressing only** and says nothing about whether secrets
+survived the re-key, which is what the rest of this section is about.
 
 ## Publishing
 

@@ -48,14 +48,23 @@
 #       b3sum ui/public/contracts/site_delegate.wasm
 #    Hash MUST differ from the one you just recorded in step 1.
 #
-# 5. Run the local migration check (the same one CI runs):
-#       ./scripts/check-migration.sh
-#    Must print "Safe to publish."
+# 4b. Re-sign the pointer records against the WASMs you just built:
+#       ./scripts/sign-pointer-records.sh
+#    Steps 1-2 carry OUR users' data forward. This carries THIRD PARTIES
+#    forward: pointer-records.toml is what integrators resolve instead of
+#    pinning a key that just moved (see FREENET.md). Same trigger, different
+#    people, and the pointer failure is the quieter of the two — a stale
+#    pointer answers confidently with a dead key rather than erroring.
+#
+# 5. Run the local checks (the same ones CI runs):
+#       ./scripts/check-migration.sh          # must print "Safe to publish."
+#       ./scripts/check-pointer-freshness.sh  # must report every record fresh
 #
 # 6. Commit everything together as ONE atomic change:
 #       git add rust-toolchain.toml \
 #               legacy_delegates.toml \
 #               legacy_contracts.toml \
+#               pointer-records.toml \
 #               ui/public/contracts/site_delegate.wasm \
 #               ui/public/contracts/site_contract.wasm
 #       git commit -m "build: bump rustc X.Y.Z -> X.Y.Z+1"
@@ -73,6 +82,12 @@
 #
 # 8. After merge, republish to Freenet:
 #       cargo make publish-delta
+#    ...and publish the re-signed pointer records, from main:
+#       ./scripts/publish-pointer-records.sh --node-port <a node of yours, NOT 7509> \
+#           --pointer-wasm <the COMMITTED pointer-v1.wasm from freenet-migrate>
+#    Signing (4b) is offline and belongs in the PR; the network write does not.
+#    Do not accept "the PUT returned OK": a publish at an already-used version
+#    is a no-op SUCCESS, so the script re-reads and verifies instead.
 #    The new delegate / contract WASMs ship. Existing users boot
 #    the new UI, the legacy migration paths kick in, and their
 #    pre-bump data migrates from the old key to the new one.
