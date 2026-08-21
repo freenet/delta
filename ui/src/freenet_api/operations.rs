@@ -584,7 +584,6 @@ fn handle_site_delta(key: ContractKey, delta_bytes: &[u8]) {
                 log(&format!(
                     "Delta: rejected delta for {prefix} (failed verification): {e}"
                 ));
-                return;
             }
         }
     }
