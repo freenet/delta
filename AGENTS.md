@@ -479,7 +479,7 @@ Delta runs inside the Freenet gateway's sandboxed iframe:
 - **No Clipboard API** - use `document.execCommand('copy')` via textarea
 - **No autofocus** - blocked in cross-origin subframes
 - **No `fixed` positioning** - use `absolute` with inline styles
-- **No `window.location.set_hash`** - use `history.replaceState`
+- **No `window.location.set_hash`** - use `history.replaceState` or `history.pushState` (pushState creates history entries for back/forward; replaceState does not)
 - **Tailwind group-hover** - doesn't work reliably, use plain CSS `.parent:hover .child`
 - **Hash forwarding**: shell sends `__freenet_shell__` postMessage with `type: 'hash'`; Delta listens and navigates
 

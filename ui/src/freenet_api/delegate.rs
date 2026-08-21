@@ -334,6 +334,27 @@ fn load_known_sites() {
     send_delegate_request(&request);
 }
 
+/// Subscribe to every known site's contract so the network keeps hosting it.
+///
+/// Under the demand-driven hosting model (freenet-core#4642), content that
+/// nobody holds a subscription to is best-effort and can fall out under peer
+/// churn. Delta only used to subscribe reactively — after a GET or PUT for
+/// the currently-viewed site — which left the user's *published* sites (the
+/// ones they walked away from) vulnerable to silent GC. This fires
+/// always-on `Subscribe` requests for every site in `SITES` that has a
+/// contract key, called once the current delegate's KnownSites response has
+/// arrived (freenet/delta#30).
+pub fn subscribe_to_known_sites() {
+    let sites: Vec<ContractKey> = state::SITES
+        .read()
+        .values()
+        .filter_map(|s| s.contract_key)
+        .collect();
+    for key in sites {
+        super::operations::subscribe_to_site(&key);
+    }
+}
+
 /// Ask the delegate to sign a page. The response will be handled by
 /// `handle_delegate_response` which sends the UPDATE to the network.
 pub fn request_sign_page(
@@ -873,6 +894,14 @@ pub fn handle_delegate_response(responding_key: DelegateKey, values: Vec<Outboun
                         start_delegate_secret_migration();
                         fire_legacy_migration();
                     }
+                    // Proactive subscriptions: once the current delegate has
+                    // responded with KnownSites, fire always-on Subscribe
+                    // requests for every known site so the network keeps
+                    // hosting them (freenet-core demand-driven model,
+                    // freenet/delta#30). Without this, a site the user
+                    // published and then navigated away from would be
+                    // silently GC'd under peer churn.
+                    subscribe_to_known_sites();
                     arm_discovery_settle_if_ready();
                 }
                 DelegateResponse::SiteStateStored => {
