@@ -1,6 +1,5 @@
 target/
 node_modules/
-AGENTS.md
 .commandcode/
 
 # Web-container version-counter rollback snapshot. Created by

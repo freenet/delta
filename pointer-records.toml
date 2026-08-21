@@ -1,0 +1,68 @@
+# Delta's pointer records — stable identity for things that re-key.
+#
+# A pointer record is a tiny contract at a FIXED address whose state names the
+# CURRENT code hash of one of Delta's artifacts. Third parties resolve it
+# instead of pinning a key, so they survive our re-keys. See
+# freenet-core#5194 and the contract's README:
+# https://github.com/freenet/freenet-migrate/tree/main/contracts/pointer-contract
+#
+# This solves ADDRESSING ONLY. It says nothing about whether state or secrets
+# under the old key survived — that is what legacy_contracts.toml and
+# legacy_delegates.toml are for.
+#
+# ## Editing
+#
+# Do not hand-edit code_hash, version, state or pointer_key. Run
+# `scripts/sign-pointer-records.sh` and commit the result. CI's
+# check-pointer-freshness fails the PR if a pointed-at WASM changed and no new
+# record was signed.
+
+# ## THE KEY DECISION, flagged rather than buried
+#
+# Delta has NO pre-existing app-author identity. Its data model is per-SITE
+# owner keys — each site's state is signed by that site's own owner, and
+# migration is permissionless by design. So unlike Atlas, there is no root key
+# already serving this role.
+#
+# This uses the web-container key, which is Delta's only publisher identity: it
+# signs the webapp every user actually loads, and its 32 bytes ARE
+# published-contract/webapp.parameters (verified), which is why the container id
+# EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr derives from it. That follows the
+# precedent Ian set for River on 2026-08-18.
+#
+# The same two consequences as River's, and they are worth stating rather than
+# discovering: this key is NOT kept offline, because it is used on every UI
+# publish; and rotating it would move the web container's address AND both
+# pointer addresses together, so it is a coordinated flag day rather than
+# routine key hygiene.
+#
+# If a dedicated, offline Delta author key is wanted instead, that decision has
+# to be made BEFORE these records are published — afterwards it is a flag day
+# that strands anyone who has pinned the author vk.
+author_verifying_key = "river:v1:vk:54RwkjvbrXRzjyg4z2EbNCzw3Qwx5YpWQegpMyCTwibE"
+
+# The pointer contract's own frozen code hash. A CONSTANT, never recomputed:
+# every pointer address is BLAKE3(this ‖ params), so a locally rebuilt pointer
+# WASM lands every record at an address nobody else derives.
+pointer_code_hash = "8wnAPaSRY1oYZCz723fdwK6BgzL6q8ozP3buVovXnt6v"
+
+[[record]]
+app_id = "delta.site-contract"
+wasm_path = "ui/public/contracts/site_contract.wasm"
+pointer_key = "6a8ZBaFft9wVFd1mAWVRRZepXXrnQNzRCD5tqM71hBm5"
+version = 1
+code_hash = "90bc44f4f2e76aeb5aec732920c1d73ffa3d108f6e661ad84474774b246fabe3"
+state = "0000000190bc44f4f2e76aeb5aec732920c1d73ffa3d108f6e661ad84474774b246fabe359b78970b1853843340b8862e2330ad946f02fd801e44803d81e1de4a3b583909d74277582215312ccb196e0faadeda0365b4b0b25a9bf32083e5a4b40ca8507"
+
+[[record]]
+app_id = "delta.site-delegate"
+wasm_path = "ui/public/contracts/site_delegate.wasm"
+pointer_key = "ES2hnErmSh9Aip4862ZDKQCNvMeryfhj6b7FfpP5qmyZ"
+version = 1
+code_hash = "06b7e80f59412b47e86f175547104eb20801642c4b06d2d2b4c4ac759b4f848e"
+state = "0000000106b7e80f59412b47e86f175547104eb20801642c4b06d2d2b4c4ac759b4f848ed251f56ff33d25530d9527079e9367014e4f1552515b86a8a28047c41cb67cd4e71568c1c1e3327a8ec3c9b8eefa2233e376f9cc6f5a33abecf43a8ef17c020b"
+# SCOPE, and it matters most here. Resolving this pointer tells you the
+# delegate's current key. It does NOT tell you the user's secrets came with it:
+# delegate secrets move only when Delta's own UI has run on that user's node, so
+# an integrator can resolve this perfectly and still find an EMPTY namespace —
+# which looks like "this user has no data" rather than like an error.
