@@ -157,6 +157,14 @@ cd "$ROOT"
 
 [tasks.sign-webapp]
 description = "Sign the webapp using a monotonic counter file"
+# Depend on bundle-webapp directly rather than relying on this task's
+# POSITION in publish-delta's dependency list. That is the same argument
+# check-webapp-bundle.sh makes about itself: an ordering that lives in a
+# list can be reordered, and this task would then bump the counter and
+# sign whatever stale archive happened to be on disk, with no preflight
+# and no bundle gate. River's equivalent depends on compress-webapp for
+# this reason.
+dependencies = ["bundle-webapp"]
 script = '''
 # Bump the version counter committed at published-contract/contract-version.txt
 # and use that as the metadata version. The previous `seconds/60` timestamp
@@ -188,6 +196,20 @@ if [ ! -f "$version_file" ]; then
     exit 1
 fi
 current=$(cat "$version_file" | tr -d '[:space:]')
+# Validate the CONTENTS, not just that the file exists. An empty or
+# corrupted counter (interrupted write, bad merge, stray prefix) otherwise
+# arithmetic-evaluates to 0 and signs version 1 against a live counter in
+# the tens of millions -- the publish is then silently ignored by the
+# network while reporting success. That is the delta#71 failure mode
+# arriving through a different door, and it is why this refuses rather
+# than guessing.
+case "$current" in
+    ""|*[!0-9]*)
+        echo "ERROR: $version_file is not a positive integer: '$current'"
+        echo "Seed it with the version currently live on the network."
+        exit 1
+        ;;
+esac
 version=$((current + 1))
 cp "$version_file" "$prev_snapshot"
 echo "$version" > "$version_file"
