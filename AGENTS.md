@@ -1,11 +1,5 @@
 # Delta - Agent Guide
 
-## Commit Conventions
-
-- Do not add co-authoring footers or mention coding agents (including Command Code) in commit tails or contributor lists.
-- Never push directly to remote. Always send a pull request for any changes.
-- Use `gh` (GitHub CLI) for GitHub workflows (issues, PRs, etc.) rather than raw git commands for remote operations.
-
 ## Repository Structure
 
 ```
