@@ -76,7 +76,7 @@ When `site_contract.wasm` changes (code, dependency, or `common/` changes), ALL 
 
 **Multi-hop fallback:** when a restored record has no `contract_key_b58` (legacy delegates predating b82d3bc) or the stored key is no longer on the network, the UI probes every previous contract WASM hash in `legacy_contracts.toml`. Every candidate generation is reconciled via the tombstone-aware `reconcile_into` merge (keeps newest, preserves deletions, order-independent) — legacy sibling probes are deliberately left running (`operations.rs:44-53`, `:205-220`, `:255-270`) since a slower generation may still hold the newest data.
 
-The sweep runs on `freenet-migrate`'s `ProbeDriver` with `SelectionPolicy::FoldAll` (`operations.rs:939-949`, adopted delta#36): it bounds the sweep to one decision and one forward PUT once every candidate resolves (`finalize_migration_sweep`), rather than re-PUTting on every legacy response.
+The sweep runs on `freenet-migrate`'s `ProbeDriver` with `SelectionPolicy::FoldAll` (`operations.rs:939-949`, adopted delta#36): it bounds the sweep to one decision and one forward PUT once every candidate resolves (`finalize_migration_sweep`), rather than re-PUTting on every legacy response. `FoldAllAck` (`i_understand_fold_all_resurrects_without_tombstones`) is a deliberate, loud acknowledgement, not a formality: folding every generation can RESURRECT a page deleted before tombstones existed (generation C1). That residual is open as delta#38 - do not read the policy as unqualified.
 
 **Recording contract WASM hashes is part of the release process.** Any commit that changes `site_contract.wasm` — including an incidental rebuild from touching `common/` — must first run `./scripts/add-contract-migration.sh`. `scripts/check-migration.sh` enforces this by walking git history of the WASM file and refusing to publish unless every committed generation other than the current one is recorded (delegate gated identically against `legacy_delegates.toml`).
 
@@ -91,7 +91,7 @@ Running both is deliberate staged rollout, not an oversight; retiring the hand-r
 
 **`legacy_delegates.toml` is baked into the UI at build time** by `ui/build.rs` (`cargo:rerun-if-changed`). `add-migration.sh` edits the file without staging it — without the rerun directive, Cargo reuses cached build output and ships a **stale** migration table, silently orphaning every returning user's data on a "Welcome to Delta" screen. A build assertion now fails the build if `[[entry]]` sections exist but none deserialize (the `entry` field is `#[serde(default)]`, so a structural mismatch otherwise yields an empty table with no error).
 
-**A worktree is the WRONG instrument for reproducing a build-caching or publish problem.** In a git worktree, `.git` is a file pointing at `.git/worktrees/<name>`, and an unresolvable `rerun-if-changed` target makes Cargo treat the build script as permanently dirty (always re-running it) — which hid the missing directive above from every agent who investigated inside a worktree. Reproduce build-caching/publish issues in a clean clone or the main checkout.
+**A worktree is the WRONG instrument for reproducing a build-caching or publish problem.** In a git worktree, `.git` is a file pointing at `.git/worktrees/<name>`. An unresolvable `rerun-if-changed` target used to leave Cargo treating the build script as permanently dirty, so it always re-ran - which is exactly what hid the missing directive above from every agent who investigated inside a worktree. `ui/build.rs` now resolves those paths with `git rev-parse --git-path` and both layouts cache identically, but the general lesson outlives the fix: reproduce build-caching and publish issues in a clean clone or the main checkout.
 
 **Every delegate storage key type must be migrated.** If a new storage op is added to the delegate (e.g. `StoreFoo`/`GetFoo`), the corresponding `GetFoo` MUST be added to `fire_legacy_migration()` and the KnownSites handler, or that data is lost silently on upgrade. April 2026: `GetSiteState` was missing, causing sites to vanish when network state had been GC'd. **Defense in depth:** `request_site_state_backup()` (NotFound handler) queries the current delegate AND all legacy delegates, catching prefixes the proactive KnownSites-time fetch misses.
 
@@ -170,7 +170,7 @@ cargo make publish-delta
 cargo make bundle-webapp     # -> target/webapp/webapp.tar.xz, gated, no publish
 ```
 
-**Version counter**: `published-contract/contract-version.txt` is the source of truth for the web-container version. `cargo make sign-webapp` (run by `publish-delta`) reads, bumps, and writes it back each publish. Do not derive the version from wall-clock time (delta#71). Commit the bumped counter alongside other publish artifacts.
+**Version counter**: `published-contract/contract-version.txt` is the source of truth for the web-container version. `cargo make sign-webapp` (run by `publish-delta`) reads, bumps, and writes it back each publish. Do not derive the version from wall-clock time (delta#71). Commit the bumped counter alongside other publish artifacts, **and open a pull request for all changes before pushing** - `main` has no branch protection here, so nothing enforces this but the convention.
 
 Contract ID: `EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr`
 
