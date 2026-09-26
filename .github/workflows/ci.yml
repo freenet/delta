@@ -14,7 +14,7 @@ jobs:
     name: Check, lint, and test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust
         # No `with: toolchain:` — `dtolnay/rust-toolchain` honours the
@@ -60,7 +60,7 @@ jobs:
     name: Delegate migration safety
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Load-bearing. The gate finds the previous release's WASM by walking
           # this file's git history; the default depth-1 checkout has no history
@@ -111,7 +111,7 @@ jobs:
     # pointer that still names the OLD hash is worse than no pointer: an
     # integrator resolves it, gets a confident answer, and derives a dead key.
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           # Full history: the gate compares against the PR's base commit to
           # confirm the version moved and that no record vanished.
