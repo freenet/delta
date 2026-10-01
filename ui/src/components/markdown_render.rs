@@ -39,6 +39,9 @@ struct Limits {
     /// Bound on the sum, over each run of non-blank lines, of the run's
     /// length squared, in bytes squared.
     block_cost: u64,
+    /// Bound on the sum, over each run of blank lines, of the number of lines
+    /// in it squared.
+    blank_runs: usize,
     /// Most table cells the HTML can contain.
     table_cells: usize,
     /// Bound on `]:` occurrences times `]` occurrences.
@@ -74,6 +77,10 @@ struct Limits {
 ///   36 runs of 2 KiB, and so on. The largest real document measured (a
 ///   40 KiB design document with a 9 KiB run) uses 70% of it, and 99% of the
 ///   markdown files measured use under a quarter.
+/// - `blank_runs`: inside fenced or indented code or an HTML block, a run of
+///   empty lines takes the parser time quadratic in its length. Real files
+///   rarely have more than one blank line in a row (the largest total
+///   measured is about 340); this allows a single run of 256.
 /// - `table_cells`: a table's body rows are padded to the width of its
 ///   delimiter row, so a wide delimiter row followed by many short lines
 ///   expands to columns times rows cells.
@@ -87,6 +94,7 @@ const LIMITS: Limits = Limits {
     open_depth: 48,
     open_depth_total: 32 * 1024,
     block_cost: 12 * 1024 * 12 * 1024,
+    blank_runs: 64 * 1024,
     table_cells: 64 * 1024,
     reference_lookups: 1024 * 1024,
     html_bytes: 4 * 1024 * 1024,
@@ -186,6 +194,8 @@ fn render_gfm_bounded(text: &str, limits: &Limits) -> Option<String> {
 struct ParseCost {
     /// See `Limits::block_cost`.
     block: u64,
+    /// See `Limits::blank_runs`.
+    blank_runs: usize,
     /// See `Limits::container_markers`.
     container_markers: usize,
     /// The most containers opened at the start of any one line.
@@ -223,6 +233,7 @@ impl ParseCost {
         // also continue a paragraph lazily, keeping everything open.
         let mut open = 0;
         let mut in_run = false;
+        let mut blank_run: usize = 0;
         for line in markdown_lines(text) {
             let prefix = container_prefix(line);
             let blank = is_blank_line(line);
@@ -239,11 +250,16 @@ impl ParseCost {
             cost.deepest_line = cost.deepest_line.max(prefix.markers);
             cost.container_markers = cost.container_markers.saturating_add(prefix.markers);
             if blank {
+                blank_run += 1;
                 cost.block = cost.block.saturating_add(run_bytes * run_bytes);
                 run_bytes = 0;
                 run_table_columns = 0;
                 continue;
             }
+            cost.blank_runs = cost
+                .blank_runs
+                .saturating_add(blank_run.saturating_mul(blank_run));
+            blank_run = 0;
             run_bytes += line.len() as u64 + 1;
             if let Some(columns) = delimiter_row_columns(line) {
                 run_table_columns = run_table_columns.max(columns);
@@ -252,6 +268,9 @@ impl ParseCost {
             cost.table_cells = cost.table_cells.saturating_add(run_table_columns);
         }
         cost.block = cost.block.saturating_add(run_bytes * run_bytes);
+        cost.blank_runs = cost
+            .blank_runs
+            .saturating_add(blank_run.saturating_mul(blank_run));
         cost
     }
 
@@ -261,6 +280,7 @@ impl ParseCost {
             && self.deepest_open <= limits.open_depth
             && self.open_depth_total <= limits.open_depth_total
             && self.block <= limits.block_cost
+            && self.blank_runs <= limits.blank_runs
             && self.table_cells <= limits.table_cells
             && self.reference_lookups <= limits.reference_lookups
     }
@@ -612,6 +632,7 @@ mod tests {
         open_depth: 8,
         open_depth_total: 128,
         block_cost: 64 * 64,
+        blank_runs: 64,
         table_cells: 32,
         reference_lookups: 12,
         html_bytes: 4 * 1024,
@@ -836,6 +857,7 @@ mod tests {
         // Total: blank lines after a shallow list.
         let limits = Limits {
             block_cost: u64::MAX,
+            blank_runs: usize::MAX,
             ..SMALL
         };
         let list = "- x\n";
@@ -883,6 +905,7 @@ mod tests {
             open_depth,
             open_depth_total,
             block_cost,
+            blank_runs,
             table_cells,
             reference_lookups,
             html_bytes,
@@ -893,6 +916,7 @@ mod tests {
         assert_eq!(open_depth, 48);
         assert_eq!(open_depth_total, 32_768);
         assert_eq!(block_cost, 12_288 * 12_288);
+        assert_eq!(blank_runs, 65_536);
         assert_eq!(table_cells, 65_536);
         assert_eq!(reference_lookups, 1_048_576);
         assert_eq!(html_bytes, 4_194_304);
@@ -1028,6 +1052,30 @@ mod tests {
         assert!(renders_as_markdown(&SMALL, &"word\n\n".repeat(16)));
         assert!(!is_blank_line("\u{a0}"));
         assert!(is_blank_line(" \t"));
+    }
+
+    /// Each run of blank lines costs its length squared, however the line
+    /// endings are written, and the limit is exact. (Inside code or an HTML
+    /// block, the parser's time grows that way.)
+    #[test]
+    fn blank_run_limit() {
+        // A fence, then `n` line endings: `n` blank lines after it.
+        let fence = |n: usize, ending: &str| format!("```{}", ending.repeat(n));
+        for ending in ["\n", "\r\n", "\r"] {
+            for n in [1, 2, 4, 8] {
+                assert_eq!(cost(&fence(n, ending)).blank_runs, n * n, "{ending:?} {n}");
+            }
+        }
+        // Runs are separate: each blank line between paragraphs costs 1,
+        // and the last run (with the final line ending) 4.
+        for k in [1, 2, 4, 8] {
+            assert_eq!(cost(&"a\n\n".repeat(k)).blank_runs, (k - 1) + 4, "{k}");
+        }
+        assert_eq!(cost(" \n\t\n\nx").blank_runs, 9);
+        assert!(renders_as_markdown(&SMALL, &fence(8, "\n")));
+        assert!(!renders_as_markdown(&SMALL, &fence(9, "\n")));
+        assert_plain(&SMALL, &fence(9, "\n"));
+        assert_plain(&SMALL, &format!("<!--{}", "\n".repeat(9)));
     }
 
     /// Lines split the way markdown splits them: a `\r\n` is one line ending,
@@ -1241,6 +1289,7 @@ mod tests {
         assert!(at_limit(|c| c.deepest_line as u64) <= LIMITS.line_nesting as u64);
         assert!(at_limit(|c| c.deepest_open as u64) <= LIMITS.open_depth as u64);
         assert!(at_limit(|c| c.open_depth_total as u64) <= LIMITS.open_depth_total as u64);
+        assert!(at_limit(|c| c.blank_runs as u64) <= LIMITS.blank_runs as u64);
 
         let text = doc(4);
         let html = render_page_html(&text, &text, true, None);
