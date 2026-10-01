@@ -1,43 +1,10 @@
 # Delta - Agent Guide
 
-## Repository Structure
-
-```
-delta/
-├── common/           # delta-core: shared state types, crypto, serialization
-├── contracts/
-│   └── site-contract/  # Freenet contract: validates state, handles updates
-├── delegates/
-│   └── site-delegate/  # Local agent: stores signing keys, signs pages
-├── ui/               # Dioxus web UI (compiled to WASM)
-├── published-contract/ # Committed web container WASM + params
-├── legacy_delegates.toml  # Migration entries for delegate WASM changes
-├── legacy_contracts.toml  # Migration entries for contract WASM changes
-├── scripts/          # add-migration.sh, add-contract-migration.sh, sync-wasm.sh
-└── Makefile.toml     # Build tasks
-```
-
 ## Key Concepts
 
 ### Site Identity
 
-A site is identified by a 10-character **prefix** derived from the owner's Ed25519 public key: `base58(pubkey)[..10]`. This prefix IS the contract parameters. The full contract key is `BLAKE3(BLAKE3(site_contract.wasm) || CBOR({prefix}))`.
-
-Anyone who knows the prefix can compute the contract key because the WASM is public.
-
-### State Design
-
-```
-SiteState {
-    owner: VerifyingKey,           # Owner's public key
-    config: SignedConfig,          # Site name/description (signed)
-    pages: BTreeMap<PageId, Page>, # All pages
-    next_page_id: PageId,          # Monotonic counter
-    deleted_pages: BTreeMap<PageId, SignedPageDeletion>,  # Tombstones
-}
-```
-
-All content is signed by the owner. Pages have stable IDs that don't change on rename.
+A site is identified by a 10-character **prefix** derived from the owner's Ed25519 public key: `base58(pubkey)[..10]`. This prefix IS the contract parameters. The full contract key is `BLAKE3(BLAKE3(site_contract.wasm) || CBOR({prefix}))`. Anyone who knows the prefix can compute the contract key because the WASM is public.
 
 ### CRITICAL: All State Fields Must Be Authenticated
 
@@ -50,17 +17,15 @@ When adding a new field to any signed struct (Page, SignedConfig, SignedPageDele
 
 Page signatures use v2 format (`delta:page:v2:`) which covers: page_id, title, content, updated_at, order. V1 fallback (without order) exists for pre-existing pages.
 
-**`updated_at` must be strictly greater than the page's current `updated_at`.** `apply_delta` and `merge` in `delta-core` dominate equal timestamps with `>=`, so an UPDATE whose `updated_at` matches what's already in state is silently dropped on the network. Any UI path that produces a page UPDATE (`save_current_page`, `rename_page`, `swap_page_order`, …) MUST route through `next_page_updated_at` in `ui/src/state.rs`, which computes `max(now_secs(), existing + 1)`. Calling `now_secs()` directly is a recurrence of the reorder bug Ivvor reported on 2026-04-29 (silent same-second collisions).
+**`updated_at` must be strictly greater than the page's current `updated_at`.** `apply_delta` and `merge` in `delta-core` dominate equal timestamps with `>=`, so an UPDATE whose `updated_at` matches what's already in state is silently dropped on the network. Any UI path that produces a page UPDATE MUST route through `next_page_updated_at` in `ui/src/state.rs`, which computes `max(now_secs(), existing + 1)`. Calling `now_secs()` directly reintroduces silent same-second collisions.
 
-**Page `order` invariants (for `swap_page_order` / `create_page` in `ui/src/state.rs`):**
+**Page `order` invariants** (`swap_page_order` / `create_page` in `ui/src/state.rs`):
 
-1. `swap_page_order` MUST sign and propagate a fresh page-UPDATE for **every** page whose order changes — not just the two pages clicked. When ANY page on the site is still at `order == 0` (legacy v1-signed pages, or pages created before the order field existed), the swap also performs a one-time site-wide migration to explicit orders `(10, 20, 30, …)` sorted by `(current_order, page_id)` to match the sidebar. Skipping the propagation step is the bug Ivvor re-reported on 2026-05-03 — the local view looked correct but unmigrated pages remained at `order = 0` on the network and clumped to the front of the sidebar after a refresh.
+1. `swap_page_order` MUST sign and propagate a fresh page-UPDATE for **every** page whose order changes, not just the two clicked. When any page is still at `order == 0` (legacy/pre-order pages), the swap also performs a one-time site-wide migration to explicit orders `(10, 20, 30, …)`. Skipping propagation leaves unmigrated pages at `order = 0` and they clump to the front of the sidebar after refresh.
+2. `create_page` MUST assign `order = max(existing) + ORDER_STEP` via `next_create_order`, never `0` — issuing `0` re-poisons a migrated site.
+3. `plan_swap` derives `pages_to_sign` from the diff between current and new orders; unit tests catch a regression that re-narrows the sign set.
 
-2. `create_page` MUST assign `order = max(existing) + ORDER_STEP` via `next_create_order` (never `0`). Issuing `0` re-poisons a migrated site and re-introduces the front-of-sidebar clumping symptom.
-
-3. The orchestration helper `plan_swap` derives `pages_to_sign` from the diff between current and new orders, so a regression that re-narrows the sign set (e.g. back to "just the two clicked pages") is caught by the unit tests — not just by the lower-level `compute_swap_orders` tests.
-
-**Delegate-response routing MUST use signature verification, not `CURRENT_SITE`.** `handle_signed_page` / `handle_signed_deletion` / `handle_signed_config` in `ui/src/freenet_api/delegate.rs` look up the owning site by checking the signature against every known owner's pubkey (`find_owner_for_signed_*`). Earlier code keyed `PENDING_UPDATES` by `(CURRENT_SITE, page_id)` and consumed the entry on first response; concurrent requests for the same page silently dropped subsequent UPDATEs, and a mid-flight site switch routed a signed page into the wrong site's local state. Verification-based routing handles both correctly without a delegate WASM change.
+**Delegate-response routing MUST use signature verification, not `CURRENT_SITE`.** `handle_signed_page` / `handle_signed_deletion` / `handle_signed_config` in `ui/src/freenet_api/delegate.rs` look up the owning site by checking the signature against every known owner's pubkey (`find_owner_for_signed_*`). Keying by `(CURRENT_SITE, page_id)` instead drops concurrent UPDATEs for the same page and misroutes a signed page during a mid-flight site switch.
 
 ### Page Links
 
@@ -72,289 +37,92 @@ Autocomplete inserts `[[id]]` format.
 
 ### Delegate Storage
 
-The delegate stores:
 - **Signing keys**: `delta:signing_key:{prefix}` - per-site Ed25519 private keys (legacy: `delta:signing_key`)
 - **Known sites**: `delta:known_sites` - list of sites with prefix, name, role, contract key
 - **Site state backups**: `delta:site_state:{prefix}` - full state backup for network resilience
 
 ### Known-Sites Tombstone Convention
 
-The `delta:known_sites` `Vec<KnownSiteRecord>` doubles as the persistent
-tombstone store for removed sites. A record with
-`name == TOMBSTONE_NAME_SENTINEL` (`"\0__delta_removed__"`, defined in
-`common/src/state.rs`) is a tombstone, not a real site. Tombstones exist
-to block legacy delegates from resurrecting deleted sites after a page
-refresh.
+`delta:known_sites` doubles as the tombstone store for removed sites: a record with `name == TOMBSTONE_NAME_SENTINEL` (`"\0__delta_removed__"`, `common/src/state.rs`) blocks legacy delegates from resurrecting deleted sites after refresh.
 
-**Every code path that consumes `KnownSites` responses MUST filter
-tombstones via `KnownSiteRecord::is_tombstone()`** before iterating.
-Forgetting this will leak sentinel entries into the UI and display a
-ghost site named `"\0__delta_removed__"`. `restore_known_sites` has a
-`debug_assert!` that catches this in debug builds.
+**Every consumer of `KnownSites` responses MUST filter tombstones via `KnownSiteRecord::is_tombstone()`**, or a sentinel leaks into the UI as a ghost site. `restore_known_sites` has a `debug_assert!` for debug builds. Tombstones are cleared by `clear_tombstone(prefix)`, called by any path that adds a site (`create_new_site`, `import_site_key`, `visit_site`) — otherwise a re-added prefix is silently filtered out again.
 
-Tombstones are cleared by `clear_tombstone(prefix)` in `ui/src/state.rs`,
-which must be called by any path that adds a site (`create_new_site`,
-`import_site_key`, `visit_site`) — otherwise a previously-removed prefix
-would be silently filtered out of `restore_known_sites` and the re-add
-would appear to fail.
+**Tombstone-application rules** (`filter_applicable_tombstones` in `ui/src/freenet_api/delegate.rs`, pinned by its unit tests):
 
-**Tombstone-application rules** (enforced by
-`filter_applicable_tombstones` in `ui/src/freenet_api/delegate.rs`):
+1. Once `CURRENT_SITES_LOADED` is true, legacy-delegate tombstones are dropped — the current delegate is authoritative for the removal set.
+2. A tombstone whose prefix is currently live in `SITES` is always dropped — live user intent beats any stale removal record.
 
-1. Once the current delegate has responded (`CURRENT_SITES_LOADED` is
-   true), legacy-delegate tombstones are dropped. The current delegate
-   is authoritative for the removal set; a stale legacy tombstone must
-   not override it. Without this rule, deleting a site and then
-   re-visiting it would make the site briefly appear and then vanish
-   when a legacy delegate's KnownSites response arrived later.
+**Ordering invariant: the legacy sweep must not start until the current delegate's KnownSites response has arrived** (`fire_legacy_migration` is called only from that arm). A legacy reply applied first inverts both rules above: it still lists a site the user removed under the current delegate, with no tombstone yet known to suppress it.
 
-2. A tombstone whose prefix is currently live in `SITES` is always
-   dropped, regardless of source. Live user intent (via `visit_site` /
-   `create_new_site` / `import_site_key`) beats any stale removal
-   record. This is the guardrail for ordering races between
-   `save_known_sites` and a `load_known_sites` response already in
-   flight.
-
-Any change to the KnownSites response handler must preserve both rules;
-the `filter_applicable_tombstones` unit tests pin them.
-
-**Ordering invariant: the legacy sweep is not started until the current
-delegate's KnownSites response has arrived** (`fire_legacy_migration` is
-called from that arm, and nowhere else). Both rules above are stated in
-terms of "once the current delegate has responded", so a legacy reply
-applied first inverts them: the legacy delegate still lists a site the
-user removed under the current delegate as a live record, and no
-tombstone is known yet to suppress it.
-
-#52 proposed dispatching the sweep at registration instead, to take it
-off the critical path, with legacy responses buffered to preserve the
-ordering. **Do not do this without new evidence.** Measured on a live
-node across 7 re-keys, the gap it removes is 188-355 ms (cold wasmtime
-compilation of the freshly re-keyed delegate; a warm reload is 66 ms),
-the node answers delegate ops serially so early-dispatched probes queue
-behind that same compile, and the ordering rule means their results
-cannot be applied any sooner anyway — a measured saving of about 50 ms,
-against total time-to-site of well under 1.1 s.
-
-A first attempt also released the buffer on a 2 s deadline, so a slow
-current delegate could not hold the sites hostage. Review found that
-unsafe: `save_known_sites()` has seven call sites, including one the
-contract-migration sweep reaches with no user action at all, and
-`StoreKnownSites` is a full overwrite of the delegate's stored record —
-so any of them firing inside such a window writes the merged list back
-WITHOUT the current delegate's tombstones and permanently resurrects a
-removed site. The user-visible half of #52 is handled by
-`state::SiteDiscovery` instead, which never touches stored data.
+#52 proposed dispatching the sweep earlier to shave latency, with legacy responses buffered for ordering. **Do not do this without new evidence** — a first attempt buffered on a 2s deadline, and review found that a slow current delegate could still lose the race and overwrite the delegate's stored record without the current tombstones, permanently resurrecting a removed site. The measured latency saving was marginal against total time-to-site. The user-visible half of #52 is handled by `state::SiteDiscovery` instead, which never touches stored data.
 
 ## Reproducible WASM Builds
 
-The repo pins rustc via `rust-toolchain.toml` (currently `1.94.1`). This is **load-bearing for the migration system**: the delegate key is `BLAKE3(BLAKE3(wasm) || params)`, so any change in WASM bytes — including bytes produced by an LLVM upgrade in a newer rustc — produces a new delegate key and orphans every user's stored data unless a migration entry is recorded first.
+The repo pins rustc via `rust-toolchain.toml` (currently `1.94.1`). This is **load-bearing for the migration system**: the delegate/contract key is `BLAKE3(BLAKE3(wasm) || params)`, so any WASM byte change — including one from an LLVM upgrade in a newer rustc — produces a new key and orphans every user's stored data unless a migration entry is recorded first.
 
-The migration-safety job in `.github/workflows/ci.yml` runs `scripts/check-migration.sh` on each PR: it rebuilds the WASMs from source and refuses to merge if the committed hashes don't match, and separately refuses if a changed WASM's predecessor hash was never recorded in `legacy_delegates.toml` / `legacy_contracts.toml` (see "The migration gate"). With a pinned toolchain CI and local always agree, so the gate provides real signal.
+CI's "Delegate migration safety" job runs `scripts/check-migration.sh` on each PR: it rebuilds the WASMs from source and refuses to merge if committed hashes don't match, or if a changed WASM's predecessor hash isn't recorded in `legacy_delegates.toml` / `legacy_contracts.toml`.
 
-The same pattern is used in `freenet/river` and `freenet/freenet-core`. Don't let the pin drift past those sibling repos without coordinating, since a Freenet dApp ecosystem with mismatched toolchain pins will silently produce different hashes for shared dependencies.
+`river` and `freenet-core` pin the same way — don't let the pin drift past those sibling repos, or a shared dependency will hash differently across the ecosystem.
 
 ### Upgrading the pinned rustc
 
-Bumping `channel` in `rust-toolchain.toml` is a **data-migration gesture**, not a routine maintenance task. Treat it the same way you treat changing delegate or contract code: predecessor hashes recorded first, WASM regenerated, single-commit PR, post-merge republish, browser verification. The full canonical procedure lives at the top of `rust-toolchain.toml`; the summary:
-
-1. `rustup install <new-channel>` (and add `rustfmt`, `clippy`, `wasm32-unknown-unknown` to it).
-2. `./scripts/add-migration.sh V_N "rustc X.Y.Z -> X.Y.Z+1"` — records the current delegate WASM hash in `legacy_delegates.toml` BEFORE the bump.
-3. `./scripts/add-contract-migration.sh C_N "rustc X.Y.Z -> X.Y.Z+1"` — same for the contract WASM.
-4. Bump `channel` in `rust-toolchain.toml`.
-5. `./scripts/sync-wasm.sh` — rebuilds with the new channel and copies the new bytes into `ui/public/contracts/`. The hash must differ from the one just recorded.
-6. `./scripts/check-migration.sh` — must print "Safe to publish."
-7. Single commit, single PR: `rust-toolchain.toml`, both `legacy_*.toml`, both `ui/public/contracts/*.wasm`. Reviewers see the whole atomic change in one diff.
-8. After merge: `cargo make publish-delta`.
-9. Browser verification on the live deploy: existing site still listed, at least one page loads (legacy migration of state backup worked), an edit saves and round-trips (new key functional). **Don't consider the bump done until step 9 passes.**
-
-Skipping any step silently breaks data continuity for every existing user; there is no automatic recovery. The procedure is in the toml file rather than a separate runbook so the person about to run `vim rust-toolchain.toml` has it directly in front of them.
+Bumping `channel` in `rust-toolchain.toml` is a **data-migration gesture**: predecessor hashes recorded first, WASM regenerated, single-commit PR, post-merge republish, browser verification. The full canonical procedure lives at the top of `rust-toolchain.toml`. Skipping any step silently breaks data continuity for every existing user with no automatic recovery.
 
 ## Contract Upgrade / State Migration
 
-### When Contract WASM Changes
+When `site_contract.wasm` changes (code, dependency, or `common/` changes), ALL site contract keys change. Migration is **permissionless** since all state is owner-signed: any node can GET from the old key and PUT to the new key, and the new contract validates and accepts it.
 
-When `site_contract.wasm` changes (code changes, dependency updates, `common/` changes), ALL site contract keys change because `contract_key = BLAKE3(BLAKE3(wasm) || params)`.
+**How Delta handles it automatically:** the delegate stores each site's contract key (`KnownSiteRecord.contract_key_b58`); on startup the UI recomputes the key from the prefix and the embedded WASM; a mismatch triggers GET-old/PUT-new and updates the stored key.
 
-**Migration is permissionless** - since all state is signed by the owner, ANY node can:
-1. GET state from the old contract key
-2. PUT state to the new contract key (with new WASM + same params)
+**Multi-hop fallback:** when a restored record has no `contract_key_b58` (legacy delegates predating b82d3bc) or the stored key is no longer on the network, the UI probes every previous contract WASM hash in `legacy_contracts.toml`. Every candidate generation is reconciled via the tombstone-aware `reconcile_into` merge (keeps newest, preserves deletions, order-independent) — legacy sibling probes are deliberately left running (`operations.rs:44-53`, `:205-220`, `:255-270`) since a slower generation may still hold the newest data.
 
-The new contract validates all signatures and accepts the state.
+The sweep runs on `freenet-migrate`'s `ProbeDriver` with `SelectionPolicy::FoldAll` (`operations.rs:939-949`, adopted delta#36): it bounds the sweep to one decision and one forward PUT once every candidate resolves (`finalize_migration_sweep`), rather than re-PUTting on every legacy response. `FoldAllAck` (`i_understand_fold_all_resurrects_without_tombstones`) is a deliberate, loud acknowledgement, not a formality: folding every generation can RESURRECT a page deleted before tombstones existed (generation C1). That residual is open as delta#38 - do not read the policy as unqualified.
 
-### How Delta Handles WASM Upgrades
-
-1. The delegate stores each site's contract key (base58) in `KnownSiteRecord.contract_key_b58`
-2. On startup, the UI computes the fresh contract key from the prefix using the current embedded WASM
-3. If stored key != computed key, a WASM upgrade happened
-4. GET state from old key, PUT to new key with the new contract container
-5. Update the stored key in the delegate
-
-This happens automatically - no user action needed. That is the
-single-hop case; the fallback below covers the rest, and both are
-folded into one decision by the driver described under it.
-
-**Multi-hop migration fallback:** when a restored `KnownSiteRecord`
-has no `contract_key_b58` (legacy delegates from before b82d3bc) or
-when the stored key itself refers to a hash no longer on the network,
-the UI additionally probes every previous contract WASM hash recorded
-in `legacy_contracts.toml`. Every candidate generation is reconciled
-into local state by the tombstone-aware `reconcile_into` merge, which
-keeps the newest data and preserves deletions regardless of arrival
-order. There is no "first response wins" and no drop-late-arrival
-behaviour, and legacy sibling probes are deliberately left running
-(`ui/src/freenet_api/operations.rs:49-53`, `:213-215`, `:263-267`):
-a slower generation may still be the newest one, which is also the
-self-heal path for a user whose current key holds stale state from an
-earlier broken migration.
-
-**The contract sweep runs on `freenet-migrate`'s decision driver**
-(adopted in delta#36). `ProbeDriver` with `SelectionPolicy::FoldAll`
-(`operations.rs:928-933`) bounds the sweep into ONE decision and one
-forward PUT once every candidate has resolved
-(`finalize_migration_sweep`), replacing the earlier re-PUT on every
-legacy response that changed local state. The driver validates and
-pins the fold while `reconcile_into` keeps ownership of the production
-data decisions, so no second merge implementation exists that could
-drift from the one the tests pin. The driver header at
-`operations.rs:778-800` records two honest bounds on that soundness,
-both pre-existing rather than introduced by the adoption.
-
-**Recording contract WASM hashes is part of the release process.**
-Any commit that changes `site_contract.wasm` — including an incidental
-rebuild caused by touching `common/`, even if the contract's own
-source is unchanged — must first record the currently-committed
-contract WASM hash via `./scripts/add-contract-migration.sh`.
-`scripts/check-migration.sh` enforces this: it walks the git history
-of `site_contract.wasm` and refuses to publish unless EVERY committed
-state other than the one shipping now appears in
-`legacy_contracts.toml`. The delegate is gated identically against
-`legacy_delegates.toml`. See "The migration gate" below for where it
-runs and what it cannot do.
+**Recording contract WASM hashes is part of the release process.** Any commit that changes `site_contract.wasm` — including an incidental rebuild from touching `common/` — must first run `./scripts/add-contract-migration.sh`. `scripts/check-migration.sh` enforces this by walking git history of the WASM file and refusing to publish unless every committed generation other than the current one is recorded (delegate gated identically against `legacy_delegates.toml`).
 
 ### Delegate WASM Migration
 
-When `site_delegate.wasm` changes, the delegate key changes and stored secrets (signing keys, known sites, **site state backups**) become inaccessible under the old key.
+When `site_delegate.wasm` changes, stored secrets (signing keys, known sites, site state backups) become inaccessible under the old key. Two mechanisms run side by side (both armed from the same match arm, `delegate.rs:882-883`, neither behind a feature flag), both idempotent and never-clobber:
 
-Migration entries in `legacy_delegates.toml` allow the UI to read from old delegate keys:
-1. Before changing delegate code: `./scripts/add-migration.sh VERSION "description"`
-2. Rebuild: `./scripts/sync-wasm.sh`
-3. Once the current delegate's KnownSites response arrives (see the ordering invariant under "Known-Sites Tombstone Convention"), the UI sends GetPublicKey, GetKnownSites, GetSigningKey to each legacy delegate. **The send order is load-bearing, not cosmetic:** with an empty current delegate the first non-empty legacy reply latches `CURRENT_SITES_LOADED` and calls `save_known_sites()`, after which `skip_older_legacy` discards every remaining generation bar the newest — so send order decides whose view is persisted. Reordering the sweep is a change to stored data and needs its own tests.
-4. When legacy KnownSites arrives, GetSiteState is also requested for each prefix from that legacy delegate
-5. If an old delegate responds, signing keys, known sites, and site state backups are migrated to the current delegate
+- **Hand-rolled sweep**, `fire_legacy_migration()` (`delegate.rs:1407-1472`): owns UI-state restoration (site list reconciliation, contract GETs, hash-route replay). Once the current delegate's KnownSites response has arrived, it sends GetPublicKey/GetKnownSites/GetSigningKey to each legacy delegate. **Send order is load-bearing**: the first non-empty legacy reply latches `CURRENT_SITES_LOADED` and calls `save_known_sites()`, after which `skip_older_legacy` discards every remaining generation but the newest.
+- **Crate walk**, `start_delegate_secret_migration()` (`delegate.rs:1182`) via `freenet_migrate::migrate_delegate_secrets`: owns walk order, durable per-predecessor markers, never-clobber writes.
 
-**Two mechanisms run side by side, and steps 3-5 describe only the
-first.** Since delta#61 Delta runs both:
+Running both is deliberate staged rollout, not an oversight; retiring the hand-rolled path is a follow-up once the walk is field-validated (see the `freenet-migrate-adoption` skill).
 
-- The **hand-rolled sweep**, `fire_legacy_migration()`
-  (`ui/src/freenet_api/delegate.rs:1388-1453`), is what steps 3-5
-  above describe. It owns the UI-state restoration the library does
-  not migrate: site list reconciliation, contract GETs and hash-route
-  replay. Its send order is load-bearing, as step 3 explains.
-- The **crate walk**, `start_delegate_secret_migration()`
-  (`delegate.rs:1163`), calls `freenet_migrate::migrate_delegate_secrets`
-  through `run_delegate_migration` (`delegate_migration.rs:922`). It
-  owns walk order, durable per-predecessor marker bookkeeping,
-  never-clobber writes and per-predecessor classification.
+**`legacy_delegates.toml` is baked into the UI at build time** by `ui/build.rs` (`cargo:rerun-if-changed`). `add-migration.sh` edits the file without staging it — without the rerun directive, Cargo reuses cached build output and ships a **stale** migration table, silently orphaning every returning user's data on a "Welcome to Delta" screen. A build assertion now fails the build if `[[entry]]` sections exist but none deserialize (the `entry` field is `#[serde(default)]`, so a structural mismatch otherwise yields an empty table with no error).
 
-Both are armed from the same match arm and nowhere else
-(`delegate.rs:873-874`), so both inherit the ordering invariant under
-"Known-Sites Tombstone Convention": the current delegate has already
-answered, so a predecessor's reply can no longer be applied ahead of
-it and resurrect a site the user removed. Neither is behind a feature
-flag.
+**A worktree is the WRONG instrument for reproducing a build-caching or publish problem.** In a git worktree, `.git` is a file pointing at `.git/worktrees/<name>`. An unresolvable `rerun-if-changed` target used to leave Cargo treating the build script as permanently dirty, so it always re-ran - which is exactly what hid the missing directive above from every agent who investigated inside a worktree. `ui/build.rs` now resolves those paths with `git rev-parse --git-path` and both layouts cache identically, but the general lesson outlives the fix: reproduce build-caching and publish issues in a clean clone or the main checkout.
 
-Running both is deliberate staging rather than an oversight. Both
-paths are idempotent and never-clobber, so running both is safe;
-retiring the hand-rolled secret probing is a follow-up once the walk
-is field-validated. The rationale is on the doc comment for
-`start_delegate_secret_migration` (`delegate.rs:1150-1162`), and the
-`freenet-migrate-adoption` skill covers the call-site swap, the
-dual-running period and the parity test.
-
-`ui/src/freenet_api/delegate_migration_differential.rs` is a
-**test-only** harness, declared behind `#[cfg(test)]` at
-`ui/src/freenet_api.rs:8-9`. It compares a transcribed model of the
-shipped sweep against the library-driven walk under `cargo test`. It
-is not a runtime check, so do not read it as a third mechanism.
-
-**`legacy_delegates.toml` is baked into the UI at build time** by
-`ui/build.rs`, which declares `cargo:rerun-if-changed` on it. That
-directive is load-bearing and was once missing: `add-migration.sh` edits
-the file without staging it, so without it Cargo reuses the cached build
-script output and the bundle ships a STALE migration table — the outgoing
-delegate absent from it, the sweep never asking the delegate that holds
-the user's data, and every returning user landing on a permanently empty
-"Welcome to Delta". The `entry` field is `#[serde(default)]`, so a
-structural mismatch yields an EMPTY table with no error at all; a build
-assertion now fails the build if the file has `[[entry]]` sections and
-none deserialize.
-
-**A worktree is the WRONG instrument for reproducing a build-caching or
-publish-path problem.** `ui/build.rs` is only cached as designed in a
-normal checkout. In a git worktree `.git` is a FILE pointing at
-`.git/worktrees/<name>`, so a hardcoded `../.git/HEAD` does not resolve,
-and Cargo treats an unresolvable `rerun-if-changed` target as
-permanently dirty — the script re-ran on every build and every generated
-table was always fresh. The paths are now resolved via `git rev-parse
---git-path` so both layouts cache identically, but the general point
-outlives that fix: `cargo make publish-delta` runs from the main
-checkout, so any staleness bug lives there. The repo's own convention of
-always working in a worktree structurally concealed the missing
-`legacy_delegates.toml` directive above from every agent who
-investigated it. If you are asked to reproduce something about build
-caching, generated files, or publishing, reproduce it in a clean clone
-or the main checkout — following the worktree convention guarantees you
-cannot see it.
-
-**CRITICAL: Every delegate storage key type must be migrated.** The
-legacy migration in `fire_legacy_migration()` and the KnownSites handler
-must cover ALL storage operations the delegate supports. If a new storage
-operation is added to the delegate (e.g. `StoreFoo` / `GetFoo`), the
-corresponding `GetFoo` MUST be added to the legacy migration path.
-Omitting it means that data is lost silently when the delegate WASM
-upgrades. April 2026 incident: `GetSiteState` was missing from legacy
-migration, causing sites to vanish when network state had been GC'd.
-
-**Defense in depth:** `request_site_state_backup()` (called from the
-NotFound handler) queries both the current delegate AND all legacy
-delegates, so even if the proactive fetch during KnownSites processing
-misses a prefix, the NotFound fallback catches it.
+**Every delegate storage key type must be migrated.** If a new storage op is added to the delegate (e.g. `StoreFoo`/`GetFoo`), the corresponding `GetFoo` MUST be added to `fire_legacy_migration()` and the KnownSites handler, or that data is lost silently on upgrade. April 2026: `GetSiteState` was missing, causing sites to vanish when network state had been GC'd. **Defense in depth:** `request_site_state_backup()` (NotFound handler) queries the current delegate AND all legacy delegates, catching prefixes the proactive KnownSites-time fetch misses.
 
 ### Upgrade Workflow
 
 ```bash
 # 1. Record old delegate + contract WASM hashes (BEFORE any code change).
-#    Run whichever applies — delegate-only changes don't need the
-#    contract entry, and vice-versa. Changes to `common/` touch BOTH
-#    WASMs because the contract and delegate both depend on delta-core.
+#    Changes to `common/` touch BOTH WASMs.
 ./scripts/add-migration.sh V2 "Before adding deleted_pages field"
 ./scripts/add-contract-migration.sh C3 "Before adding deleted_pages field"
 
-# 2. Make code changes
-
-# 3. Rebuild WASMs
+# 2. Make code changes; 3. Rebuild WASMs
 ./scripts/sync-wasm.sh
 
-# 3b. Re-sign the pointer records against the WASMs you just built. Step 1
-#     carries OUR users forward; this carries THIRD PARTIES forward — see
-#     "Stable identity" below. CI's pointer-freshness job fails the PR if you
-#     skip it.
+# 3b. Re-sign pointer records against the new WASMs (carries THIRD PARTIES
+#     forward, not our own users — see "Stable identity" below). CI's
+#     pointer-freshness job fails the PR if you skip it.
 ./scripts/sign-pointer-records.sh
 
 # 4. Build and publish. `publish-delta` depends on `preflight`, which runs
-#    scripts/check-migration.sh and aborts the whole chain — before anything
-#    is signed or published — if either WASM's predecessor hash is missing.
+#    check-migration.sh and aborts before anything is signed/published if a
+#    predecessor hash is missing.
 cargo make publish-delta
 
-# 5. Commit everything, including the bumped version counter
+# 5. Commit everything, including the bumped version counter.
 git add legacy_delegates.toml legacy_contracts.toml pointer-records.toml \
     ui/public/contracts/ common/ contracts/ published-contract/contract-version.txt
 git commit -m "fix: description with delegate migration"
 git push
-# Remember to commit published-contract/contract-version.txt. It is NOT
-# updated by the migration workflow; `cargo make sign-webapp` (run
-# transitively by publish-delta) increments it on each publish.
+# published-contract/contract-version.txt is NOT updated by the migration
+# workflow — `cargo make sign-webapp` (run by publish-delta) bumps it.
 
 # 6. AFTER the PR merges, from main: publish the re-signed pointer records.
 #    Signing is offline and belongs in the PR; the network write does not.
@@ -362,123 +130,47 @@ git push
     --pointer-wasm <path to the COMMITTED pointer-v1.wasm>
 ```
 
-Steps 4 and 5 may also be done in the other order (commit and merge first,
-publish from `main` afterwards, as the rustc-bump procedure does). The gate
-finds the predecessor by walking git history, so it works either way.
+Steps 4 and 5 may run in either order (publish then commit, or commit/merge then publish from `main`) — the gate finds the predecessor by walking git history either way.
 
 ### The migration gate
 
-`scripts/check-migration.sh` is the **only** implementation of the gate. It
-runs from `cargo make publish-delta` (via `preflight` → `check-migration`) and
-from the "Delegate migration safety" job in `.github/workflows/ci.yml`. For
-each of the delegate and the contract it refuses to report success unless:
+`scripts/check-migration.sh` is the **only** implementation of the gate — do not add a second copy. (`Makefile.toml` used to carry an inline near-duplicate that the publish path actually ran while the script never fired; delta#45/#46.) It runs from `cargo make publish-delta` (via `preflight`) and from CI's migration-safety job, and for each of delegate/contract refuses success unless:
 
-- the committed WASM is byte-identical to what this toolchain builds from
-  source;
-- **every** committed generation of that WASM other than the one shipping now
-  has its hash recorded in the matching `legacy_*.toml`; and
-- conversely, every hash the table records is visible in that WASM's git
-  history.
+- the committed WASM is byte-identical to a from-source rebuild;
+- **every** committed generation other than the one shipping now has its hash in the matching `legacy_*.toml`; and
+- conversely every recorded hash is visible in that WASM's git history (catches a renamed/relocated WASM path re-baselining the gate to one generation).
 
-It checks every generation rather than only the immediate predecessor because
-single-generation checking is sound only if every earlier generation was
-itself checked when it shipped — which assumes a gate that always worked and
-a branch protection rule that was always on. Neither held: three April 2026
-contract generations were unrecorded on `main`, and a predecessor-only gate
-is structurally incapable of noticing them. The converse rule is what catches
-a **renamed or relocated** WASM path, where `git log -- <new path>` reports a
-single commit and `--follow` does not bridge a rename whose content changed
-in the same commit; without it, relocating `ui/public/contracts/` silently
-re-baselines the gate to one generation and passes.
+It also refuses whenever it cannot answer the question (shallow clone, untracked WASM, unborn HEAD, orphan branch, non-git checkout) rather than reading silence as safety — this is why CI sets `fetch-depth: 0`.
 
-It also refuses whenever it cannot answer the question rather than reading
-silence as safety: a shallow clone, an untracked WASM, an unborn HEAD, an
-orphan branch, a non-git checkout, or an unreadable git object. This is why
-the CI job sets `fetch-depth: 0`.
-
-**Do not add a second copy of this check.** `Makefile.toml` used to carry an
-inline near-duplicate that only compared the committed WASM against a fresh
-build. That inline copy, not the script, was what the publish path actually
-ran, so the gate the docs promised had never once refused a publish
-(delta#45, delta#46). `scripts/tests/check-migration-test.sh` runs in CI and
-in `preflight`, ahead of the gate itself, in three layers: source scrapes that
-the Makefile task delegates to the script and that CI invokes it with full
-history (the *wiring*, which is what was actually broken); end-to-end runs of
-the real script against synthetic repos with a stubbed `build-wasm.sh`, so
-deleting a check from `main()` fails the suite; and unit cases for each
-history shape. An earlier version tested only the helper function and passed
-11/11 with the gate deleted from `main()` entirely — if you add a case, make
-sure it fails when the thing it describes is removed.
-
-What the gate does **not** cover: it verifies that a hash is recorded, not
-that the recorded entry is correct or that the migration actually restores
-data. A wrong `delegate_key` for a right `code_hash` is caught separately by
-the build assertion in `ui/build.rs`; that the sweep reaches the data at all
-is only ever proven by the browser check (step 9 of the rustc-bump
-procedure). It also cannot see a state that was published but never
-committed.
+It does **not** verify that a recorded entry is correct, or that the migration actually restores data — a wrong `delegate_key` for a right `code_hash` is caught by the `ui/build.rs` assertion instead, and that the sweep actually reaches the data is only proven by the browser check (step 9 of the rustc-bump procedure).
 
 ## Stable identity: pointer records
 
-The `legacy_*.toml` registries above carry **our own users'** data across a
-re-key. They do nothing for a **third party** integrating with Delta, whose
-reference to our contract or delegate key is a build-time constant that goes
-stale silently — every read comes back looking like "this user has nothing
-stored", which at the protocol level is indistinguishable from the truth.
+`legacy_*.toml` carries **our own users'** data across a re-key; it does nothing for a **third party** whose reference to our contract/delegate key is a build-time constant that goes stale silently (a stale key just looks like "this user has nothing stored"). `pointer-records.toml` is the other half: a record at a fixed address naming each artifact's current code hash, signed by Delta's author key, which integrators resolve instead of pinning.
 
-`pointer-records.toml` is that other half: a record at a FIXED address naming
-each artifact's current code hash, signed by Delta's author key, which
-integrators resolve instead of pinning. Same trigger as a migration entry,
-different beneficiary — and the pointer failure is the quieter of the two,
-because a stale pointer answers confidently with a dead key rather than
-erroring.
+CI's `pointer-freshness` job fails the PR if a pointed-at WASM changed and no new record was signed — so whenever you run `add-migration.sh`, also run `sign-pointer-records.sh`.
 
-CI's `pointer-freshness` job fails the PR if a pointed-at WASM changed and no
-new record was signed. So in practice: whenever you run `add-migration.sh`, you
-also need `sign-pointer-records.sh`.
-
-See `FREENET.md` for the integrator-facing side, including the scope boundary —
-**a pointer solves addressing only** and says nothing about whether secrets
-survived the re-key, which is what the rest of this section is about.
+See `FREENET.md` for the integrator-facing side, including the scope boundary: **a pointer solves addressing only**, and says nothing about whether secrets survived the re-key.
 
 ## Publishing
 
 ```bash
-# Full build + publish. This is the supported route: it runs the migration
-# gate via `preflight` and aborts before anything is built or uploaded if a
-# predecessor hash is missing, and it refuses to publish a bundle that is not
-# self-consistent.
+# Full build + publish. Runs the migration gate via `preflight` (aborts before
+# building/uploading if a predecessor hash is missing) and refuses to publish
+# a bundle that isn't self-consistent.
 cargo make publish-delta
 ```
 
-**Do not assemble a publish by hand.** There are now TWO gates on this path,
-and a hand-assembled publish skips both:
+**Do not assemble a publish by hand** — there are two gates on this path and a hand-assembled publish skips both:
 
-- `scripts/check-migration.sh` (via `preflight`) — the only thing standing
-  between a WASM change and every returning user losing their sites.
-- `scripts/check-webapp-bundle.sh` (inside `bundle-webapp`, after the tar) —
-  refuses an archive carrying stale copies from earlier builds. `dx` writes
-  content-hashed filenames, so without the clean-and-check the bundle grew a
-  full ~2MB wasm on every publish and shipped several builds of the app at
-  once (delta#70).
-
-An earlier version of this section listed raw `dx build` / tar / sign /
-`fdev publish` steps, which documented exactly that gate-free route. If you
-need the archive without publishing, build it with the task — it runs both
-gates and stops at the tar:
+- `scripts/check-migration.sh` (via `preflight`)
+- `scripts/check-webapp-bundle.sh` (inside `bundle-webapp`, after the tar) — refuses an archive carrying stale copies from earlier builds. `dx` writes content-hashed filenames, so without this the bundle grew ~2MB of stale wasm and shipped several app builds at once (delta#70).
 
 ```bash
 cargo make bundle-webapp     # -> target/webapp/webapp.tar.xz, gated, no publish
 ```
 
-Do not sign or publish an archive produced any other way.
-
-**Version counter**: `published-contract/contract-version.txt` is the source of
-truth for the web-container version. `cargo make sign-webapp` (run transitively
-by `publish-delta`) reads, bumps, and writes it back each publish. Do not
-derive the version from wall-clock time — see delta#71 for the failure mode.
-Commit the bumped counter file alongside the other publish artifacts, and send
-a pull request for all changes before pushing.
+**Version counter**: `published-contract/contract-version.txt` is the source of truth for the web-container version. `cargo make sign-webapp` (run by `publish-delta`) reads, bumps, and writes it back each publish. Do not derive the version from wall-clock time (delta#71). Commit the bumped counter alongside other publish artifacts, **and open a pull request for all changes before pushing** - `main` has no branch protection here, so nothing enforces this but the convention.
 
 Contract ID: `EqJ5YpEEV3XLqEvKWLQHFhGAac2qXzSUoE6k2zbdnXBr`
 
@@ -493,16 +185,6 @@ Delta runs inside the Freenet gateway's sandboxed iframe:
 - **Tailwind group-hover** - doesn't work reliably, use plain CSS `.parent:hover .child`
 - **Hash forwarding**: shell sends `__freenet_shell__` postMessage with `type: 'hash'`; Delta listens and navigates
 
-## People
-
-- **Ian Clarke** - project lead. GitHub: sanity
-
 ## Testing
 
-Run Playwright tests via SSH on technic:
-```bash
-scp test.mjs technic:/tmp/
-ssh technic "cd /tmp && npm install playwright && node test.mjs"
-```
-
-Technic has one owned site and several visited sites for testing.
+No dedicated remote browser-test rig exists for this repo. The old instructions here (SSH to `technic`) are dead — technic died in a hardware failure on 2026-06-27, and there is no replacement host with pre-seeded test sites. For ad hoc browser testing against a locally- or gateway-served Delta instance, use the general-purpose `playwright-skill` (auto-detects dev servers / takes a URL) rather than any repo-specific script.
