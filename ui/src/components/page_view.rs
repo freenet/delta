@@ -3,6 +3,7 @@ use dioxus::prelude::*;
 use crate::state;
 use crate::state::SiteRole;
 use delta_core::PageId;
+use std::collections::{BTreeMap, HashMap};
 
 #[component]
 pub fn PageView() -> Element {
@@ -202,12 +203,31 @@ pub fn PageView() -> Element {
 /// Content too costly to render as markdown is shown as plain text (see
 /// `markdown_render`).
 fn render_markdown(content: &str) -> String {
-    let resolved = resolve_page_links(content);
-    super::markdown_render::render_page_html(
-        &resolved,
+    let prefix = state::CURRENT_SITE.read().clone().unwrap_or_default();
+    let sites = state::SITES.read();
+    let pages = sites.get(&prefix).map(|s| &s.state.pages);
+    page_content_html(
         content,
+        &prefix,
+        pages,
         behind_gateway(),
         own_contract_id().as_deref(),
+    )
+}
+
+/// `render_markdown` for the site `prefix` with `pages`.
+fn page_content_html(
+    content: &str,
+    prefix: &str,
+    pages: Option<&BTreeMap<PageId, delta_core::Page>>,
+    rewrite_freenet_hrefs: bool,
+    own_contract_id: Option<&str>,
+) -> String {
+    super::markdown_render::render_page_view_html(
+        content,
+        |text, max_len| resolve_page_links(text, prefix, pages, max_len, &mut 0),
+        rewrite_freenet_hrefs,
+        own_contract_id,
     )
 }
 
@@ -670,87 +690,134 @@ fn slugify_heading(text: &str) -> String {
     out
 }
 
-/// Replace page links with hash-routed markdown links.
+/// Replace page links with hash-routed markdown links, or return `None` if
+/// the result would be longer than `max_len` or the work would exceed
+/// `RESOLVE_WORK_PER_BYTE * max_len`.
 ///
 /// Supported syntax:
 ///   [[id|Display Text]]  - link by page ID (canonical, stored format)
 ///   [[Page Title]]       - link by page title (user-friendly)
 ///   [[Page Title|Label]] - link by title with custom display text
-fn resolve_page_links(content: &str) -> String {
-    let prefix = state::CURRENT_SITE.read().clone().unwrap_or_default();
-    let sites = state::SITES.read();
-    let pages = sites.get(&prefix).map(|s| &s.state.pages);
-
-    let mut result = String::with_capacity(content.len());
+///
+/// `work` counts the bytes searched for `[[` and `]]`, plus the bytes of
+/// each page title a link copies. Each byte of `content` is searched at most
+/// once, and scanning stops at the last `]]`.
+fn resolve_page_links(
+    content: &str,
+    prefix: &str,
+    pages: Option<&BTreeMap<PageId, delta_core::Page>>,
+    max_len: usize,
+    work: &mut usize,
+) -> Option<String> {
+    let work_budget = max_len.saturating_mul(RESOLVE_WORK_PER_BYTE);
+    let mut titles = TitleIndex::new(pages);
+    let mut result = String::with_capacity(content.len().min(max_len));
     let mut rest = content;
 
-    while let Some(start) = rest.find("[[") {
-        result.push_str(&rest[..start]);
+    loop {
+        let Some(start) = rest.find("[[") else {
+            *work += rest.len();
+            break;
+        };
+        *work += start + 2;
         let after_open = &rest[start + 2..];
+        let Some(end) = after_open.find("]]") else {
+            // No `]]` remains, so no later `[[` can open a link either.
+            *work += after_open.len();
+            break;
+        };
+        *work += end + 2;
+        result.push_str(&rest[..start]);
 
-        if let Some(end) = after_open.find("]]") {
-            let link_content = &after_open[..end];
-            let resolved = if let Some((first, display)) = link_content.split_once('|') {
-                // [[first|display]] - first could be ID or title
-                // The display text is always used as the rendered link text
-                if let Ok(id) = first.trim().parse::<PageId>() {
-                    // [[id|Display Text]] - canonical format
-                    let slug = pages
-                        .and_then(|p| p.get(&id))
-                        .map(|p| p.title.clone())
-                        .unwrap_or_else(|| display.to_string());
-                    let hash = state::build_hash_route(&prefix, Some(id), Some(&slug));
-                    Some(format!("[{display}]({hash})"))
-                } else {
-                    // [[Title|Label]] - look up by title, show label
-                    find_page_by_title(pages, first.trim()).map(|(id, _)| {
-                        let hash = state::build_hash_route(&prefix, Some(id), Some(first.trim()));
-                        format!("[{display}]({hash})")
-                    })
-                }
+        let link_content = &after_open[..end];
+        let resolved = if let Some((first, display)) = link_content.split_once('|') {
+            // [[first|display]] - first could be ID or title
+            // The display text is always used as the rendered link text
+            if let Ok(id) = first.trim().parse::<PageId>() {
+                // [[id|Display Text]] - canonical format
+                let slug = match pages.and_then(|p| p.get(&id)) {
+                    Some(page) => {
+                        *work += page.title.len();
+                        page.title.as_str()
+                    }
+                    None => display,
+                };
+                let hash = state::build_hash_route(prefix, Some(id), Some(slug));
+                Some(format!("[{display}]({hash})"))
             } else {
-                // [[id]] or [[Page Title]] - no custom display text
-                let trimmed = link_content.trim();
-                if let Ok(id) = trimmed.parse::<PageId>() {
-                    // [[id]] - render as current page title (auto-updates on rename)
-                    pages.and_then(|p| p.get(&id)).map(|p| {
-                        let hash = state::build_hash_route(&prefix, Some(id), Some(&p.title));
-                        format!("[{}]({hash})", p.title)
-                    })
-                } else {
-                    // [[Page Title]] - look up by title
-                    find_page_by_title(pages, trimmed).map(|(id, title)| {
-                        let hash = state::build_hash_route(&prefix, Some(id), Some(&title));
-                        format!("[{title}]({hash})")
-                    })
-                }
-            };
-
-            result.push_str(&resolved.unwrap_or_else(|| {
-                // Broken link - render as styled warning text
-                format!("<span style=\"color: var(--color-text-muted); text-decoration: line-through;\" title=\"Page not found\">[[{link_content}]]</span>")
-            }));
-            rest = &after_open[end + 2..];
+                // [[Title|Label]] - look up by title, show label
+                titles.find(first.trim()).map(|(id, _)| {
+                    let hash = state::build_hash_route(prefix, Some(id), Some(first.trim()));
+                    format!("[{display}]({hash})")
+                })
+            }
         } else {
-            result.push_str("[[");
-            rest = after_open;
+            // [[id]] or [[Page Title]] - no custom display text
+            let trimmed = link_content.trim();
+            let page = if let Ok(id) = trimmed.parse::<PageId>() {
+                // [[id]] - render as current page title (auto-updates on rename)
+                pages
+                    .and_then(|p| p.get(&id))
+                    .map(|p| (id, p.title.as_str()))
+            } else {
+                // [[Page Title]] - look up by title
+                titles.find(trimmed)
+            };
+            page.map(|(id, title)| {
+                *work += title.len();
+                let hash = state::build_hash_route(prefix, Some(id), Some(title));
+                format!("[{title}]({hash})")
+            })
+        };
+
+        result.push_str(&resolved.unwrap_or_else(|| {
+            // Broken link - render as styled warning text
+            format!("<span style=\"color: var(--color-text-muted); text-decoration: line-through;\" title=\"Page not found\">[[{link_content}]]</span>")
+        }));
+        rest = &after_open[end + 2..];
+        if result.len() > max_len || *work > work_budget {
+            return None;
         }
     }
     result.push_str(rest);
-    result
+    (result.len() <= max_len).then_some(result)
 }
 
-/// Find a page by title (case-insensitive).
-fn find_page_by_title(
-    pages: Option<&std::collections::BTreeMap<PageId, delta_core::Page>>,
-    title: &str,
-) -> Option<(PageId, String)> {
-    let pages = pages?;
-    let lower = title.to_lowercase();
-    pages
-        .iter()
-        .find(|(_, p)| p.title.to_lowercase() == lower)
-        .map(|(&id, p)| (id, p.title.clone()))
+/// Most work `resolve_page_links` does per byte of its output limit: one for
+/// searching the content, the rest for the page titles links copy.
+const RESOLVE_WORK_PER_BYTE: usize = 4;
+
+/// Pages by title, case-insensitively, for `[[Page Title]]` links. Built on
+/// first use, so a page with no title links never builds it, and a page with
+/// many builds it once.
+struct TitleIndex<'a> {
+    pages: Option<&'a BTreeMap<PageId, delta_core::Page>>,
+    by_title: Option<HashMap<String, (PageId, &'a str)>>,
+}
+
+impl<'a> TitleIndex<'a> {
+    fn new(pages: Option<&'a BTreeMap<PageId, delta_core::Page>>) -> Self {
+        Self {
+            pages,
+            by_title: None,
+        }
+    }
+
+    /// The page titled `title`, ignoring case. If several are, the one with
+    /// the lowest id.
+    fn find(&mut self, title: &str) -> Option<(PageId, &'a str)> {
+        let pages = self.pages?;
+        let by_title = self.by_title.get_or_insert_with(|| {
+            let mut by_title = HashMap::new();
+            for (&id, page) in pages {
+                by_title
+                    .entry(page.title.to_lowercase())
+                    .or_insert((id, page.title.as_str()));
+            }
+            by_title
+        });
+        by_title.get(&title.to_lowercase()).copied()
+    }
 }
 
 /// Copy the full URL for a specific page to clipboard.
@@ -1326,5 +1393,131 @@ mod tests {
         assert!(result.matches("target=\"_blank\"").count() == 2); // freenet + example
                                                                    // Internal hash anchor untouched.
         assert!(result.contains("href=\"#section\">jump</a>"));
+    }
+
+    mod page_links {
+        use super::super::{page_content_html, resolve_page_links, RESOLVE_WORK_PER_BYTE};
+        use delta_core::{Page, PageId};
+        use std::collections::BTreeMap;
+
+        const PREFIX: &str = "AbCdEfGhJk";
+
+        fn pages(titles: &[(PageId, &str)]) -> BTreeMap<PageId, Page> {
+            let key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+            titles
+                .iter()
+                .map(|&(id, title)| (id, Page::new(id, title.into(), String::new(), 1, &key)))
+                .collect()
+        }
+
+        fn resolve(content: &str, pages: &BTreeMap<PageId, Page>, max: usize) -> Option<String> {
+            resolve_page_links(content, PREFIX, Some(pages), max, &mut 0)
+        }
+
+        /// Work done resolving `content`, with no output limit.
+        fn work(content: &str, pages: &BTreeMap<PageId, Page>) -> usize {
+            let mut work = 0;
+            resolve_page_links(content, PREFIX, Some(pages), usize::MAX / 8, &mut work);
+            work
+        }
+
+        #[test]
+        fn links_resolve_by_id_and_title() {
+            let pages = pages(&[(1, "Home"), (2, "About Us"), (3, "home")]);
+            let resolved = resolve(
+                "[[1]] [[2|who]] [[ABOUT US]] [[about us|team]] [[home]] [[9]] [[x|y]] [[",
+                &pages,
+                1024,
+            )
+            .unwrap();
+            assert_eq!(
+                resolved,
+                "[Home](#AbCdEfGhJk/1/home) [who](#AbCdEfGhJk/2/about-us) \
+                 [About Us](#AbCdEfGhJk/2/about-us) [team](#AbCdEfGhJk/2/about-us) \
+                 [Home](#AbCdEfGhJk/1/home) \
+                 <span style=\"color: var(--color-text-muted); text-decoration: line-through;\" title=\"Page not found\">[[9]]</span> \
+                 <span style=\"color: var(--color-text-muted); text-decoration: line-through;\" title=\"Page not found\">[[x|y]]</span> [["
+            );
+        }
+
+        /// Searching visits each byte once, however many `[[` have no `]]`
+        /// after them: the work equals the length.
+        #[test]
+        fn scanning_is_linear() {
+            let pages = pages(&[(1, "A")]);
+            for n in [1, 2, 4, 8, 16] {
+                let unclosed = "[[".repeat(n);
+                assert_eq!(work(&unclosed, &pages), unclosed.len(), "{n}");
+                assert_eq!(resolve(&unclosed, &pages, 1024).unwrap(), unclosed);
+
+                let nested = format!("{}x]]", "[[".repeat(n));
+                assert_eq!(work(&nested, &pages), nested.len(), "{n}");
+
+                // Links, then unclosed openers: the work is the length plus
+                // each link's title.
+                let mixed = format!("{}{}", "[[1]] ".repeat(n), "[[ ".repeat(n));
+                assert_eq!(work(&mixed, &pages), mixed.len() + n, "{n}");
+            }
+        }
+
+        /// The output limit is exact.
+        #[test]
+        fn output_is_capped() {
+            let pages = pages(&[(1, "A page with a long title")]);
+            let content = "[[1]] [[missing]] [[1]]";
+            let full = resolve(content, &pages, usize::MAX / 8).unwrap();
+            assert!(full.len() > content.len());
+            assert_eq!(resolve(content, &pages, full.len()), Some(full.clone()));
+            assert_eq!(resolve(content, &pages, full.len() - 1), None);
+            // Text without links is checked too.
+            assert_eq!(resolve("abc", &pages, 2), None);
+        }
+
+        /// Copying page titles counts as work, so many links to a page with a
+        /// long title that adds little output still stop.
+        #[test]
+        fn title_work_is_capped() {
+            let title = "!".repeat(100);
+            let pages = pages(&[(1, title.as_str())]);
+            // Each link is 7 bytes searched and 100 of title, and its slug
+            // is empty, so its output is short.
+            let max = 128;
+            let budget = max * RESOLVE_WORK_PER_BYTE;
+            for links in 1..=8 {
+                let content = "[[1|d]]".repeat(links);
+                let expected_work = links * (7 + 100);
+                assert_eq!(work(&content, &pages), expected_work);
+                let resolved = resolve(&content, &pages, max);
+                assert_eq!(resolved.is_some(), expected_work <= budget, "{links}");
+            }
+        }
+
+        /// The page view renders through the bounded renderer: costly content
+        /// is plain text, shown as written, and links resolve otherwise.
+        #[test]
+        fn page_view_renders_through_the_bounded_renderer() {
+            let pages = pages(&[(1, "Home")]);
+            let render =
+                |content: &str| page_content_html(content, PREFIX, Some(&pages), true, None);
+
+            let html = render("See [[1]].\n\n- item");
+            assert!(
+                html.contains("<a href=\"#AbCdEfGhJk/1/home\">Home</a>"),
+                "{html}"
+            );
+            assert!(html.contains("<li>item</li>"), "{html}");
+
+            let deep = format!("[[1]]\n{}x", "- ".repeat(17));
+            assert_eq!(
+                render(&deep),
+                format!("<p>[[1]]<br />\n{}x</p>", "- ".repeat(17))
+            );
+
+            // Malformed input from the parser fixes, reached through a link.
+            for input in ["[[1]] [a](b \"x\ny\")", "[[1]]\n1. <!--\n-", "[[1]]<![C&#;"] {
+                let rendered = std::panic::catch_unwind(|| render(input));
+                assert!(rendered.is_ok(), "{input:?}");
+            }
+        }
     }
 }
