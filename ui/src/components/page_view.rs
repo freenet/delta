@@ -206,13 +206,52 @@ fn render_markdown(content: &str) -> String {
     let prefix = state::CURRENT_SITE.read().clone().unwrap_or_default();
     let sites = state::SITES.read();
     let pages = sites.get(&prefix).map(|s| &s.state.pages);
-    page_content_html(
-        content,
-        &prefix,
-        pages,
-        behind_gateway(),
-        own_contract_id().as_deref(),
-    )
+    let inputs = RenderInputs {
+        content: content.to_string(),
+        prefix: prefix.clone(),
+        titles: pages
+            .into_iter()
+            .flatten()
+            .map(|(&id, page)| (id, page.title.clone()))
+            .collect(),
+        rewrite_freenet_hrefs: behind_gateway(),
+        own_contract_id: own_contract_id(),
+    };
+    // The page view re-renders on every network update to any site and on
+    // UI toggles. Rendering the same content again would repeat work that
+    // can take a noticeable fraction of a second, so the last result is kept.
+    LAST_RENDER.with(|last| {
+        if let Some((cached, html)) = &*last.borrow() {
+            if *cached == inputs {
+                return html.clone();
+            }
+        }
+        let html = page_content_html(
+            content,
+            &prefix,
+            pages,
+            inputs.rewrite_freenet_hrefs,
+            inputs.own_contract_id.as_deref(),
+        );
+        *last.borrow_mut() = Some((inputs, html.clone()));
+        html
+    })
+}
+
+/// Everything `render_markdown`'s output depends on. Page titles are what
+/// page links resolve against.
+#[derive(PartialEq)]
+struct RenderInputs {
+    content: String,
+    prefix: String,
+    titles: Vec<(PageId, String)>,
+    rewrite_freenet_hrefs: bool,
+    own_contract_id: Option<String>,
+}
+
+thread_local! {
+    static LAST_RENDER: std::cell::RefCell<Option<(RenderInputs, String)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// `render_markdown` for the site `prefix` with `pages`.
@@ -1523,7 +1562,10 @@ mod tests {
             let deep = format!("[[1]]\n{}x", "- ".repeat(17));
             assert_eq!(
                 render(&deep),
-                format!("<p>[[1]]<br />\n{}x</p>", "- ".repeat(17))
+                format!(
+                    "<p style=\"white-space: pre-wrap\">[[1]]\n{}x</p>",
+                    "- ".repeat(17)
+                )
             );
 
             // Malformed input from the parser fixes, reached through a link.

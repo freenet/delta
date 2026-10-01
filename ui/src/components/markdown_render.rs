@@ -29,6 +29,13 @@ struct Limits {
     /// Most block container markers in the whole text: the sum over its lines
     /// of the containers each opens (see `line_container_depth`).
     container_markers: usize,
+    /// Most block containers that may be open on any one line, opened on it
+    /// or earlier (see `ParseCost::of`).
+    open_depth: usize,
+    /// Bound on the sum, over every line including blank ones, of the
+    /// containers that may be open on it. The parser checks each open
+    /// container on every line.
+    open_depth_total: usize,
     /// Bound on the sum, over each run of non-blank lines, of the run's
     /// length squared, in bytes squared.
     block_cost: u64,
@@ -56,6 +63,11 @@ struct Limits {
 /// - `container_markers`: the most any real markdown file measured opens is
 ///   about 700, so this leaves a wide margin. A very long checklist or list
 ///   (thousands of items) is shown as plain text.
+/// - `open_depth` and `open_depth_total`: nesting can also be built up across
+///   lines by indentation, and parser time grows with the number of open
+///   containers on every line, blank ones included. Of the real markdown
+///   files measured, the deepest estimate is 30 and the largest total about
+///   9,000 (human-written documents stay under 3,000).
 /// - `block_cost`: inline parsing (emphasis, brackets, code spans, inline
 ///   HTML) can take time quadratic in the length of a paragraph, and a
 ///   paragraph never spans a blank line. This allows a single 12 KiB run, or
@@ -72,6 +84,8 @@ const LIMITS: Limits = Limits {
     source_bytes: 128 * 1024,
     line_nesting: 16,
     container_markers: 4 * 1024,
+    open_depth: 48,
+    open_depth_total: 32 * 1024,
     block_cost: 12 * 1024 * 12 * 1024,
     table_cells: 64 * 1024,
     reference_lookups: 1024 * 1024,
@@ -176,6 +190,10 @@ struct ParseCost {
     container_markers: usize,
     /// The most containers opened at the start of any one line.
     deepest_line: usize,
+    /// The most containers that may be open on any one line.
+    deepest_open: usize,
+    /// See `Limits::open_depth_total`.
+    open_depth_total: usize,
     /// See `Limits::table_cells`.
     table_cells: usize,
     /// `]:` occurrences times `]` occurrences.
@@ -198,11 +216,29 @@ impl ParseCost {
 
         let mut run_bytes: u64 = 0;
         let mut run_table_columns: usize = 0;
+        // Containers that may be open on the current line (an over-estimate).
+        // A blank line keeps every container open (a list item stays open
+        // across one). The first line after a blank one can only continue
+        // what its own markers and indentation reach. Any other line may
+        // also continue a paragraph lazily, keeping everything open.
+        let mut open = 0;
+        let mut in_run = false;
         for line in markdown_lines(text) {
-            let depth = line_container_depth(line);
-            cost.deepest_line = cost.deepest_line.max(depth);
-            cost.container_markers = cost.container_markers.saturating_add(depth);
-            if is_blank_line(line) {
+            let prefix = container_prefix(line);
+            let blank = is_blank_line(line);
+            if !blank {
+                open = if in_run {
+                    open.max(prefix.open_depth())
+                } else {
+                    prefix.open_depth()
+                };
+            }
+            in_run = !blank;
+            cost.deepest_open = cost.deepest_open.max(open);
+            cost.open_depth_total = cost.open_depth_total.saturating_add(open);
+            cost.deepest_line = cost.deepest_line.max(prefix.markers);
+            cost.container_markers = cost.container_markers.saturating_add(prefix.markers);
+            if blank {
                 cost.block = cost.block.saturating_add(run_bytes * run_bytes);
                 run_bytes = 0;
                 run_table_columns = 0;
@@ -222,6 +258,8 @@ impl ParseCost {
     fn is_within(&self, limits: &Limits) -> bool {
         self.deepest_line <= limits.line_nesting
             && self.container_markers <= limits.container_markers
+            && self.deepest_open <= limits.open_depth
+            && self.open_depth_total <= limits.open_depth_total
             && self.block <= limits.block_cost
             && self.table_cells <= limits.table_cells
             && self.reference_lookups <= limits.reference_lookups
@@ -287,25 +325,64 @@ fn delimiter_row_columns(line: &str) -> Option<usize> {
 /// How many block quote, list item or footnote definition markers open at
 /// the start of `line` (an over-count is fine: it only makes plain text more
 /// likely).
+#[cfg(test)]
 fn line_container_depth(line: &str) -> usize {
+    container_prefix(line).markers
+}
+
+/// The block container markers at the start of a line, and the whitespace
+/// around them.
+#[derive(Debug, PartialEq)]
+struct ContainerPrefix {
+    /// Block quote, list item and footnote definition markers.
+    markers: usize,
+    /// Columns of spaces and tabs before, between and just after them, a tab
+    /// counting as 4.
+    whitespace_columns: usize,
+}
+
+impl ContainerPrefix {
+    /// At most how many containers can be open on the line: the ones its
+    /// markers open, plus one for every two columns of indentation, since a
+    /// list item or footnote definition continues only on a line indented
+    /// by at least two columns more than the container around it.
+    fn open_depth(&self) -> usize {
+        self.markers + self.whitespace_columns.div_ceil(2)
+    }
+}
+
+/// The container prefix of `line`. Over-counting is fine: it only makes plain
+/// text more likely.
+fn container_prefix(line: &str) -> ContainerPrefix {
     let bytes = line.as_bytes();
     let mut i = 0;
-    let mut depth = 0;
+    let mut prefix = ContainerPrefix {
+        markers: 0,
+        whitespace_columns: 0,
+    };
     loop {
-        while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        while let Some(&b) = bytes.get(i) {
+            match b {
+                b' ' => prefix.whitespace_columns += 1,
+                b'\t' => prefix.whitespace_columns += 4,
+                _ => break,
+            }
             i += 1;
         }
         let marker_end = match bytes.get(i) {
             Some(b'>') => i + 1,
             // A GFM footnote definition, `[^label]: `.
-            Some(b'[') if bytes.get(i + 1) == Some(&b'^') => match line[i..].find("]:") {
-                Some(end) => {
-                    depth += 1;
-                    i += end + 2;
-                    continue;
+            Some(b'[') if bytes.get(i + 1) == Some(&b'^') => {
+                match footnote_label_end(&bytes[i + 2..]) {
+                    Some(end) => {
+                        prefix.markers += 1;
+                        // Past the label, its `]` and the `:`.
+                        i += 2 + end + 2;
+                        continue;
+                    }
+                    None => return prefix,
                 }
-                None => return depth,
-            },
+            }
             Some(b'-' | b'*' | b'+') => i + 1,
             Some(b'0'..=b'9') => {
                 let mut j = i;
@@ -314,19 +391,36 @@ fn line_container_depth(line: &str) -> usize {
                 }
                 match bytes.get(j) {
                     Some(b'.' | b')') => j + 1,
-                    _ => return depth,
+                    _ => return prefix,
                 }
             }
-            _ => return depth,
+            _ => return prefix,
         };
         // A list marker must be followed by whitespace or the line's end.
         let is_quote = bytes[i] == b'>';
         if !is_quote && !matches!(bytes.get(marker_end), None | Some(b' ' | b'\t')) {
-            return depth;
+            return prefix;
         }
-        depth += 1;
+        prefix.markers += 1;
         i = marker_end;
     }
+}
+
+/// Where the label of a footnote definition ends, given the bytes after its
+/// `[^`: the index of the `]` that closes it, if a `:` follows. The label
+/// ends at the first `]` not escaped by a backslash, and cannot be empty or
+/// contain a space, tab or unescaped `[`, as the parser reads it.
+fn footnote_label_end(bytes: &[u8]) -> Option<usize> {
+    let mut j = 0;
+    while let Some(&b) = bytes.get(j) {
+        match b {
+            b'\\' if matches!(bytes.get(j + 1), Some(b'[' | b'\\' | b']')) => j += 2,
+            b']' => return (j > 0 && bytes.get(j + 1) == Some(&b':')).then_some(j),
+            b' ' | b'\t' | b'[' => return None,
+            _ => j += 1,
+        }
+    }
+    None
 }
 
 /// Bytes of HTML per byte of a copied destination or title (`"` becomes
@@ -476,10 +570,15 @@ fn drop_mdast(root: markdown::mdast::Node) {
     }
 }
 
-/// Text not rendered as markdown: escaped, with each line break kept.
+/// Text not rendered as markdown: escaped, as one block that keeps its line
+/// breaks and spacing. One text node however long the text, rather than an
+/// element per line.
 fn plain_text_to_html(text: &str) -> String {
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
-    format!("<p>{}</p>", escape_html(&text).replace('\n', "<br />\n"))
+    format!(
+        "<p style=\"white-space: pre-wrap\">{}</p>",
+        escape_html(&text)
+    )
 }
 
 fn escape_html(text: &str) -> String {
@@ -510,6 +609,8 @@ mod tests {
         source_bytes: 256,
         line_nesting: 4,
         container_markers: 16,
+        open_depth: 8,
+        open_depth_total: 128,
         block_cost: 64 * 64,
         table_cells: 32,
         reference_lookups: 12,
@@ -647,38 +748,128 @@ mod tests {
             .expect("walking a deep markdown tree panicked");
     }
 
-    /// The deepest nesting that the exact reference count accepts renders, on
-    /// a small stack. Nesting across lines needs growing indentation, which
-    /// the size limit bounds.
+    /// The deepest nesting across lines that the limits allow renders, on a
+    /// small stack, through the exact reference count.
     #[test]
     fn deepest_allowed_nesting_renders_on_a_small_stack() {
-        let mut text = String::new();
-        let mut depth = 0;
-        loop {
-            let line = format!("{}- [a]\n\n", "  ".repeat(depth));
-            // Half the size limit, the most the exact reference count allows.
-            if text.len() + line.len() + 6_100 > LIMITS.source_bytes / 2 {
-                break;
-            }
-            text.push_str(&line);
-            depth += 1;
-        }
-        // A definition followed, in the same run, by a long paragraph, so the
-        // cheap reference bound fails and the tree is built and walked.
-        text.push_str(&format!("[a]: b\n{}\n", "word ".repeat(1_200)));
-        assert!(depth > 200, "{depth}");
-        assert!(markdown_parse_cost(&text, &LIMITS).is_some());
+        let nested = |depth: usize| {
+            let mut text: String = (0..depth)
+                .map(|d| format!("{}- [a]\n", "  ".repeat(d)))
+                .collect();
+            // A definition followed, in the same run, by many references, so
+            // the cheap reference bound fails and the tree is built and
+            // walked.
+            text.push_str(&format!("\n[a]: b\n{}\n", "[a] ".repeat(500)));
+            text
+        };
+        let depth = (1..)
+            .take_while(|&d| markdown_parse_cost(&nested(d), &LIMITS).is_some())
+            .last()
+            .unwrap();
+        let text = nested(depth);
+        assert!(depth >= 16, "{depth}");
+        assert_eq!(cost(&nested(depth + 1)).deepest_open, LIMITS.open_depth + 1);
         let cheap = text.matches(']').count() * (longest_possible_definition(&text) * 6 + 64);
         assert!(cheap > LIMITS.html_bytes, "{cheap}");
         std::thread::Builder::new()
             .stack_size(256 * 1024)
             .spawn(move || {
                 let html = render_page_html(&text, &text, true, None);
-                assert!(html.contains("<ul>"), "{}", &html[..200]);
+                assert_eq!(html.matches("<ul>").count(), depth, "{}", &html[..200]);
             })
             .expect("spawn")
             .join()
             .expect("rendering deep nesting panicked");
+    }
+
+    /// Nesting built up across lines is counted: each two columns of
+    /// indentation may continue a container, a tab counts as four, and blank
+    /// lines and lazy lines keep every container open. Both open-depth limits
+    /// are exact.
+    #[test]
+    fn open_depth_limits() {
+        assert_eq!(container_prefix("- x").open_depth(), 2);
+        assert_eq!(container_prefix("    - x").open_depth(), 1 + 3);
+        assert_eq!(container_prefix("\t- x").open_depth(), 1 + 3);
+        assert_eq!(container_prefix("> > x").open_depth(), 2 + 1);
+        assert_eq!(container_prefix("      x").open_depth(), 3);
+
+        // A staircase: one more level per line, by indentation alone.
+        let staircase = |levels: usize| -> String {
+            (0..levels)
+                .map(|d| format!("{}- x\n", "  ".repeat(d)))
+                .collect()
+        };
+        for levels in [1, 2, 4, 8] {
+            let c = cost(&staircase(levels));
+            // The last line is indented 2 * (levels - 1) columns.
+            assert_eq!(c.deepest_open, levels + 1, "{levels}");
+            assert_eq!(c.deepest_line, 1);
+        }
+        // Blank lines cost the depth before them, and grow the total
+        // linearly.
+        let deep = staircase(4);
+        let base = cost(&deep).open_depth_total;
+        for blanks in [1, 2, 4, 8] {
+            let c = cost(&format!("{deep}{}", "\n".repeat(blanks)));
+            assert_eq!(c.open_depth_total, base + 5 * blanks, "{blanks}");
+        }
+        // A lazy line keeps the depth; a line after a blank one does not.
+        // (`deep` ends in a line ending, so its last line is already blank.)
+        assert_eq!(cost(&format!("{deep}y\n")).open_depth_total, base + 5);
+        assert_eq!(cost(&format!("{deep}\ny")).open_depth_total, base);
+
+        let limits = Limits {
+            block_cost: u64::MAX,
+            open_depth_total: usize::MAX,
+            ..SMALL
+        };
+        // Depth: `SMALL.open_depth` is 8, reached on the 7th step.
+        assert_eq!(cost(&staircase(7)).deepest_open, limits.open_depth);
+        assert!(renders_as_markdown(&limits, &staircase(7)));
+        assert!(!renders_as_markdown(&limits, &staircase(8)));
+        assert_plain(&limits, &staircase(8));
+        let tabs = format!("- x\n\t\t\t\t- y\n");
+        assert!(cost(&tabs).deepest_open > limits.open_depth);
+        assert!(!renders_as_markdown(&limits, &tabs));
+
+        // Total: blank lines after a shallow list.
+        let limits = Limits {
+            block_cost: u64::MAX,
+            ..SMALL
+        };
+        let list = "- x\n";
+        // The list line costs 2, and so does each blank line after it: the
+        // one its own line ending starts, and one per extra `\n`.
+        let blanks_at = (limits.open_depth_total - 2) / 2 - 1;
+        let at = format!("{list}{}", "\n".repeat(blanks_at));
+        assert_eq!(cost(&at).open_depth_total, limits.open_depth_total);
+        assert!(renders_as_markdown(&limits, &at));
+        let over = format!("{list}{}", "\n".repeat(blanks_at + 1));
+        assert!(!renders_as_markdown(&limits, &over));
+        assert_plain(&limits, &over);
+    }
+
+    /// A footnote label ends at its first unescaped `]`, as the parser reads
+    /// it, so an escaped one cannot hide the markers after the label.
+    #[test]
+    fn footnote_labels_are_read_like_the_parser() {
+        let hidden = format!("[^a\\]:b]: {}x", "- ".repeat(SMALL.line_nesting));
+        assert_eq!(line_container_depth(&hidden), SMALL.line_nesting + 1);
+        assert_plain(&SMALL, &hidden);
+        assert_eq!(line_container_depth("[^a\\\\]: - x"), 2);
+        assert_eq!(line_container_depth("[^a\\[b]: - x"), 2);
+        assert_eq!(line_container_depth("[^]: - x"), 0);
+        assert_eq!(line_container_depth("[^a b]: - x"), 0);
+        assert_eq!(line_container_depth("[^a[b]: - x"), 0);
+        assert_eq!(line_container_depth("[^a] - x"), 0);
+        // The parser agrees that the escaped label opens a definition.
+        let html = markdown::to_html_with_options(
+            "x[^a\\]:b]\n\n[^a\\]:b]: - y",
+            &markdown::Options::gfm(),
+        )
+        .unwrap();
+        assert!(html.contains("<li>y"), "{html}");
     }
 
     /// The values the limits are set to. Changing one changes what readers
@@ -689,6 +880,8 @@ mod tests {
             source_bytes,
             line_nesting,
             container_markers,
+            open_depth,
+            open_depth_total,
             block_cost,
             table_cells,
             reference_lookups,
@@ -697,6 +890,8 @@ mod tests {
         assert_eq!(source_bytes, 131_072);
         assert_eq!(line_nesting, 16);
         assert_eq!(container_markers, 4_096);
+        assert_eq!(open_depth, 48);
+        assert_eq!(open_depth_total, 32_768);
         assert_eq!(block_cost, 12_288 * 12_288);
         assert_eq!(table_cells, 65_536);
         assert_eq!(reference_lookups, 1_048_576);
@@ -1030,6 +1225,7 @@ mod tests {
         let two = cost(&doc(2));
         let four = cost(&doc(4));
         assert_eq!(four.container_markers, 4 * one.container_markers);
+        assert_eq!(four.open_depth_total, 4 * one.open_depth_total);
         assert_eq!(four.table_cells, 4 * one.table_cells);
         // Runs do not grow, so block cost is linear (the last run differs).
         assert_eq!(four.block - two.block, 2 * (two.block - one.block));
@@ -1043,6 +1239,8 @@ mod tests {
         assert!(at_limit(|c| c.container_markers as u64) <= LIMITS.container_markers as u64);
         assert!(at_limit(|c| c.table_cells as u64) <= LIMITS.table_cells as u64);
         assert!(at_limit(|c| c.deepest_line as u64) <= LIMITS.line_nesting as u64);
+        assert!(at_limit(|c| c.deepest_open as u64) <= LIMITS.open_depth as u64);
+        assert!(at_limit(|c| c.open_depth_total as u64) <= LIMITS.open_depth_total as u64);
 
         let text = doc(4);
         let html = render_page_html(&text, &text, true, None);
@@ -1079,14 +1277,14 @@ mod tests {
             None,
         );
         assert_eq!(max_seen, Some(SMALL.source_bytes));
-        assert_eq!(html, "<p>[[Page]] &lt;b&gt;</p>");
+        assert_eq!(html, plain_text_to_html("[[Page]] <b>"));
 
         // Resolved text goes through the limits, and the plain text shown is
         // the content as written.
         let deep = format!("{}x", "- ".repeat(SMALL.line_nesting + 1));
         let html =
             render_page_view_html_with(&SMALL, "[[P]]", |_, _| Some(deep.clone()), true, None);
-        assert_eq!(html, "<p>[[P]]</p>");
+        assert_eq!(html, plain_text_to_html("[[P]]"));
         let html =
             render_page_view_html_with(&SMALL, "[[P]]", |_, _| Some("[P](#p)".into()), true, None);
         assert!(html.contains("<a href=\"#p\">P</a>"), "{html}");
@@ -1098,7 +1296,10 @@ mod tests {
     fn plain_text_is_escaped_with_line_breaks() {
         let costly = format!("<b>[[Page]]</b> & \"x\"\r\n{}", "- ".repeat(40));
         let html = render_page_html(&costly, "<b>[[Page]]</b>\r\nsecond", true, None);
-        assert_eq!(html, "<p>&lt;b&gt;[[Page]]&lt;/b&gt;<br />\nsecond</p>");
+        assert_eq!(
+            html,
+            "<p style=\"white-space: pre-wrap\">&lt;b&gt;[[Page]]&lt;/b&gt;\nsecond</p>"
+        );
         assert!(!render_page_html(&costly, &costly, true, None).contains("<b>"));
     }
 
