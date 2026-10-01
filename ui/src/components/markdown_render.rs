@@ -829,9 +829,9 @@ mod tests {
         assert!(renders_as_markdown(&limits, &staircase(7)));
         assert!(!renders_as_markdown(&limits, &staircase(8)));
         assert_plain(&limits, &staircase(8));
-        let tabs = format!("- x\n\t\t\t\t- y\n");
-        assert!(cost(&tabs).deepest_open > limits.open_depth);
-        assert!(!renders_as_markdown(&limits, &tabs));
+        let tabs = "- x\n\t\t\t\t- y\n";
+        assert!(cost(tabs).deepest_open > limits.open_depth);
+        assert!(!renders_as_markdown(&limits, tabs));
 
         // Total: blank lines after a shallow list.
         let limits = Limits {
