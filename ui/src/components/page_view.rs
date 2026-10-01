@@ -1471,6 +1471,16 @@ mod tests {
             assert_eq!(resolve(content, &pages, full.len() - 1), None);
             // Text without links is checked too.
             assert_eq!(resolve("abc", &pages, 2), None);
+
+            // Resolving stops as soon as the output is too long, without
+            // searching the rest.
+            let long = "[[missing]] ".repeat(16);
+            let mut stopped = 0;
+            assert_eq!(
+                resolve_page_links(&long, PREFIX, Some(&pages), 256, &mut stopped),
+                None
+            );
+            assert!(stopped < work(&long, &pages) / 4, "{stopped}");
         }
 
         /// Copying page titles counts as work, so many links to a page with a

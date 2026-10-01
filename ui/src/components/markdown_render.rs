@@ -1002,6 +1002,7 @@ mod tests {
         let render = |cap| render_page_html_with(&with_cap(cap), text, text, true, None);
         // Parser output over the cap.
         assert_eq!(render(raw.len() - 1), plain_text_to_html(text));
+        assert!(render_gfm_bounded(text, &with_cap(raw.len() - 1)).is_none());
         assert!(render_gfm_bounded(text, &with_cap(raw.len())).is_some());
         // Parser output within the cap, finished HTML over it.
         assert_eq!(render(raw.len()), plain_text_to_html(text));
