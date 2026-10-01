@@ -1117,12 +1117,21 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\n")
         }
+        /// Whether `code` names the crate `krate`: a path through it, or a
+        /// `use` or `extern crate` of it (which could rename it).
         fn uses_crate(code: &str, krate: &str) -> bool {
-            code.match_indices(&format!("{krate}::")).any(|(i, _)| {
-                !code[..i]
-                    .chars()
-                    .next_back()
-                    .is_some_and(|c| c.is_alphanumeric() || c == '_')
+            let is_ident = |c: char| c.is_alphanumeric() || c == '_';
+            code.match_indices(krate).any(|(i, _)| {
+                let before = code[..i].chars().next_back();
+                let after = &code[i + krate.len()..];
+                if before.is_some_and(is_ident) || after.starts_with(is_ident) {
+                    return false;
+                }
+                let line_start = code[..i].rfind('\n').map_or(0, |n| n + 1);
+                let line = code[line_start..].trim_start();
+                after.starts_with("::")
+                    || line.starts_with("use ")
+                    || line.starts_with("extern crate")
             })
         }
         /// The body of `fn name` in `code`: from its signature to the first
@@ -1182,6 +1191,10 @@ mod tests {
         assert!(scanned > 10, "scanned only {scanned} files");
         assert!(uses_crate("x = markdown::to_html(t)", "markdown"));
         assert!(!uses_crate("super::render_markdown::x()", "markdown"));
+        assert!(uses_crate("use markdown as md;", "markdown"));
+        assert!(uses_crate("use {markdown, x};", "markdown"));
+        assert!(uses_crate("extern crate markdown as md;", "markdown"));
+        assert!(!uses_crate("let markdown = 1;", "markdown"));
     }
 
     /// The patched `markdown` build is the one compiled in. The parser fixes

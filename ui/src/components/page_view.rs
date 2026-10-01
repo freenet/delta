@@ -1487,19 +1487,22 @@ mod tests {
         /// long title that adds little output still stop.
         #[test]
         fn title_work_is_capped() {
-            let title = "!".repeat(100);
-            let pages = pages(&[(1, title.as_str())]);
-            // Each link is 7 bytes searched and 100 of title, and its slug
-            // is empty, so its output is short.
             let max = 128;
             let budget = max * RESOLVE_WORK_PER_BYTE;
-            for links in 1..=8 {
+            // Each link is 7 bytes searched plus its page's title, and the
+            // slug of a title of `!` is empty, so the output stays short.
+            let work_for = |links: usize, title_len: usize| links * (7 + title_len);
+            for (links, title_len) in [(1, 100), (2, 100), (4, 100), (8, 100), (4, 121), (4, 122)] {
+                let title = "!".repeat(title_len);
+                let pages = pages(&[(1, title.as_str())]);
                 let content = "[[1|d]]".repeat(links);
-                let expected_work = links * (7 + 100);
-                assert_eq!(work(&content, &pages), expected_work);
+                assert_eq!(work(&content, &pages), work_for(links, title_len));
                 let resolved = resolve(&content, &pages, max);
-                assert_eq!(resolved.is_some(), expected_work <= budget, "{links}");
+                let within = work_for(links, title_len) <= budget;
+                assert_eq!(resolved.is_some(), within, "{links} x {title_len}");
             }
+            // The boundary itself: exactly the budget is allowed.
+            assert_eq!(work_for(4, 121), budget);
         }
 
         /// The page view renders through the bounded renderer: costly content
