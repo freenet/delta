@@ -198,12 +198,17 @@ pub fn PageView() -> Element {
 /// (`[Link to Heading](#heading)`) work natively, and beautifying bare
 /// Freenet web-contract URLs (`http://gateway/v1/contract/web/<id>/...`)
 /// into `freenet:<id-prefix>[/path]` labels with same-origin hrefs.
+///
+/// Content too costly to render as markdown is shown as plain text (see
+/// `markdown_render`).
 fn render_markdown(content: &str) -> String {
     let resolved = resolve_page_links(content);
-    let html = markdown::to_html_with_options(&resolved, &markdown::Options::gfm())
-        .unwrap_or_else(|_| markdown::to_html(&resolved));
-    let html = inject_heading_ids(&html);
-    finalize_anchors(&html, behind_gateway(), own_contract_id().as_deref())
+    super::markdown_render::render_page_html(
+        &resolved,
+        content,
+        behind_gateway(),
+        own_contract_id().as_deref(),
+    )
 }
 
 /// True when Delta is currently being served from a path under

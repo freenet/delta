@@ -132,18 +132,16 @@ pub fn Editor() -> Element {
 
     let title = state::EDITOR_TITLE.read().clone();
     let content = state::EDITOR_CONTENT.read().clone();
-    let preview_html = markdown::to_html_with_options(&content, &markdown::Options::gfm())
-        .unwrap_or_else(|_| markdown::to_html(&content));
-    // Inject heading ids so in-page anchor links (`[Link](#heading)`) work
-    // in the live preview as well as in the rendered page view, and
-    // beautify any Freenet URLs the user has typed. Honor the same
-    // gateway-detection flag the rendered page view uses — passing
-    // `true` unconditionally would show a same-origin `/v1/contract/
-    // web/...` path in `dx serve` previews where there's no gateway
-    // behind Delta to resolve it.
-    let preview_html = super::page_view::inject_heading_ids(&preview_html);
-    let preview_html = super::page_view::finalize_anchors(
-        &preview_html,
+    // Render through the same bounded path as the page view, which also
+    // injects heading ids so in-page anchor links (`[Link](#heading)`) work
+    // in the live preview, and beautifies any Freenet URLs the user has
+    // typed. Honor the same gateway-detection flag the rendered page view
+    // uses — passing `true` unconditionally would show a same-origin
+    // `/v1/contract/web/...` path in `dx serve` previews where there's no
+    // gateway behind Delta to resolve it.
+    let preview_html = super::markdown_render::render_page_html(
+        &content,
+        &content,
         super::page_view::behind_gateway(),
         super::page_view::own_contract_id().as_deref(),
     );

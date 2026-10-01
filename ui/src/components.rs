@@ -1,6 +1,7 @@
 mod add_site_dialog;
 mod editor;
 pub(crate) mod export_key;
+mod markdown_render;
 mod page_view;
 mod pages_sidebar;
 mod sites_sidebar;
