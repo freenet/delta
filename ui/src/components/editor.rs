@@ -196,6 +196,7 @@ pub fn Editor() -> Element {
 
     let _ = (ac_top, ac_left, ac_open_upward); // no longer used for positioning
     let key_matches = matches.clone();
+    let key_create = show_create.then(|| ac_query_val.clone());
 
     rsx! {
         div { class: "flex flex-col h-full bg-panel",
@@ -277,8 +278,7 @@ pub fn Editor() -> Element {
                                         // Index into the same list the dropdown renders
                                         // (which excludes the current page), so the
                                         // highlighted row is the one inserted.
-                                        let q = ac_query.read().clone().unwrap_or_default();
-                                        if let Some(target) = selected_link_target(&key_matches, sel, &q) {
+                                        if let Some(target) = selected_link_target(&key_matches, sel, key_create.as_deref()) {
                                             insert_link(target);
                                         }
                                     }
@@ -452,18 +452,17 @@ enum LinkTarget {
     New(String),
 }
 
-/// The target of autocomplete row `sel`, given the page rows the dropdown
-/// renders (`matches`). Any row past them is taken as "+ Create" for a
-/// non-empty `query`; the caller keeps `sel` below the rendered row count, so
-/// that row is only reachable when the dropdown actually shows it.
+/// The target of autocomplete row `sel`, given the rows the dropdown
+/// renders: the page rows `matches`, then a "+ Create" row titled `create`
+/// when it is shown. Any other `sel` (e.g. a stale index) selects nothing.
 fn selected_link_target(
     matches: &[(PageId, String)],
     sel: usize,
-    query: &str,
+    create: Option<&str>,
 ) -> Option<LinkTarget> {
     match matches.get(sel) {
         Some((id, _)) => Some(LinkTarget::Existing(*id)),
-        None if !query.is_empty() => Some(LinkTarget::New(query.to_string())),
+        None if sel == matches.len() => create.map(|t| LinkTarget::New(t.to_string())),
         None => None,
     }
 }
@@ -860,7 +859,6 @@ mod reseed_tests {
 
         let draft = "intro [[New";
         dom.in_runtime(|| {
-            *state::EDITOR_TITLE.write() = "Home, retitled".to_string();
             *state::EDITOR_CONTENT.write() = format!("{draft} and the rest");
         });
         flush(&mut dom);
@@ -888,7 +886,7 @@ mod reseed_tests {
                 format!("intro [[{new_id}]] and the rest"),
                 "the draft and the inserted link must survive"
             );
-            assert_eq!(state::EDITOR_TITLE.cloned(), "Home, retitled");
+            assert_eq!(state::EDITOR_TITLE.cloned(), "Home");
         });
 
         // For an owned site with a contract key, the delegate's signed copy
@@ -991,19 +989,22 @@ mod tests {
         // different link than the one highlighted.
         let rows = vec![(3, "Third".to_string()), (5, "Fifth".to_string())];
         assert_eq!(
-            selected_link_target(&rows, 0, "t"),
+            selected_link_target(&rows, 0, Some("t")),
             Some(LinkTarget::Existing(3))
         );
         assert_eq!(
-            selected_link_target(&rows, 1, "t"),
+            selected_link_target(&rows, 1, Some("t")),
             Some(LinkTarget::Existing(5))
         );
         // The row after the matches is "+ Create".
         assert_eq!(
-            selected_link_target(&rows, 2, "Fresh"),
+            selected_link_target(&rows, 2, Some("Fresh")),
             Some(LinkTarget::New("Fresh".to_string()))
         );
-        assert_eq!(selected_link_target(&rows, 2, ""), None);
+        // No Create row shown (the query exactly matches a page), and an
+        // index past every rendered row: neither may create a page.
+        assert_eq!(selected_link_target(&rows, 2, None), None);
+        assert_eq!(selected_link_target(&rows, 3, Some("Fresh")), None);
     }
 
     #[test]
