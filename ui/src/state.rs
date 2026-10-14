@@ -529,8 +529,9 @@ pub fn create_page(title: String) {
 
 /// Add a new page to the current site without navigating to it, returning
 /// its id, or `None` if no page was added (no current site, or the user does
-/// not own it), in which case nothing at all changed. For owned sites with a contract key, sends to delegate for
-/// signing. For example data, creates with placeholder signature.
+/// not own it), in which case nothing at all changed. For owned sites with a
+/// contract key, sends to delegate for signing. For example data, creates
+/// with placeholder signature.
 ///
 /// Leaves `CURRENT_PAGE` and `EDITING` alone so a caller that is mid-edit on
 /// another page (the editor's "+ Create" autocomplete) keeps its draft open.

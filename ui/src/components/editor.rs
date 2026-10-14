@@ -452,8 +452,10 @@ enum LinkTarget {
     New(String),
 }
 
-/// The target of autocomplete row `sel`, given the rows the dropdown renders
-/// (`matches`, then a "+ Create" row for a non-empty `query`).
+/// The target of autocomplete row `sel`, given the page rows the dropdown
+/// renders (`matches`). Any row past them is taken as "+ Create" for a
+/// non-empty `query`; the caller keeps `sel` below the rendered row count, so
+/// that row is only reachable when the dropdown actually shows it.
 fn selected_link_target(
     matches: &[(PageId, String)],
     sel: usize,
@@ -939,6 +941,23 @@ mod reseed_tests {
             assert_eq!(state::SITES.read()[PREFIX].state.pages.len(), 1);
             assert_eq!(*state::CURRENT_PAGE.read(), Some(1));
             assert_eq!(state::EDITOR_CONTENT.cloned(), "intro [[New");
+        });
+    }
+
+    #[test]
+    fn create_from_autocomplete_without_an_open_link_adds_no_page() {
+        // A stale cursor with no `[[query` before it must not create an
+        // orphan page that nothing links to.
+        let mut dom = open_editor_on(site(&[(1, "Home", "persisted text")]), 1);
+
+        dom.in_runtime(|| *state::EDITOR_CONTENT.write() = "no brackets".to_string());
+        dom.in_runtime(|| insert_link_target(LinkTarget::New("New".into()), 5));
+        flush(&mut dom);
+
+        dom.in_runtime(|| {
+            assert_eq!(state::SITES.read()[PREFIX].state.pages.len(), 1);
+            assert_eq!(state::EDITOR_CONTENT.cloned(), "no brackets");
+            assert_eq!(*state::CURRENT_PAGE.read(), Some(1));
         });
     }
 
