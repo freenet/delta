@@ -19,10 +19,10 @@ Page signatures use v2 format (`delta:page:v2:`) which covers: page_id, title, c
 
 **`updated_at` must be strictly greater than the page's current `updated_at`.** `apply_delta` and `merge` in `delta-core` dominate equal timestamps with `>=`, so an UPDATE whose `updated_at` matches what's already in state is silently dropped on the network. Any UI path that produces a page UPDATE MUST route through `next_page_updated_at` in `ui/src/state.rs`, which computes `max(now_secs(), existing + 1)`. Calling `now_secs()` directly reintroduces silent same-second collisions.
 
-**Page `order` invariants** (`swap_page_order` / `create_page` in `ui/src/state.rs`):
+**Page `order` invariants** (`swap_page_order` / `add_page` in `ui/src/state.rs`; `create_page` is `add_page` plus navigation):
 
 1. `swap_page_order` MUST sign and propagate a fresh page-UPDATE for **every** page whose order changes, not just the two clicked. When any page is still at `order == 0` (legacy/pre-order pages), the swap also performs a one-time site-wide migration to explicit orders `(10, 20, 30, …)`. Skipping propagation leaves unmigrated pages at `order = 0` and they clump to the front of the sidebar after refresh.
-2. `create_page` MUST assign `order = max(existing) + ORDER_STEP` via `next_create_order`, never `0` — issuing `0` re-poisons a migrated site.
+2. `add_page` MUST assign `order = max(existing) + ORDER_STEP` via `next_create_order`, never `0` — issuing `0` re-poisons a migrated site.
 3. `plan_swap` derives `pages_to_sign` from the diff between current and new orders; unit tests catch a regression that re-narrows the sign set.
 
 **Delegate-response routing MUST use signature verification, not `CURRENT_SITE`.** `handle_signed_page` / `handle_signed_deletion` / `handle_signed_config` in `ui/src/freenet_api/delegate.rs` look up the owning site by checking the signature against every known owner's pubkey (`find_owner_for_signed_*`). Keying by `(CURRENT_SITE, page_id)` instead drops concurrent UPDATEs for the same page and misroutes a signed page during a mid-flight site switch.
