@@ -327,7 +327,11 @@ impl<'a, C: DeltaDelegateChannel> DeltaPredecessorIo<'a, C> {
 /// So a V1–V3 predecessor's signing key cannot be read through the delegate
 /// protocol at all: those generations had no export request. Neither this
 /// adapter nor the hand-rolled sweep can recover it; only a node-side
-/// copy-forward that reads storage directly could.
+/// copy-forward that reads storage directly could. Such a predecessor is
+/// sealed with what it CAN export (V3's site list, or nothing), and the report
+/// reads complete for it even when its `GetPublicKey` proved a key is stored.
+/// Failing its fetch instead would only re-walk it forever with the same
+/// result, and would withhold V3's site list as well.
 ///
 /// `generation_capabilities_match_the_registry` pins the index-to-blob
 /// identity this table rests on (the blob inspection itself was a one-off
@@ -1239,7 +1243,7 @@ pub fn delta_delegate_lineage(table: &[([u8; 32], [u8; 32])]) -> Vec<DelegateLin
 /// whatever identity the reply itself carries).
 ///
 /// The migration awaits its own round-trips sequentially, so it never has more
-/// than ONE request outstanding and the registry holds at most one slot. That
+/// than ONE request outstanding and the registry holds at most one live slot. That
 /// does NOT make kind-matching sound on its own: the shipped sweep in
 /// `super::delegate` runs CONCURRENTLY from the same trigger and sends the
 /// SAME request kinds to the SAME delegates (`fire_legacy_migration`,
@@ -1405,7 +1409,7 @@ pub mod correlation {
             // The signing-key load path answers GetPublicKey, GetSigningKey
             // and GetSigningKeyForPrefix (and the Sign* requests, which the
             // migration never awaits). The V1–V5 wording is narrowed too: a
-            // concurrent sweep probe's "no key" from a V4/V5 delegate would
+            // concurrent sweep probe's "no key" from a V3–V5 delegate would
             // otherwise resolve an awaited GetKnownSites/GetSiteState and,
             // since an unanswered export sub-request fails the fetch, turn a
             // healthy predecessor `Unresponsive` for that load.
@@ -1491,9 +1495,9 @@ pub mod correlation {
             // An await that already timed out has resolved as silence and
             // nobody is listening on it. Left parked, it would swallow the
             // next matching reply (oldest waiter first) — which may belong to
-            // a LIVE await, or to the shipped sweep — and since a timed-out
-            // export sub-request fails the whole fetch, that would turn one
-            // timeout into a second, spurious one.
+            // a LIVE await — and since a timed-out export sub-request fails
+            // the whole fetch, that would turn one timeout into a second,
+            // spurious one.
             pending.retain(|p| !p.slot.borrow().timed_out);
             let Some(index) = pending.iter().position(|p| {
                 p.target == responding_key.bytes() && p.expectation.matches(response)
@@ -2556,6 +2560,16 @@ mod tests {
                 "GetSigningKeyForPrefix",
                 DelegateResponse::Error("something went wrong".into()),
             ),
+            (
+                "GetKnownSites",
+                DelegateResponse::Error("something went wrong".into()),
+            ),
+            (
+                "GetSigningKey",
+                DelegateResponse::Error("something went wrong".into()),
+            ),
+            ("GetSigningKeyForPrefix", DelegateResponse::SitesStored),
+            ("GetSiteState", DelegateResponse::KeyStored),
             // Absence of ANOTHER site's backup says nothing about p1's.
             (
                 "GetSiteState",
@@ -2668,9 +2682,8 @@ mod tests {
     /// never be SENT a request its WASM cannot deserialize, because that
     /// silence is permanent and would make it `Unresponsive` on every load,
     /// withholding the data it CAN give. Covers every capability band:
-    /// V1 (only `GetPublicKey`), V3 (adds `GetKnownSites`, but has no
-    /// `GetSigningKey` yet), V5 (adds `GetSigningKey` and `GetSiteState`), and
-    /// a modern generation.
+    /// V1 (only `GetPublicKey`), V3 (adds `GetKnownSites`), V4 (adds
+    /// `GetSigningKey`), V5 (adds `GetSiteState`), and a modern generation.
     #[test]
     fn old_generations_are_only_sent_requests_they_understand() {
         // V1 holds a key in its single slot, but has no request to export it.
@@ -2687,6 +2700,16 @@ mod tests {
             legacy_key: Some(diff::signing_key_seed(3)),
             ..Default::default()
         };
+        // V4: `GetSigningKey` exists, `GetSiteState` does not yet.
+        let p4 = diff::prefix_of_seed(4);
+        let v4 = diff::DelegateFixture {
+            reachable: true,
+            generation: Some(PredecessorCapabilities::FIRST_WITH_SIGNING_KEY),
+            known_sites: vec![diff::site(&p4, "V4 site")],
+            legacy_key: Some(diff::signing_key_seed(4)),
+            site_states: [(p4.clone(), vec![0x44; 4])].into_iter().collect(),
+            ..Default::default()
+        };
         let p2 = diff::prefix_of_seed(2);
         let v5 = diff::DelegateFixture {
             reachable: true,
@@ -2697,7 +2720,7 @@ mod tests {
             ..Default::default()
         };
         let fixture = diff::Fixture {
-            predecessors: vec![v1, v3, v5, diff::DelegateFixture::modern()],
+            predecessors: vec![v1, v3, v4, v5, diff::DelegateFixture::modern()],
             successor: diff::DelegateFixture::modern(),
         };
         let lineage = fixture.lineage();
@@ -2706,6 +2729,7 @@ mod tests {
             vec![
                 0,
                 PredecessorCapabilities::FIRST_WITH_KNOWN_SITES,
+                PredecessorCapabilities::FIRST_WITH_SIGNING_KEY,
                 PredecessorCapabilities::FIRST_WITH_SITE_STATE,
                 PredecessorCapabilities::FIRST_WITH_PER_PREFIX_KEY
             ]
@@ -2734,6 +2758,12 @@ mod tests {
                 );
             }
             if *target == diff::gen_hash(2) {
+                assert!(
+                    matches!(*label, "GetPublicKey" | "GetKnownSites" | "GetSigningKey"),
+                    "V4 was sent {label}, which it cannot deserialize"
+                );
+            }
+            if *target == diff::gen_hash(3) {
                 assert_ne!(
                     *label, "GetSigningKeyForPrefix",
                     "V5 was sent GetSigningKeyForPrefix, which it cannot deserialize"
@@ -2754,6 +2784,15 @@ mod tests {
             landed.per_prefix_keys.get(&p3),
             None,
             "V3's key has no export request either"
+        );
+        assert_eq!(
+            landed.per_prefix_keys.get(&p4),
+            Some(&diff::signing_key_seed(4)),
+            "V4's legacy-slot key must land"
+        );
+        assert!(
+            !landed.site_states.contains_key(&p4),
+            "V4 has no GetSiteState, so nothing may claim to recover a backup from it"
         );
         assert_eq!(
             landed.per_prefix_keys.get(&p2),
@@ -2870,12 +2909,12 @@ mod tests {
         let node = diff::FakeNode::new(&fixture);
         let predecessor = diff::delegate_key(diff::gen_hash(0));
         let predecessor_bytes = predecessor.bytes().to_vec();
-        let p2_for_silence = p2.clone();
+        let p1_for_silence = p1.clone();
         let channel = SilencingChannel {
             inner: &node,
             silence: |target: &DelegateKey, request: &DelegateRequest| {
                 target.bytes() == predecessor_bytes.as_slice()
-                    && matches!(request, DelegateRequest::GetSiteState { prefix } if *prefix == p2_for_silence)
+                    && matches!(request, DelegateRequest::GetSiteState { prefix } if *prefix == p1_for_silence)
             },
         };
         let mut markers = diff::MemoryMarkers::default();
@@ -2884,8 +2923,9 @@ mod tests {
             &mut markers,
             diff::delegate_key(diff::successor_key_bytes()),
             &fixture.lineage(),
-            // p1 is listed by the predecessor; p2 is known locally, so it is
-            // probed second.
+            // p2 is known locally, so it is probed FIRST (extra prefixes
+            // seed the list) and fully answered; p1, listed by the
+            // predecessor, comes second and its backup goes unanswered.
             vec![p2.clone()],
         ));
         assert!(report.any_unresponsive());
@@ -2893,12 +2933,13 @@ mod tests {
             markers.load(&predecessor).unwrap(),
             Some(MigrationMarker::Done { .. })
         ));
-        let _ = p1;
+        // Every other request was answered, so `Unresponsive` here can only
+        // come from the second prefix's silenced backup: the loop reached it.
     }
 
     /// A timed-out await must stop competing for replies. Left parked, it
     /// swallowed the next matching reply, which could belong to a live await
-    /// (turning one timeout into two) or to the shipped sweep.
+    /// (turning one timeout into two).
     #[test]
     fn a_timed_out_await_does_not_swallow_a_later_reply() {
         let registry = correlation::PendingRegistry::new();
