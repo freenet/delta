@@ -56,8 +56,9 @@
 //!    marker durability in this module's `MigrationMarkerStore` docs.
 //! 4. **[`SecretSelectionPolicy::UnionAllGenerations`]**, because the default
 //!    halts the walk at the first silent predecessor and silence is the ORDINARY
-//!    case for Delta's old delegates (a V6/V7 delegate cannot answer
-//!    `GetSigningKeyForPrefix` at all).
+//!    case for Delta's old delegates (any generation the reached node never
+//!    registered is silent, and an export sub-request that times out fails
+//!    the whole fetch rather than sealing a partial one — freenet/delta#100).
 //!
 //! # Honest bounds (do not design as though these are covered)
 //!
@@ -217,28 +218,186 @@ pub trait MigrationMarkerStore {
 /// `extra_prefixes` seeds prefixes the caller already knows about locally, so a
 /// site whose key is stranded in a predecessor is still probed even when that
 /// predecessor's own `GetKnownSites` comes back empty or unsupported.
+///
+/// # Silence is never absence
+///
+/// [`fetch_secrets`](PredecessorSecretsIo::fetch_secrets) runs only after
+/// [`probe_executable`](PredecessorSecretsIo::probe_executable) got a reply, so
+/// a later sub-request that goes unanswered is a lost or timed-out request, not
+/// "nothing stored". Returning `Ok` without its contribution would hand the
+/// library a SMALLER export it cannot tell from a complete one, and the library
+/// would seal the predecessor `Done` with the missing secrets never asked for
+/// again (freenet/delta#100). So silence, and any reply that does not answer the
+/// request, fails the whole fetch: the predecessor is reported `Unresponsive`,
+/// earns no marker, and is re-walked on the next load.
+///
+/// The one silence that IS expected is a request the predecessor's WASM cannot
+/// deserialize at all: the node reports that as a client-API error carrying no
+/// delegate key, which the UI drops, so it arrives here as `Ok(None)`. Such a
+/// request is therefore never SENT — [`PredecessorCapabilities`] says which
+/// requests each generation understands — rather than sent and its silence
+/// excused, which would make a timeout and "unsupported" indistinguishable.
 pub struct DeltaPredecessorIo<'a, C: DeltaDelegateChannel> {
     channel: &'a C,
     extra_prefixes: Vec<String>,
+    /// Per-predecessor capabilities, by delegate key. A predecessor missing
+    /// from the map is assumed to understand every request, which is the
+    /// conservative direction: a wrongly-assumed capability costs a retry,
+    /// a wrongly-denied one silently drops data.
+    capabilities: BTreeMap<Vec<u8>, PredecessorCapabilities>,
 }
 
 impl<'a, C: DeltaDelegateChannel> DeltaPredecessorIo<'a, C> {
     /// Wrap `channel`, additionally probing `extra_prefixes` on every predecessor.
-    pub fn new(channel: &'a C, extra_prefixes: Vec<String>) -> Self {
+    ///
+    /// `lineage` supplies each predecessor's generation, from which
+    /// [`PredecessorCapabilities::of_generation`] decides which requests it is
+    /// sent.
+    pub fn new(
+        channel: &'a C,
+        extra_prefixes: Vec<String>,
+        lineage: &[DelegateLineageEntry],
+    ) -> Self {
         Self {
             channel,
             extra_prefixes,
+            capabilities: lineage
+                .iter()
+                .map(|entry| {
+                    (
+                        entry.delegate_key.to_vec(),
+                        PredecessorCapabilities::of_generation(entry.generation),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    fn capabilities_of(&self, predecessor: &DelegateKey) -> PredecessorCapabilities {
+        self.capabilities
+            .get(predecessor.bytes())
+            .copied()
+            .unwrap_or(PredecessorCapabilities::ALL)
+    }
+}
+
+/// Which of the export requests a predecessor delegate generation understands.
+///
+/// `GetPublicKey` and `GetSigningKey` are understood by every generation (V1+)
+/// and are not listed. The others were added over time; an older WASM fails to
+/// deserialize them, which reaches the UI as silence (see
+/// [`DeltaPredecessorIo`]).
+///
+/// The thresholds are 0-based generation indices into `legacy_delegates.toml`
+/// (index 0 is "V1"). Each `legacy_delegates.toml` entry records the delegate
+/// that was REPLACED by the commit that added it, so the entry named after a
+/// feature ("V4: Before adding StoreSiteState/GetSiteState") is the last one
+/// WITHOUT it. Verified directly against the WASM blobs: the delegate WASM is
+/// checked in at `ui/public/contracts/site_delegate.wasm`, and for every
+/// registry entry the git blob whose BLAKE3 equals its `code_hash` was found
+/// and searched for the request variant's name (serde embeds it):
+///
+/// | entry | index | `GetKnownSites` | `GetSiteState` | `GetSigningKeyForPrefix` |
+/// |-------|-------|-----------------|----------------|--------------------------|
+/// | V1–V2 | 0–1   | no              | no             | no                       |
+/// | V3–V4 | 2–3   | yes             | no             | no                       |
+/// | V5–V7 | 4–6   | yes             | yes            | no                       |
+/// | V8+   | 7+    | yes             | yes            | yes                      |
+///
+/// `generation_capabilities_match_the_registry` pins the index-to-WASM
+/// identity this table rests on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PredecessorCapabilities {
+    /// Understands `GetKnownSites`.
+    pub known_sites: bool,
+    /// Understands `GetSiteState`.
+    pub site_state: bool,
+    /// Understands `GetSigningKeyForPrefix`.
+    pub per_prefix_key: bool,
+}
+
+impl PredecessorCapabilities {
+    /// First generation index (V3) that understands `GetKnownSites`.
+    pub const FIRST_WITH_KNOWN_SITES: u32 = 2;
+    /// First generation index (V5) that understands `GetSiteState`.
+    pub const FIRST_WITH_SITE_STATE: u32 = 4;
+    /// First generation index (V8) that understands `GetSigningKeyForPrefix`.
+    pub const FIRST_WITH_PER_PREFIX_KEY: u32 = 7;
+
+    /// Every request: the current delegate, or one of unknown generation.
+    pub const ALL: Self = Self {
+        known_sites: true,
+        site_state: true,
+        per_prefix_key: true,
+    };
+
+    /// What the predecessor at generation index `generation` understands.
+    pub fn of_generation(generation: u32) -> Self {
+        Self {
+            known_sites: generation >= Self::FIRST_WITH_KNOWN_SITES,
+            site_state: generation >= Self::FIRST_WITH_SITE_STATE,
+            per_prefix_key: generation >= Self::FIRST_WITH_PER_PREFIX_KEY,
         }
     }
 }
 
+/// Why [`DeltaPredecessorIo::fetch_secrets`] could not establish an export.
+///
+/// Every variant means "the export is incomplete, retry later" — the library
+/// records the predecessor `Unresponsive` and gives it no marker. Deliberately
+/// carries no reply payload: a mis-routed `SigningKey` reply holds key material,
+/// and this value is `Debug`-formatted into the migration report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FetchError<E> {
+    /// The transport itself failed.
+    Transport(E),
+    /// No reply to `request` within the transport's bound.
+    NoReply(&'static str),
+    /// `request` got a reply that does not answer it.
+    UnexpectedReply(&'static str),
+    /// `request` got an in-band error that is not one of the delegate's
+    /// recognised "nothing stored" / "stored value unusable" answers.
+    DelegateError {
+        /// The request that was answered.
+        request: &'static str,
+        /// The delegate's error text.
+        message: String,
+    },
+}
+
+/// Whether `msg` is a signing-key-load answer that means "there is no usable
+/// key here": absence, in either generation's wording, or a stored value that
+/// is not a key. Both are stable facts about the predecessor's storage, so they
+/// are answers, not failures to answer.
+fn is_no_usable_signing_key(msg: &str) -> bool {
+    msg == correlation::ERR_NO_SIGNING_KEY
+        || msg == correlation::ERR_NO_SIGNING_KEY_V1_V5
+        || msg == correlation::ERR_STORED_KEY_BAD_LEN
+}
+
+impl<C: DeltaDelegateChannel> DeltaPredecessorIo<'_, C> {
+    /// One export sub-request, as a definite answer or a [`FetchError`].
+    async fn ask(
+        &self,
+        predecessor: &DelegateKey,
+        request: DelegateRequest,
+        name: &'static str,
+    ) -> Result<DelegateResponse, FetchError<C::Error>> {
+        self.channel
+            .request(predecessor, request)
+            .await
+            .map_err(FetchError::Transport)?
+            .ok_or(FetchError::NoReply(name))
+    }
+}
+
 impl<C: DeltaDelegateChannel> PredecessorSecretsIo for DeltaPredecessorIo<'_, C> {
-    type Error = C::Error;
+    type Error = FetchError<C::Error>;
 
     /// Cheap executability preflight: `GetPublicKey`.
     ///
     /// Chosen because it is the ONLY request every delegate generation back to V1
-    /// understands. `GetKnownSites` (V3+) and `GetSigningKeyForPrefix` (V7+) would
+    /// understands. `GetKnownSites` (V3+) and `GetSigningKeyForPrefix` (V8+) would
     /// misreport a V1/V2 predecessor as unresponsive when it is merely older.
     ///
     /// Any reply counts as executed, INCLUDING [`DelegateResponse::Error`] — a
@@ -248,48 +407,94 @@ impl<C: DeltaDelegateChannel> PredecessorSecretsIo for DeltaPredecessorIo<'_, C>
         Ok(self
             .channel
             .request(predecessor, DelegateRequest::GetPublicKey)
-            .await?
+            .await
+            .map_err(FetchError::Transport)?
             .is_some())
     }
 
+    /// Reconstruct the predecessor's export, or `Err` if any part of it could
+    /// not be established. See [`DeltaPredecessorIo`] for why a partial export
+    /// must never be returned as a smaller `Ok`.
+    ///
+    /// Each sub-request's reply is classified as one of:
+    ///
+    /// * the value — contributes a pair;
+    /// * a recognised "nothing usable stored" answer — contributes nothing, and
+    ///   is a definite answer (absence, or a stored value the delegate itself
+    ///   cannot parse, which no retry will change);
+    /// * anything else — silence, a reply of the wrong kind, an unrecognised
+    ///   error — fails the fetch with [`FetchError`].
     async fn fetch_secrets(
         &mut self,
         predecessor: &DelegateKey,
     ) -> Result<Vec<SecretPair>, Self::Error> {
+        let capabilities = self.capabilities_of(predecessor);
         let mut pairs: Vec<SecretPair> = Vec::new();
         let mut prefixes: Vec<String> = self.extra_prefixes.clone();
 
         // 1. The known-sites list, as ONE pair (it is one delegate entry).
-        if let Some(DelegateResponse::KnownSites(records)) = self
-            .channel
-            .request(predecessor, DelegateRequest::GetKnownSites)
-            .await?
-        {
-            for record in &records {
-                if !record.is_tombstone() && !prefixes.contains(&record.prefix) {
-                    prefixes.push(record.prefix.clone());
+        //    Not sent to V1/V2, which cannot deserialize it.
+        if capabilities.known_sites {
+            const REQ: &str = "GetKnownSites";
+            match self
+                .ask(predecessor, DelegateRequest::GetKnownSites, REQ)
+                .await?
+            {
+                DelegateResponse::KnownSites(records) => {
+                    for record in &records {
+                        if !record.is_tombstone() && !prefixes.contains(&record.prefix) {
+                            prefixes.push(record.prefix.clone());
+                        }
+                    }
+                    // Emit even an empty list only when it carries tombstones:
+                    // an empty, tombstone-free list is genuinely "no data" and
+                    // emitting it would make a data-free predecessor look
+                    // data-bearing to the sticky-data rule.
+                    if !records.is_empty() {
+                        pairs.push((
+                            SECRET_KNOWN_SITES.as_bytes().to_vec(),
+                            encode_known_sites(&records),
+                        ));
+                    }
                 }
-            }
-            // Emit even an empty list only when it carries tombstones: an empty,
-            // tombstone-free list is genuinely "no data" and emitting it would
-            // make a data-free predecessor look data-bearing to the sticky-data
-            // rule.
-            if !records.is_empty() {
-                pairs.push((
-                    SECRET_KNOWN_SITES.as_bytes().to_vec(),
-                    encode_known_sites(&records),
-                ));
+                // The delegate answers an ABSENT list with `KnownSites([])`; its
+                // only error is "the stored list does not decode", which is a
+                // permanent fact about its storage. Failing the fetch on it
+                // would withhold this predecessor's signing keys forever, so
+                // proceed without the list (`extra_prefixes` still drives the
+                // per-site probes below).
+                DelegateResponse::Error(message)
+                    if message.starts_with(correlation::ERR_KNOWN_SITES_DECODE_PREFIX) => {}
+                DelegateResponse::Error(message) => {
+                    return Err(FetchError::DelegateError {
+                        request: REQ,
+                        message,
+                    })
+                }
+                _ => return Err(FetchError::UnexpectedReply(REQ)),
             }
         }
 
         // 2. The legacy single-slot signing key (V1+).
-        if let Some(DelegateResponse::SigningKey(bytes)) = self
-            .channel
-            .request(predecessor, DelegateRequest::GetSigningKey)
-            .await?
         {
-            if !bytes.is_empty() {
-                pairs.push((SECRET_SIGNING_KEY_LEGACY.as_bytes().to_vec(), bytes));
+            const REQ: &str = "GetSigningKey";
+            match self
+                .ask(predecessor, DelegateRequest::GetSigningKey, REQ)
+                .await?
+            {
+                DelegateResponse::SigningKey(bytes) => {
+                    if !bytes.is_empty() {
+                        pairs.push((SECRET_SIGNING_KEY_LEGACY.as_bytes().to_vec(), bytes));
+                    }
+                }
+                DelegateResponse::Error(message) if is_no_usable_signing_key(&message) => {}
+                DelegateResponse::Error(message) => {
+                    return Err(FetchError::DelegateError {
+                        request: REQ,
+                        message,
+                    })
+                }
+                _ => return Err(FetchError::UnexpectedReply(REQ)),
             }
         }
 
@@ -309,48 +514,84 @@ impl<C: DeltaDelegateChannel> PredecessorSecretsIo for DeltaPredecessorIo<'_, C>
         // same reply falls through to the sweep's `SigningKey` arm, which
         // re-stores it content-addressed as well.)
         for prefix in &prefixes {
-            if let Some(DelegateResponse::SigningKey(bytes)) = self
-                .channel
-                .request(
-                    predecessor,
-                    DelegateRequest::GetSigningKeyForPrefix {
-                        prefix: prefix.clone(),
-                    },
-                )
-                .await?
-            {
-                if let Some(derived) = signing_key_prefix(&bytes) {
-                    let slot = per_prefix_signing_key(&derived).into_bytes();
-                    // Distinct probes can surface the same key (the fallback
-                    // serves it for every keyless prefix); emit it once.
-                    if !pairs.iter().any(|(key, _)| *key == slot) {
-                        pairs.push((slot, bytes));
+            // Not sent to V1–V7, which predate it (their keys live in the
+            // legacy single slot read above).
+            if capabilities.per_prefix_key {
+                const REQ: &str = "GetSigningKeyForPrefix";
+                match self
+                    .ask(
+                        predecessor,
+                        DelegateRequest::GetSigningKeyForPrefix {
+                            prefix: prefix.clone(),
+                        },
+                        REQ,
+                    )
+                    .await?
+                {
+                    DelegateResponse::SigningKey(bytes) => {
+                        // Bytes that are not an Ed25519 seed are a corrupt
+                        // stored value: an answer, but nothing to import.
+                        if let Some(derived) = signing_key_prefix(&bytes) {
+                            let slot = per_prefix_signing_key(&derived).into_bytes();
+                            // Distinct probes can surface the same key (the
+                            // fallback serves it for every keyless prefix);
+                            // emit it once.
+                            if !pairs.iter().any(|(key, _)| *key == slot) {
+                                pairs.push((slot, bytes));
+                            }
+                        }
                     }
+                    DelegateResponse::Error(message) if is_no_usable_signing_key(&message) => {}
+                    DelegateResponse::Error(message) => {
+                        return Err(FetchError::DelegateError {
+                            request: REQ,
+                            message,
+                        })
+                    }
+                    _ => return Err(FetchError::UnexpectedReply(REQ)),
                 }
             }
 
-            // A `SiteState` reply DOES echo its prefix; trust the echo, not
-            // the request. (The wasm registry already rejects a mismatched
-            // echo, so there the two always agree; a non-wasm channel gets the
-            // same attribution safety from this.)
-            if let Some(DelegateResponse::SiteState {
-                prefix: echoed,
-                state_bytes,
-            }) = self
-                .channel
-                .request(
-                    predecessor,
-                    DelegateRequest::GetSiteState {
-                        prefix: prefix.clone(),
-                    },
-                )
-                .await?
-            {
-                if !state_bytes.is_empty() {
-                    let slot = site_state_key(&echoed).into_bytes();
-                    if !pairs.iter().any(|(key, _)| *key == slot) {
-                        pairs.push((slot, state_bytes));
+            // Not sent to V1–V4, which predate site-state backups.
+            if capabilities.site_state {
+                const REQ: &str = "GetSiteState";
+                match self
+                    .ask(
+                        predecessor,
+                        DelegateRequest::GetSiteState {
+                            prefix: prefix.clone(),
+                        },
+                        REQ,
+                    )
+                    .await?
+                {
+                    // A `SiteState` reply DOES echo its prefix; trust the
+                    // echo, not the request. (The wasm registry already
+                    // rejects a mismatched echo, so there the two always
+                    // agree; a non-wasm channel gets the same attribution
+                    // safety from this.)
+                    DelegateResponse::SiteState {
+                        prefix: echoed,
+                        state_bytes,
+                    } => {
+                        if !state_bytes.is_empty() {
+                            let slot = site_state_key(&echoed).into_bytes();
+                            if !pairs.iter().any(|(key, _)| *key == slot) {
+                                pairs.push((slot, state_bytes));
+                            }
+                        }
                     }
+                    // Absence names its prefix, so only absence of THIS
+                    // prefix's backup is an answer about it.
+                    DelegateResponse::Error(message)
+                        if correlation::is_no_backup_error_for(&message, prefix) => {}
+                    DelegateResponse::Error(message) => {
+                        return Err(FetchError::DelegateError {
+                            request: REQ,
+                            message,
+                        })
+                    }
+                    _ => return Err(FetchError::UnexpectedReply(REQ)),
                 }
             }
         }
@@ -886,11 +1127,11 @@ impl<C: DeltaDelegateChannel, M: MigrationMarkerStore> DeltaSuccessorIo<'_, C, M
 ///
 /// [`SecretSelectionPolicy::UnionAllGenerations`], because the default
 /// (`NewestSnapshotWins`) halts the walk at the first predecessor that answers
-/// silently, and silence is the ORDINARY case here: V6/V7 delegates predate
-/// `GetSigningKeyForPrefix` and cannot answer it at all, and any predecessor the
-/// reached node never registered is indistinguishable from a broken one. Halting
-/// there would strand every older generation's keys — the freenet/river#204
-/// failure this policy exists for.
+/// silently, and silence is the ORDINARY case here: any predecessor the reached
+/// node never registered is indistinguishable from a broken one, and a timed-out
+/// export sub-request fails that predecessor's whole fetch (see
+/// [`DeltaPredecessorIo`]). Halting there would strand every older generation's
+/// keys — the freenet/river#204 failure this policy exists for.
 ///
 /// The [`UnionAck`] acknowledges both hazards: union resurrects delete-by-absence
 /// data (bounded for Delta by the tombstone convention — see the module docs),
@@ -917,7 +1158,7 @@ pub async fn run_delegate_migration<C: DeltaDelegateChannel, M: MigrationMarkerS
     // `DeltaDelegateChannel::request` takes `&self`: the shared `&C` can sit in
     // both without conflict.
     let newest_generation = predecessors.iter().map(|e| e.generation).max();
-    let mut reader = DeltaPredecessorIo::new(channel, extra_prefixes);
+    let mut reader = DeltaPredecessorIo::new(channel, extra_prefixes, predecessors);
     let mut writer = DeltaSuccessorIo::new(channel, markers, successor, newest_generation);
     freenet_migrate::migrate_delegate_secrets(
         &mut writer,
@@ -1092,6 +1333,13 @@ pub mod correlation {
 
     /// The current delegate's signing-key absence answer (`load_signing_key`).
     pub const ERR_NO_SIGNING_KEY: &str = "no signing key stored -- store key first";
+    /// The same absence answer as worded by delegate V1–V5 (an em dash rather
+    /// than `--`). Frozen in those deployed WASMs, so it can no longer be
+    /// pinned to source; it was checked against each generation's WASM blob.
+    /// Deliberately NOT used to narrow registry matching (unrecognised text
+    /// still matches any kind there); only [`super::DeltaPredecessorIo`]
+    /// uses it, to recognise an old predecessor's "no key" as an answer.
+    pub const ERR_NO_SIGNING_KEY_V1_V5: &str = "no signing key stored \u{2014} store key first";
     /// The current delegate's corrupt-stored-key answer (`parse_signing_key`).
     pub const ERR_STORED_KEY_BAD_LEN: &str = "stored key is not 32 bytes";
     /// The current delegate's `StoreSigningKey` length rejection.
@@ -2097,5 +2345,399 @@ mod tests {
             node.successor_state().site_states.is_empty(),
             "and nothing may be written from an unverified answer"
         );
+    }
+
+    // --- freenet/delta#100: a partial export must never be sealed ---
+
+    /// Wraps the differential [`diff::FakeNode`], turning chosen requests into
+    /// silence (`Ok(None)`), as a lost request or a 10 s timeout would.
+    struct SilencingChannel<'a, F>
+    where
+        F: Fn(&DelegateKey, &DelegateRequest) -> bool,
+    {
+        inner: &'a diff::FakeNode,
+        silence: F,
+    }
+
+    impl<F> DeltaDelegateChannel for SilencingChannel<'_, F>
+    where
+        F: Fn(&DelegateKey, &DelegateRequest) -> bool,
+    {
+        type Error = core::convert::Infallible;
+
+        async fn request(
+            &self,
+            target: &DelegateKey,
+            request: DelegateRequest,
+        ) -> Result<Option<DelegateResponse>, Self::Error> {
+            if (self.silence)(target, &request) {
+                return Ok(None);
+            }
+            self.inner.request(target, request).await
+        }
+    }
+
+    fn request_name(request: &DelegateRequest) -> &'static str {
+        match request {
+            DelegateRequest::GetKnownSites => "GetKnownSites",
+            DelegateRequest::GetSigningKey => "GetSigningKey",
+            DelegateRequest::GetSigningKeyForPrefix { .. } => "GetSigningKeyForPrefix",
+            DelegateRequest::GetSiteState { .. } => "GetSiteState",
+            _ => "other",
+        }
+    }
+
+    /// A modern predecessor holding one of everything `fetch_secrets` reads:
+    /// a listed site `p1` with a per-prefix key and a state backup, plus a
+    /// legacy single-slot key belonging to site `p2`.
+    fn full_predecessor_fixture() -> (diff::Fixture, String, String) {
+        let p1 = diff::prefix_of_seed(1);
+        let p2 = diff::prefix_of_seed(2);
+        let mut predecessor = diff::DelegateFixture::modern();
+        predecessor.known_sites = vec![diff::site(&p1, "Listed")];
+        predecessor
+            .per_prefix_keys
+            .insert(p1.clone(), diff::signing_key_seed(1));
+        predecessor.legacy_key = Some(diff::signing_key_seed(2));
+        predecessor.site_states.insert(p1.clone(), vec![0xAB; 16]);
+        let fixture = diff::Fixture {
+            predecessors: vec![predecessor],
+            successor: diff::DelegateFixture::modern(),
+        };
+        (fixture, p1, p2)
+    }
+
+    fn assert_everything_landed(node: &diff::FakeNode, p1: &str, p2: &str, what: &str) {
+        let landed = node.successor_state();
+        assert_eq!(
+            landed.per_prefix_keys.get(p1),
+            Some(&diff::signing_key_seed(1)),
+            "{what}: p1's per-prefix key must land"
+        );
+        assert_eq!(
+            landed.per_prefix_keys.get(p2),
+            Some(&diff::signing_key_seed(2)),
+            "{what}: the legacy-slot key must land under p2"
+        );
+        assert!(
+            landed.site_states.contains_key(p1),
+            "{what}: p1's state backup must land"
+        );
+        assert!(
+            landed.known_sites.iter().any(|r| r.prefix == p1),
+            "{what}: p1 must be in the successor's site list"
+        );
+    }
+
+    /// The freenet/delta#100 headline. Any export sub-request that goes
+    /// unanswered AFTER the executability probe succeeded made `fetch_secrets`
+    /// return a smaller `Ok`; the library imported it, sealed the predecessor
+    /// `Done`, and never asked for the missing secrets again. Each sub-request
+    /// is silenced in turn: the run must report the predecessor
+    /// `Unresponsive`, leave it unsealed, and a later healthy run (with the
+    /// SAME, durable markers) must recover everything.
+    #[test]
+    fn a_silent_export_sub_request_is_retried_never_sealed() {
+        for silenced in [
+            "GetKnownSites",
+            "GetSigningKey",
+            "GetSigningKeyForPrefix",
+            "GetSiteState",
+        ] {
+            let (fixture, p1, p2) = full_predecessor_fixture();
+            let node = diff::FakeNode::new(&fixture);
+            let predecessor = diff::delegate_key(diff::gen_hash(0));
+            let predecessor_bytes = predecessor.bytes().to_vec();
+            let lineage = fixture.lineage();
+            let mut markers = diff::MemoryMarkers::default();
+
+            let channel = SilencingChannel {
+                inner: &node,
+                silence: |target: &DelegateKey, request: &DelegateRequest| {
+                    target.bytes() == predecessor_bytes.as_slice()
+                        && request_name(request) == silenced
+                },
+            };
+            let first = diff::block_on(run_delegate_migration(
+                &channel,
+                &mut markers,
+                diff::delegate_key(diff::successor_key_bytes()),
+                &lineage,
+                Vec::new(),
+            ));
+            assert!(
+                first.any_unresponsive(),
+                "silenced {silenced}: an export missing a sub-request's answer must be \
+                 reported Unresponsive, not imported as if complete"
+            );
+            assert!(
+                !matches!(
+                    markers.load(&predecessor).unwrap(),
+                    Some(MigrationMarker::Done { .. })
+                ),
+                "silenced {silenced}: a partial export must never earn a Done marker"
+            );
+
+            // The next load, the predecessor answers everything.
+            let second = diff::block_on(run_delegate_migration(
+                &node,
+                &mut markers,
+                diff::delegate_key(diff::successor_key_bytes()),
+                &lineage,
+                Vec::new(),
+            ));
+            assert!(
+                second.is_complete(),
+                "silenced {silenced}: the retry should complete"
+            );
+            assert_everything_landed(&node, &p1, &p2, &format!("silenced {silenced}"));
+        }
+    }
+
+    /// The issue's second case: a reply that does not answer the request.
+    /// Neither a reply of the wrong kind nor an unrecognised in-band error is
+    /// an answer about the data, so both must fail the fetch.
+    #[test]
+    fn a_reply_that_does_not_answer_an_export_sub_request_is_retried() {
+        for (forged_for, forged) in [
+            ("GetKnownSites", DelegateResponse::KeyStored),
+            ("GetSigningKey", DelegateResponse::SitesStored),
+            (
+                "GetSiteState",
+                DelegateResponse::Error("something went wrong".into()),
+            ),
+            (
+                "GetSigningKeyForPrefix",
+                DelegateResponse::Error("something went wrong".into()),
+            ),
+        ] {
+            let (fixture, _, _) = full_predecessor_fixture();
+            let node = diff::FakeNode::new(&fixture);
+            let predecessor = diff::delegate_key(diff::gen_hash(0));
+            let predecessor_bytes = predecessor.bytes().to_vec();
+            let mut markers = diff::MemoryMarkers::default();
+            let channel = HostileChannel {
+                inner: &node,
+                intercept: |target: &DelegateKey, request: &DelegateRequest| {
+                    (target.bytes() == predecessor_bytes.as_slice()
+                        && request_name(request) == forged_for)
+                        .then(|| forged.clone())
+                },
+            };
+            let report = diff::block_on(run_delegate_migration(
+                &channel,
+                &mut markers,
+                diff::delegate_key(diff::successor_key_bytes()),
+                &fixture.lineage(),
+                Vec::new(),
+            ));
+            assert!(
+                report.any_unresponsive(),
+                "{forged_for} answered with {forged:?}: must be reported Unresponsive"
+            );
+            assert!(
+                !matches!(
+                    markers.load(&predecessor).unwrap(),
+                    Some(MigrationMarker::Done { .. })
+                ),
+                "{forged_for} answered with {forged:?}: must not be sealed"
+            );
+        }
+    }
+
+    /// The other side of the line: the delegate's DEFINITE answers that mean
+    /// "nothing usable here" must not be mistaken for failures, or a healthy
+    /// predecessor is re-walked forever and its other secrets never import.
+    /// Covers the V1–V5 em-dash wording of the signing-key absence, and the
+    /// known-sites decode error (a permanently corrupt list must not withhold
+    /// the predecessor's signing keys).
+    #[test]
+    fn a_definite_nothing_usable_answer_is_not_a_failure() {
+        let p1 = diff::prefix_of_seed(1);
+        let mut predecessor = diff::DelegateFixture::modern();
+        predecessor
+            .per_prefix_keys
+            .insert(p1.clone(), diff::signing_key_seed(1));
+        let fixture = diff::Fixture {
+            predecessors: vec![predecessor],
+            successor: diff::DelegateFixture::modern(),
+        };
+        let node = diff::FakeNode::new(&fixture);
+        let predecessor_bytes = diff::gen_hash(0).to_vec();
+        let channel = HostileChannel {
+            inner: &node,
+            intercept: |target: &DelegateKey, request: &DelegateRequest| {
+                if target.bytes() != predecessor_bytes.as_slice() {
+                    return None;
+                }
+                match request {
+                    DelegateRequest::GetKnownSites => Some(DelegateResponse::Error(format!(
+                        "{}unexpected end of input",
+                        correlation::ERR_KNOWN_SITES_DECODE_PREFIX
+                    ))),
+                    DelegateRequest::GetSigningKey => Some(DelegateResponse::Error(
+                        correlation::ERR_NO_SIGNING_KEY_V1_V5.into(),
+                    )),
+                    _ => None,
+                }
+            },
+        };
+        let mut markers = diff::MemoryMarkers::default();
+        let report = diff::block_on(run_delegate_migration(
+            &channel,
+            &mut markers,
+            diff::delegate_key(diff::successor_key_bytes()),
+            &fixture.lineage(),
+            // p1 is known locally, so it is probed despite the corrupt list.
+            vec![p1.clone()],
+        ));
+        assert!(
+            !report.any_unresponsive() && report.is_complete(),
+            "recognised 'nothing usable' answers are answers, not failures"
+        );
+        assert_eq!(
+            node.successor_state().per_prefix_keys.get(&p1),
+            Some(&diff::signing_key_seed(1)),
+            "the per-prefix key must still import"
+        );
+    }
+
+    /// The flip side of treating silence as failure: an old generation must
+    /// never be SENT a request its WASM cannot deserialize, because that
+    /// silence is permanent and would make it `Unresponsive` on every load,
+    /// withholding the data it CAN give (its legacy-slot key).
+    #[test]
+    fn old_generations_are_only_sent_requests_they_understand() {
+        let v1 = diff::DelegateFixture {
+            reachable: true,
+            legacy_key: Some(diff::signing_key_seed(1)),
+            ..Default::default()
+        };
+        let p2 = diff::prefix_of_seed(2);
+        let v5 = diff::DelegateFixture {
+            reachable: true,
+            supports_known_sites: true,
+            legacy_key: Some(diff::signing_key_seed(2)),
+            known_sites: vec![diff::site(&p2, "V5 site")],
+            site_states: [(p2.clone(), vec![0xEF; 4])].into_iter().collect(),
+            ..Default::default()
+        };
+        let fixture = diff::Fixture {
+            predecessors: vec![v1, v5, diff::DelegateFixture::modern()],
+            successor: diff::DelegateFixture::modern(),
+        };
+        let lineage = fixture.lineage();
+        assert_eq!(
+            lineage.iter().map(|e| e.generation).collect::<Vec<_>>(),
+            vec![
+                0,
+                PredecessorCapabilities::FIRST_WITH_SITE_STATE,
+                PredecessorCapabilities::FIRST_WITH_PER_PREFIX_KEY
+            ]
+        );
+        let node = diff::FakeNode::new(&fixture);
+        let mut markers = diff::MemoryMarkers::default();
+        let report = diff::block_on(run_delegate_migration(
+            &node,
+            &mut markers,
+            diff::delegate_key(diff::successor_key_bytes()),
+            &lineage,
+            Vec::new(),
+        ));
+
+        for (target, label) in node.log.borrow().iter() {
+            if *target == diff::gen_hash(0) {
+                assert!(
+                    !matches!(
+                        *label,
+                        "GetKnownSites" | "GetSiteState" | "GetSigningKeyForPrefix"
+                    ),
+                    "V1 was sent {label}, which it cannot deserialize"
+                );
+            }
+            if *target == diff::gen_hash(1) {
+                assert_ne!(
+                    *label, "GetSigningKeyForPrefix",
+                    "V5 was sent GetSigningKeyForPrefix, which it cannot deserialize"
+                );
+            }
+        }
+        assert!(
+            !report.any_unresponsive(),
+            "no reachable generation may be Unresponsive for lack of a capability"
+        );
+        let landed = node.successor_state();
+        assert_eq!(
+            landed.per_prefix_keys.get(&diff::prefix_of_seed(1)),
+            Some(&diff::signing_key_seed(1))
+        );
+        assert_eq!(
+            landed.per_prefix_keys.get(&p2),
+            Some(&diff::signing_key_seed(2))
+        );
+        assert!(
+            landed.site_states.contains_key(&p2),
+            "V5's backup must land"
+        );
+    }
+
+    /// [`PredecessorCapabilities`]' thresholds are generation INDICES, and were
+    /// established by inspecting the WASM blob behind each registry entry's
+    /// `code_hash`. Pin that the entries on either side of every threshold are
+    /// still those blobs, so a reordered or edited registry cannot silently
+    /// shift a capability onto the wrong generation.
+    #[test]
+    fn generation_capabilities_match_the_registry() {
+        use super::super::delegate::LEGACY_DELEGATES;
+        let expected = [
+            // (index, code_hash, the capabilities its WASM was observed to have)
+            (
+                1,
+                "5c0ee5d24a91122b9f17217f01ef2cb12b72d516953b081ecbe4aea71324a9f5",
+                (false, false, false),
+            ),
+            (
+                2,
+                "1224d52d5175a937e512d8bd8c6c8a08c48f5b7c4bc7aa4e5cc1305bceb170d6",
+                (true, false, false),
+            ),
+            (
+                3,
+                "c33f9f25daf4b62927f0100081fa057999de7dae62e6a017b8ea36d05292f8ad",
+                (true, false, false),
+            ),
+            (
+                4,
+                "9694b6c553a83696932b479f0662a7181de7008a430f831d6773c4ce70575c0f",
+                (true, true, false),
+            ),
+            (
+                6,
+                "eb5396ef340832847151d1339e676b57ca79968ae498fa67951d280b1f5b9231",
+                (true, true, false),
+            ),
+            (
+                7,
+                "8a78b8b529aabfa2e160a9ef0c5754aa20d527ee5babaa1951d56ac69082dcda",
+                (true, true, true),
+            ),
+        ];
+        for (index, code_hash, (known_sites, site_state, per_prefix_key)) in expected {
+            assert_eq!(
+                hex::encode(LEGACY_DELEGATES[index].1),
+                code_hash,
+                "legacy delegate generation {index} is no longer the WASM the \
+                 capability thresholds were measured on"
+            );
+            assert_eq!(
+                PredecessorCapabilities::of_generation(index as u32),
+                PredecessorCapabilities {
+                    known_sites,
+                    site_state,
+                    per_prefix_key,
+                },
+                "generation {index}'s capabilities"
+            );
+        }
     }
 }
