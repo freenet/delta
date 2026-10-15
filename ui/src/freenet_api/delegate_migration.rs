@@ -212,7 +212,7 @@ pub trait MigrationMarkerStore {
 ///
 /// * `GetKnownSites` yields the site list, and with it the set of prefixes.
 /// * `GetSigningKeyForPrefix { prefix }` yields each per-site key (V8+).
-/// * `GetSigningKey` yields the legacy single-slot key (V1+).
+/// * `GetSigningKey` yields the legacy single-slot key (V4+).
 /// * `GetSiteState { prefix }` yields each state backup.
 ///
 /// `extra_prefixes` seeds prefixes the caller already knows about locally, so a
@@ -237,13 +237,32 @@ pub trait MigrationMarkerStore {
 /// request is therefore never SENT — [`PredecessorCapabilities`] says which
 /// requests each generation understands — rather than sent and its silence
 /// excused, which would make a timeout and "unsupported" indistinguishable.
+///
+/// Two bounds, stated so nobody designs as though they were covered:
+///
+/// * **All or nothing per predecessor.** A sub-request that fails on EVERY
+///   load (say, a reply too large to ever arrive) withholds that whole
+///   predecessor's export, not just the one item. That is the price of never
+///   sealing a partial export, and it surfaces as `Unresponsive`, not as a
+///   silent loss.
+/// * **A mis-correlated absence answer is still accepted as absence.** The
+///   signing-key absence error names no prefix, so a concurrent sweep probe's
+///   "no key" reply that resolves our `GetSigningKeyForPrefix { p }` await is
+///   indistinguishable from p's own answer, and the export can then be
+///   sealed without p's key. Our real reply then falls through to the
+///   shipped sweep's `SigningKey` arm, which stores it on the successor
+///   content-addressed, so the key still lands; this adapter alone does not
+///   guarantee it.
 pub struct DeltaPredecessorIo<'a, C: DeltaDelegateChannel> {
     channel: &'a C,
     extra_prefixes: Vec<String>,
     /// Per-predecessor capabilities, by delegate key. A predecessor missing
     /// from the map is assumed to understand every request, which is the
-    /// conservative direction: a wrongly-assumed capability costs a retry,
-    /// a wrongly-denied one silently drops data.
+    /// conservative direction: a wrongly-assumed capability makes that
+    /// predecessor visibly `Unresponsive` on every load, a wrongly-denied one
+    /// silently drops data. (The library only ever fetches lineage entries, so
+    /// the fallback is not reached in practice;
+    /// `capabilities_are_keyed_by_the_real_delegate_key` pins that.)
     capabilities: BTreeMap<Vec<u8>, PredecessorCapabilities>,
 }
 
@@ -283,33 +302,42 @@ impl<'a, C: DeltaDelegateChannel> DeltaPredecessorIo<'a, C> {
 
 /// Which of the export requests a predecessor delegate generation understands.
 ///
-/// `GetPublicKey` and `GetSigningKey` are understood by every generation (V1+)
-/// and are not listed. The others were added over time; an older WASM fails to
-/// deserialize them, which reaches the UI as silence (see
-/// [`DeltaPredecessorIo`]).
+/// `GetPublicKey` is understood by every generation (V1+), which is why it is
+/// the executability probe, and is not listed. The others were added over
+/// time; an older WASM fails to deserialize them, which reaches the UI as
+/// silence (see [`DeltaPredecessorIo`]).
 ///
 /// The thresholds are 0-based generation indices into `legacy_delegates.toml`
-/// (index 0 is "V1"). Each `legacy_delegates.toml` entry records the delegate
-/// that was REPLACED by the commit that added it, so the entry named after a
-/// feature ("V4: Before adding StoreSiteState/GetSiteState") is the last one
-/// WITHOUT it. Verified directly against the WASM blobs: the delegate WASM is
-/// checked in at `ui/public/contracts/site_delegate.wasm`, and for every
-/// registry entry the git blob whose BLAKE3 equals its `code_hash` was found
-/// and searched for the request variant's name (serde embeds it):
+/// (index 0 is "V1"). They were established from the WASM blobs themselves,
+/// NOT from the entries' descriptions (whose naming convention changed at V4:
+/// V1–V3 name the blob a commit introduced, V4 onward the blob a commit
+/// replaced). The delegate WASM is checked in at
+/// `ui/public/contracts/site_delegate.wasm`; for every registry entry the git
+/// blob whose BLAKE3 equals its `code_hash` was found and searched for each
+/// request variant's name, which serde embeds in the binary:
 ///
-/// | entry | index | `GetKnownSites` | `GetSiteState` | `GetSigningKeyForPrefix` |
-/// |-------|-------|-----------------|----------------|--------------------------|
-/// | V1–V2 | 0–1   | no              | no             | no                       |
-/// | V3–V4 | 2–3   | yes             | no             | no                       |
-/// | V5–V7 | 4–6   | yes             | yes            | no                       |
-/// | V8+   | 7+    | yes             | yes            | yes                      |
+/// | entry | index | `GetKnownSites` | `GetSigningKey` | `GetSiteState` | `GetSigningKeyForPrefix` |
+/// |-------|-------|-----------------|-----------------|----------------|--------------------------|
+/// | V1–V2 | 0–1   | no              | no              | no             | no                       |
+/// | V3    | 2     | yes             | no              | no             | no                       |
+/// | V4    | 3     | yes             | yes             | no             | no                       |
+/// | V5–V7 | 4–6   | yes             | yes             | yes            | no                       |
+/// | V8+   | 7+    | yes             | yes             | yes            | yes                      |
 ///
-/// `generation_capabilities_match_the_registry` pins the index-to-WASM
-/// identity this table rests on.
+/// So a V1–V3 predecessor's signing key cannot be read through the delegate
+/// protocol at all: those generations had no export request. Neither this
+/// adapter nor the hand-rolled sweep can recover it; only a node-side
+/// copy-forward that reads storage directly could.
+///
+/// `generation_capabilities_match_the_registry` pins the index-to-blob
+/// identity this table rests on (the blob inspection itself was a one-off
+/// manual check; the blobs live only in git history).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PredecessorCapabilities {
     /// Understands `GetKnownSites`.
     pub known_sites: bool,
+    /// Understands `GetSigningKey` (the legacy single slot).
+    pub signing_key: bool,
     /// Understands `GetSiteState`.
     pub site_state: bool,
     /// Understands `GetSigningKeyForPrefix`.
@@ -319,6 +347,8 @@ pub struct PredecessorCapabilities {
 impl PredecessorCapabilities {
     /// First generation index (V3) that understands `GetKnownSites`.
     pub const FIRST_WITH_KNOWN_SITES: u32 = 2;
+    /// First generation index (V4) that understands `GetSigningKey`.
+    pub const FIRST_WITH_SIGNING_KEY: u32 = 3;
     /// First generation index (V5) that understands `GetSiteState`.
     pub const FIRST_WITH_SITE_STATE: u32 = 4;
     /// First generation index (V8) that understands `GetSigningKeyForPrefix`.
@@ -327,6 +357,7 @@ impl PredecessorCapabilities {
     /// Every request: the current delegate, or one of unknown generation.
     pub const ALL: Self = Self {
         known_sites: true,
+        signing_key: true,
         site_state: true,
         per_prefix_key: true,
     };
@@ -335,6 +366,7 @@ impl PredecessorCapabilities {
     pub fn of_generation(generation: u32) -> Self {
         Self {
             known_sites: generation >= Self::FIRST_WITH_KNOWN_SITES,
+            signing_key: generation >= Self::FIRST_WITH_SIGNING_KEY,
             site_state: generation >= Self::FIRST_WITH_SITE_STATE,
             per_prefix_key: generation >= Self::FIRST_WITH_PER_PREFIX_KEY,
         }
@@ -475,8 +507,9 @@ impl<C: DeltaDelegateChannel> PredecessorSecretsIo for DeltaPredecessorIo<'_, C>
             }
         }
 
-        // 2. The legacy single-slot signing key (V1+).
-        {
+        // 2. The legacy single-slot signing key. Not sent to V1–V3, which
+        //    had no request to read it.
+        if capabilities.signing_key {
             const REQ: &str = "GetSigningKey";
             match self
                 .ask(predecessor, DelegateRequest::GetSigningKey, REQ)
@@ -1335,10 +1368,9 @@ pub mod correlation {
     pub const ERR_NO_SIGNING_KEY: &str = "no signing key stored -- store key first";
     /// The same absence answer as worded by delegate V1–V5 (an em dash rather
     /// than `--`). Frozen in those deployed WASMs, so it can no longer be
-    /// pinned to source; it was checked against each generation's WASM blob.
-    /// Deliberately NOT used to narrow registry matching (unrecognised text
-    /// still matches any kind there); only [`super::DeltaPredecessorIo`]
-    /// uses it, to recognise an old predecessor's "no key" as an answer.
+    /// pinned to source; it was checked against each generation's WASM blob
+    /// (present in V1–V5, absent from V6 on). Only the signing-key load path
+    /// produces it, so it is narrowed exactly like [`ERR_NO_SIGNING_KEY`].
     pub const ERR_NO_SIGNING_KEY_V1_V5: &str = "no signing key stored \u{2014} store key first";
     /// The current delegate's corrupt-stored-key answer (`parse_signing_key`).
     pub const ERR_STORED_KEY_BAD_LEN: &str = "stored key is not 32 bytes";
@@ -1366,10 +1398,17 @@ pub mod correlation {
             return kind == ReplyKind::SiteState
                 && expected_prefix.is_none_or(|expected| expected == err_prefix);
         }
-        if msg == ERR_NO_SIGNING_KEY || msg == ERR_STORED_KEY_BAD_LEN {
+        if msg == ERR_NO_SIGNING_KEY
+            || msg == ERR_NO_SIGNING_KEY_V1_V5
+            || msg == ERR_STORED_KEY_BAD_LEN
+        {
             // The signing-key load path answers GetPublicKey, GetSigningKey
             // and GetSigningKeyForPrefix (and the Sign* requests, which the
-            // migration never awaits).
+            // migration never awaits). The V1–V5 wording is narrowed too: a
+            // concurrent sweep probe's "no key" from a V4/V5 delegate would
+            // otherwise resolve an awaited GetKnownSites/GetSiteState and,
+            // since an unanswered export sub-request fails the fetch, turn a
+            // healthy predecessor `Unresponsive` for that load.
             return matches!(kind, ReplyKind::PublicKey | ReplyKind::SigningKey);
         }
         if msg == ERR_STORE_KEY_BAD_LEN {
@@ -1449,6 +1488,13 @@ pub mod correlation {
         /// first. Returns `true` if it was consumed.
         pub fn offer(&self, responding_key: &DelegateKey, response: &DelegateResponse) -> bool {
             let mut pending = self.pending.borrow_mut();
+            // An await that already timed out has resolved as silence and
+            // nobody is listening on it. Left parked, it would swallow the
+            // next matching reply (oldest waiter first) — which may belong to
+            // a LIVE await, or to the shipped sweep — and since a timed-out
+            // export sub-request fails the whole fetch, that would turn one
+            // timeout into a second, spurious one.
+            pending.retain(|p| !p.slot.borrow().timed_out);
             let Some(index) = pending.iter().position(|p| {
                 p.target == responding_key.bytes() && p.expectation.matches(response)
             }) else {
@@ -2510,6 +2556,14 @@ mod tests {
                 "GetSigningKeyForPrefix",
                 DelegateResponse::Error("something went wrong".into()),
             ),
+            // Absence of ANOTHER site's backup says nothing about p1's.
+            (
+                "GetSiteState",
+                DelegateResponse::Error(format!(
+                    "{}someothersite",
+                    correlation::ERR_NO_SITE_BACKUP_PREFIX
+                )),
+            ),
         ] {
             let (fixture, _, _) = full_predecessor_fixture();
             let node = diff::FakeNode::new(&fixture);
@@ -2548,8 +2602,8 @@ mod tests {
     /// The other side of the line: the delegate's DEFINITE answers that mean
     /// "nothing usable here" must not be mistaken for failures, or a healthy
     /// predecessor is re-walked forever and its other secrets never import.
-    /// Covers the V1–V5 em-dash wording of the signing-key absence, and the
-    /// known-sites decode error (a permanently corrupt list must not withhold
+    /// Covers the V1–V5 em-dash wording of the signing-key absence, a corrupt
+    /// stored key, and the known-sites decode error (a permanently corrupt list must not withhold
     /// the predecessor's signing keys).
     #[test]
     fn a_definite_nothing_usable_answer_is_not_a_failure() {
@@ -2564,6 +2618,7 @@ mod tests {
         };
         let node = diff::FakeNode::new(&fixture);
         let predecessor_bytes = diff::gen_hash(0).to_vec();
+        let p1_probe = p1.clone();
         let channel = HostileChannel {
             inner: &node,
             intercept: |target: &DelegateKey, request: &DelegateRequest| {
@@ -2578,6 +2633,12 @@ mod tests {
                     DelegateRequest::GetSigningKey => Some(DelegateResponse::Error(
                         correlation::ERR_NO_SIGNING_KEY_V1_V5.into(),
                     )),
+                    // A corrupt stored key: an answer, nothing to import.
+                    DelegateRequest::GetSigningKeyForPrefix { prefix } if *prefix != p1_probe => {
+                        Some(DelegateResponse::Error(
+                            correlation::ERR_STORED_KEY_BAD_LEN.into(),
+                        ))
+                    }
                     _ => None,
                 }
             },
@@ -2588,8 +2649,9 @@ mod tests {
             &mut markers,
             diff::delegate_key(diff::successor_key_bytes()),
             &fixture.lineage(),
-            // p1 is known locally, so it is probed despite the corrupt list.
-            vec![p1.clone()],
+            // p1 is known locally, so it is probed despite the corrupt list;
+            // so is a second site whose stored key is corrupt.
+            vec![p1.clone(), diff::prefix_of_seed(4)],
         ));
         assert!(
             !report.any_unresponsive() && report.is_complete(),
@@ -2605,12 +2667,24 @@ mod tests {
     /// The flip side of treating silence as failure: an old generation must
     /// never be SENT a request its WASM cannot deserialize, because that
     /// silence is permanent and would make it `Unresponsive` on every load,
-    /// withholding the data it CAN give (its legacy-slot key).
+    /// withholding the data it CAN give. Covers every capability band:
+    /// V1 (only `GetPublicKey`), V3 (adds `GetKnownSites`, but has no
+    /// `GetSigningKey` yet), V5 (adds `GetSigningKey` and `GetSiteState`), and
+    /// a modern generation.
     #[test]
     fn old_generations_are_only_sent_requests_they_understand() {
+        // V1 holds a key in its single slot, but has no request to export it.
         let v1 = diff::DelegateFixture {
             reachable: true,
             legacy_key: Some(diff::signing_key_seed(1)),
+            ..Default::default()
+        };
+        let p3 = diff::prefix_of_seed(3);
+        let v3 = diff::DelegateFixture {
+            reachable: true,
+            generation: Some(PredecessorCapabilities::FIRST_WITH_KNOWN_SITES),
+            known_sites: vec![diff::site(&p3, "V3 site")],
+            legacy_key: Some(diff::signing_key_seed(3)),
             ..Default::default()
         };
         let p2 = diff::prefix_of_seed(2);
@@ -2623,7 +2697,7 @@ mod tests {
             ..Default::default()
         };
         let fixture = diff::Fixture {
-            predecessors: vec![v1, v5, diff::DelegateFixture::modern()],
+            predecessors: vec![v1, v3, v5, diff::DelegateFixture::modern()],
             successor: diff::DelegateFixture::modern(),
         };
         let lineage = fixture.lineage();
@@ -2631,6 +2705,7 @@ mod tests {
             lineage.iter().map(|e| e.generation).collect::<Vec<_>>(),
             vec![
                 0,
+                PredecessorCapabilities::FIRST_WITH_KNOWN_SITES,
                 PredecessorCapabilities::FIRST_WITH_SITE_STATE,
                 PredecessorCapabilities::FIRST_WITH_PER_PREFIX_KEY
             ]
@@ -2647,15 +2722,18 @@ mod tests {
 
         for (target, label) in node.log.borrow().iter() {
             if *target == diff::gen_hash(0) {
-                assert!(
-                    !matches!(
-                        *label,
-                        "GetKnownSites" | "GetSiteState" | "GetSigningKeyForPrefix"
-                    ),
+                assert_eq!(
+                    *label, "GetPublicKey",
                     "V1 was sent {label}, which it cannot deserialize"
                 );
             }
             if *target == diff::gen_hash(1) {
+                assert!(
+                    matches!(*label, "GetPublicKey" | "GetKnownSites"),
+                    "V3 was sent {label}, which it cannot deserialize"
+                );
+            }
+            if *target == diff::gen_hash(2) {
                 assert_ne!(
                     *label, "GetSigningKeyForPrefix",
                     "V5 was sent GetSigningKeyForPrefix, which it cannot deserialize"
@@ -2669,7 +2747,13 @@ mod tests {
         let landed = node.successor_state();
         assert_eq!(
             landed.per_prefix_keys.get(&diff::prefix_of_seed(1)),
-            Some(&diff::signing_key_seed(1))
+            None,
+            "V1's key has no export request; nothing may claim to recover it"
+        );
+        assert_eq!(
+            landed.per_prefix_keys.get(&p3),
+            None,
+            "V3's key has no export request either"
         );
         assert_eq!(
             landed.per_prefix_keys.get(&p2),
@@ -2683,46 +2767,54 @@ mod tests {
 
     /// [`PredecessorCapabilities`]' thresholds are generation INDICES, and were
     /// established by inspecting the WASM blob behind each registry entry's
-    /// `code_hash`. Pin that the entries on either side of every threshold are
-    /// still those blobs, so a reordered or edited registry cannot silently
-    /// shift a capability onto the wrong generation.
+    /// `code_hash` (a one-off manual check: the blobs live only in git history
+    /// of `ui/public/contracts/site_delegate.wasm`). Pin that the entries on
+    /// either side of every threshold are still those blobs, so a reordered or
+    /// edited registry cannot silently shift a capability onto the wrong
+    /// generation.
     #[test]
     fn generation_capabilities_match_the_registry() {
         use super::super::delegate::LEGACY_DELEGATES;
+        // (index, code_hash, the capabilities its WASM was observed to have:
+        //  known_sites, signing_key, site_state, per_prefix_key)
         let expected = [
-            // (index, code_hash, the capabilities its WASM was observed to have)
+            (
+                0,
+                "2e590420a9718a6c2b358e3695ff9767726828763e781f3fbad45203952eab72",
+                (false, false, false, false),
+            ),
             (
                 1,
                 "5c0ee5d24a91122b9f17217f01ef2cb12b72d516953b081ecbe4aea71324a9f5",
-                (false, false, false),
+                (false, false, false, false),
             ),
             (
                 2,
                 "1224d52d5175a937e512d8bd8c6c8a08c48f5b7c4bc7aa4e5cc1305bceb170d6",
-                (true, false, false),
+                (true, false, false, false),
             ),
             (
                 3,
                 "c33f9f25daf4b62927f0100081fa057999de7dae62e6a017b8ea36d05292f8ad",
-                (true, false, false),
+                (true, true, false, false),
             ),
             (
                 4,
                 "9694b6c553a83696932b479f0662a7181de7008a430f831d6773c4ce70575c0f",
-                (true, true, false),
+                (true, true, true, false),
             ),
             (
                 6,
                 "eb5396ef340832847151d1339e676b57ca79968ae498fa67951d280b1f5b9231",
-                (true, true, false),
+                (true, true, true, false),
             ),
             (
                 7,
                 "8a78b8b529aabfa2e160a9ef0c5754aa20d527ee5babaa1951d56ac69082dcda",
-                (true, true, true),
+                (true, true, true, true),
             ),
         ];
-        for (index, code_hash, (known_sites, site_state, per_prefix_key)) in expected {
+        for (index, code_hash, (known_sites, signing_key, site_state, per_prefix_key)) in expected {
             assert_eq!(
                 hex::encode(LEGACY_DELEGATES[index].1),
                 code_hash,
@@ -2733,10 +2825,136 @@ mod tests {
                 PredecessorCapabilities::of_generation(index as u32),
                 PredecessorCapabilities {
                     known_sites,
+                    signing_key,
                     site_state,
                     per_prefix_key,
                 },
                 "generation {index}'s capabilities"
+            );
+        }
+    }
+
+    /// The capability map is keyed by the lineage entry's DELEGATE key, which
+    /// is what the library hands `fetch_secrets`. In production that is
+    /// `BLAKE3(code_hash)`, not the code hash (the test fixtures use one value
+    /// for both, so they cannot tell the difference). A wrong key would fall
+    /// through to the all-capable default and send V1–V7 requests they cannot
+    /// deserialize, which is the permanent-`Unresponsive` failure.
+    #[test]
+    fn capabilities_are_keyed_by_the_real_delegate_key() {
+        use super::super::delegate::LEGACY_DELEGATES;
+        let lineage = delta_delegate_lineage(LEGACY_DELEGATES);
+        let node = diff::FakeNode::new(&diff::Fixture::default());
+        let reader = DeltaPredecessorIo::new(&node, Vec::new(), &lineage);
+        for entry in &lineage {
+            assert_ne!(entry.delegate_key, entry.code_hash);
+            let key = DelegateKey::new(
+                entry.delegate_key,
+                freenet_stdlib::prelude::CodeHash::new(entry.code_hash),
+            );
+            assert_eq!(
+                reader.capabilities_of(&key),
+                PredecessorCapabilities::of_generation(entry.generation),
+                "generation {}",
+                entry.generation
+            );
+        }
+    }
+
+    /// A sub-request that fails part-way through the per-site loop (here the
+    /// SECOND prefix's backup) must still fail the whole fetch: the first
+    /// prefix's items alone are a partial export.
+    #[test]
+    fn a_failure_part_way_through_the_per_site_loop_fails_the_fetch() {
+        let (fixture, p1, p2) = full_predecessor_fixture();
+        let node = diff::FakeNode::new(&fixture);
+        let predecessor = diff::delegate_key(diff::gen_hash(0));
+        let predecessor_bytes = predecessor.bytes().to_vec();
+        let p2_for_silence = p2.clone();
+        let channel = SilencingChannel {
+            inner: &node,
+            silence: |target: &DelegateKey, request: &DelegateRequest| {
+                target.bytes() == predecessor_bytes.as_slice()
+                    && matches!(request, DelegateRequest::GetSiteState { prefix } if *prefix == p2_for_silence)
+            },
+        };
+        let mut markers = diff::MemoryMarkers::default();
+        let report = diff::block_on(run_delegate_migration(
+            &channel,
+            &mut markers,
+            diff::delegate_key(diff::successor_key_bytes()),
+            &fixture.lineage(),
+            // p1 is listed by the predecessor; p2 is known locally, so it is
+            // probed second.
+            vec![p2.clone()],
+        ));
+        assert!(report.any_unresponsive());
+        assert!(!matches!(
+            markers.load(&predecessor).unwrap(),
+            Some(MigrationMarker::Done { .. })
+        ));
+        let _ = p1;
+    }
+
+    /// A timed-out await must stop competing for replies. Left parked, it
+    /// swallowed the next matching reply, which could belong to a live await
+    /// (turning one timeout into two) or to the shipped sweep.
+    #[test]
+    fn a_timed_out_await_does_not_swallow_a_later_reply() {
+        let registry = correlation::PendingRegistry::new();
+        let target = diff::delegate_key([0x55; 32]);
+        let stale = registry
+            .register(&target, &DelegateRequest::GetKnownSites)
+            .expect("protocol request");
+        correlation::mark_timed_out(&stale);
+        let live = registry
+            .register(&target, &DelegateRequest::GetKnownSites)
+            .expect("protocol request");
+        assert!(registry.offer(&target, &DelegateResponse::KnownSites(Vec::new())));
+        assert!(
+            diff::block_on(correlation::ReplyFuture { slot: live }).is_some(),
+            "the live await must receive the reply, not the timed-out one"
+        );
+        assert_eq!(registry.pending_len(), 0);
+    }
+
+    /// The V1–V5 signing-key absence wording is narrowed like the current
+    /// one: it answers signing-key and public-key awaits only. Matching any
+    /// kind let a concurrent sweep probe's "no key" resolve an awaited export
+    /// sub-request, failing a healthy predecessor's fetch for that load.
+    #[test]
+    fn the_v1_v5_signing_key_absence_only_answers_signing_key_awaits() {
+        let registry = correlation::PendingRegistry::new();
+        let target = diff::delegate_key([0x66; 32]);
+        let reply = DelegateResponse::Error(correlation::ERR_NO_SIGNING_KEY_V1_V5.into());
+        for request in [
+            DelegateRequest::GetKnownSites,
+            DelegateRequest::GetSiteState {
+                prefix: "abc".into(),
+            },
+        ] {
+            let _slot = registry.register(&target, &request).expect("protocol");
+            assert!(
+                !registry.offer(&target, &reply),
+                "{request:?} must not be answered by a signing-key absence"
+            );
+            registry.offer(&target, &DelegateResponse::KnownSites(Vec::new()));
+            registry.offer(
+                &target,
+                &DelegateResponse::SiteState {
+                    prefix: "abc".into(),
+                    state_bytes: Vec::new(),
+                },
+            );
+        }
+        for request in [
+            DelegateRequest::GetPublicKey,
+            DelegateRequest::GetSigningKey,
+        ] {
+            let _slot = registry.register(&target, &request).expect("protocol");
+            assert!(
+                registry.offer(&target, &reply),
+                "{request:?} must still be answered by it"
             );
         }
     }

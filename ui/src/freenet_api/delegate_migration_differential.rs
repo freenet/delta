@@ -72,6 +72,12 @@ pub struct DelegateFixture {
     pub supports_per_prefix: bool,
     /// Whether this generation understands `GetKnownSites` (V3+).
     pub supports_known_sites: bool,
+    /// Pin this fixture to a specific real generation index instead of
+    /// deriving one from the `supports_*` flags. Its capabilities are then
+    /// exactly that generation's ([`PredecessorCapabilities::of_generation`]),
+    /// which is how a V3/V4-shaped predecessor (known sites, but no site-state
+    /// backups, and for V3 no `GetSigningKey`) is expressed.
+    pub generation: Option<u32>,
 }
 
 impl DelegateFixture {
@@ -85,21 +91,32 @@ impl DelegateFixture {
         }
     }
 
-    /// Which export requests this fixture's WASM understands. Site-state
-    /// backups arrived (V5) between known sites (V3) and per-prefix keys (V8),
-    /// so a fixture with either flag is modelled as understanding them.
+    /// Which export requests this fixture's WASM understands.
+    ///
+    /// From the flags (when no explicit [`Self::generation`] is set): a
+    /// fixture with neither flag is V1/V2-shaped and understands only
+    /// `GetPublicKey`; with known sites it is V5–V7-shaped (`GetSigningKey`
+    /// arrived in V4 and site-state backups in V5, both before per-prefix keys
+    /// in V8).
     pub fn capabilities(&self) -> PredecessorCapabilities {
+        if let Some(generation) = self.generation {
+            return PredecessorCapabilities::of_generation(generation);
+        }
+        let v5_or_later = self.supports_known_sites || self.supports_per_prefix;
         PredecessorCapabilities {
             known_sites: self.supports_known_sites,
-            site_state: self.supports_known_sites || self.supports_per_prefix,
+            signing_key: v5_or_later,
+            site_state: v5_or_later,
             per_prefix_key: self.supports_per_prefix,
         }
     }
 
     /// The oldest real generation index whose capabilities match this
-    /// fixture's flags.
+    /// fixture.
     fn earliest_generation(&self) -> u32 {
-        if self.supports_per_prefix {
+        if let Some(generation) = self.generation {
+            generation
+        } else if self.supports_per_prefix {
             PredecessorCapabilities::FIRST_WITH_PER_PREFIX_KEY
         } else if self.supports_known_sites {
             PredecessorCapabilities::FIRST_WITH_SITE_STATE
@@ -113,6 +130,7 @@ impl DelegateFixture {
         let capabilities = self.capabilities();
         match request {
             DelegateRequest::GetKnownSites => capabilities.known_sites,
+            DelegateRequest::GetSigningKey => capabilities.signing_key,
             DelegateRequest::GetSiteState { .. } | DelegateRequest::StoreSiteState { .. } => {
                 capabilities.site_state
             }
@@ -614,8 +632,12 @@ pub fn shipped_sweep(fixture: &Fixture) -> (Landed, Vec<Classification>) {
 
         // --- the legacy single slot ---
         // The `SigningKey` arm re-derives the prefix from the key's public half
-        // and stores it per-prefix.
-        if let Some(seed) = predecessor.legacy_key {
+        // and stores it per-prefix. V1–V3 cannot deserialize `GetSigningKey`
+        // (it arrived in V4), so their single slot is unreachable.
+        if let Some(seed) = predecessor
+            .legacy_key
+            .filter(|_| predecessor.capabilities().signing_key)
+        {
             let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
             let prefix = delta_core::pubkey_to_prefix(&sk.verifying_key());
             if let std::collections::btree_map::Entry::Vacant(slot) = signing_keys.entry(prefix) {
@@ -924,7 +946,7 @@ mod tests {
     /// per-prefix probe.
     ///
     /// The adoption recovers it, because `fetch_secrets` ALSO reads the legacy
-    /// single slot via `GetSigningKey` (understood since V1) and the writer
+    /// single slot via `GetSigningKey` (understood since V4) and the writer
     /// re-derives the owning prefix from the key's public half before storing it
     /// per-prefix. That re-derivation is exactly the app-level knowledge the
     /// 0.5.0 writer seam exists to preserve: a raw pair copy would have put it in
@@ -966,9 +988,11 @@ mod tests {
     }
 
     /// The preflight must use a request EVERY generation understands. Using
-    /// `GetKnownSites` (V3+) or `GetSigningKeyForPrefix` (V8+) would misreport an
-    /// older but perfectly healthy delegate as `Unresponsive`, which is the
-    /// freenet/river#204 UX bug in reverse.
+    /// `GetKnownSites` (V3+), `GetSigningKey` (V4+) or `GetSigningKeyForPrefix`
+    /// (V8+) would misreport an older but perfectly healthy delegate as
+    /// `Unresponsive`, which is the freenet/river#204 UX bug in reverse. The
+    /// same goes for the export itself: a V1 delegate holds a key it has no
+    /// request to export, and asking for it anyway must not fail the fetch.
     #[test]
     fn preflight_uses_the_universally_understood_request() {
         let v1 = DelegateFixture {
