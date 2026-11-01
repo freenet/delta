@@ -666,7 +666,7 @@ dependencies = [
  "ed25519-dalek",
  "freenet-scaffold",
  "freenet-scaffold-macro",
- "freenet-stdlib",
+ "freenet-stdlib 0.12.1",
  "rand 0.8.5",
  "serde",
 ]
@@ -683,7 +683,7 @@ dependencies = [
  "dioxus",
  "ed25519-dalek",
  "freenet-migrate",
- "freenet-stdlib",
+ "freenet-stdlib 0.12.1",
  "getrandom 0.2.17",
  "gloo-timers",
  "hex",
@@ -1361,6 +1361,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "freenet-macros"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6447ac80d17ad1a22d87f470d1c170ca3cfa976a433883de6472c1ede381e525"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "freenet-migrate"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1371,7 +1382,7 @@ dependencies = [
  "ciborium",
  "ed25519-dalek",
  "freenet-scaffold",
- "freenet-stdlib",
+ "freenet-stdlib 0.8.5",
  "serde",
  "serde_with",
 ]
@@ -1398,9 +1409,9 @@ dependencies = [
 
 [[package]]
 name = "freenet-stdlib"
-version = "0.8.3"
+version = "0.8.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ce69f7b87ca5fedb784da0194e26a3315bc23b11e346f7a8413c48abdcac73f"
+checksum = "b62aeba7634d1ae5c2d02f78db33ee40442511858275be5be2099d24a13b2559"
 dependencies = [
  "bincode",
  "blake3",
@@ -1409,7 +1420,31 @@ dependencies = [
  "bytes",
  "chrono",
  "flatbuffers",
- "freenet-macros",
+ "freenet-macros 0.2.0",
+ "futures",
+ "semver",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "thiserror 2.0.18",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "freenet-stdlib"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8d1d34436ce7088f277e65a616951ab8ea43091e04bb18f9af562651019b656f"
+dependencies = [
+ "bincode",
+ "blake3",
+ "bs58",
+ "byteorder",
+ "bytes",
+ "chrono",
+ "flatbuffers",
+ "freenet-macros 0.3.1",
  "futures",
  "js-sys",
  "semver",
@@ -3084,7 +3119,7 @@ dependencies = [
  "delta-core",
  "ed25519-dalek",
  "freenet-scaffold",
- "freenet-stdlib",
+ "freenet-stdlib 0.12.1",
 ]
 
 [[package]]
@@ -3094,7 +3129,7 @@ dependencies = [
  "ciborium",
  "delta-core",
  "ed25519-dalek",
- "freenet-stdlib",
+ "freenet-stdlib 0.12.1",
  "serde",
 ]
 
